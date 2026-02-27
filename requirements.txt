@@ -1,0 +1,40 @@
+# =============================================================
+# Dependencias del Proyecto de Reconciliación Bibliográfica
+# =============================================================
+
+# --- Base de datos ---
+sqlalchemy>=2.0
+psycopg2-binary>=2.9          # Driver PostgreSQL
+alembic>=1.13                  # Migraciones de DB
+
+# --- API REST (FastAPI) ---
+fastapi>=0.109
+uvicorn[standard]>=0.27
+pydantic>=2.5
+
+# --- HTTP / APIs ---
+requests>=2.31
+urllib3>=2.0
+
+# --- Fuzzy matching ---
+rapidfuzz>=3.6
+unidecode>=1.3
+python-Levenshtein>=0.25       # Acelerador C para rapidfuzz
+
+# --- Procesamiento de datos ---
+pandas>=2.1
+
+# --- Dashboard ---
+streamlit>=1.30
+plotly>=5.18
+
+# --- Utilidades ---
+python-dotenv>=1.0             # Cargar .env si se prefiere
+tqdm>=4.66                     # Barras de progreso
+
+# --- Scraping (CVLAC) ---
+beautifulsoup4>=4.12
+lxml>=5.1
+
+# --- Logging ---
+rich>=13.7                     # Logging bonito en consola
