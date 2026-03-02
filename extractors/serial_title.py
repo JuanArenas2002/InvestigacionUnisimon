@@ -41,6 +41,27 @@ def _clean_issn(value: str) -> str:
     return ""
 
 
+def _split_issns(raw: str) -> list[str]:
+    """
+    Divide un campo ISSN que puede contener varios valores separados por
+    punto y coma ('; '), coma o espacio, y retorna solo los ISSNs válidos.
+
+    Ejemplo: '14220067; 16616596' → ['14220067', '16616596']
+    """
+    import re
+    if not raw:
+        return []
+    parts = re.split(r"[;,\s]+", str(raw).strip())
+    result = []
+    seen: set[str] = set()
+    for part in parts:
+        clean = _clean_issn(part)
+        if clean and clean not in seen:
+            seen.add(clean)
+            result.append(clean)
+    return result
+
+
 class SerialTitleAPIError(Exception):
     """Excepción para errores del Serial Title API de Scopus."""
     pass
@@ -180,6 +201,63 @@ class SerialTitleExtractor:
     # ------------------------------------------------------------------
     # Búsqueda por nombre de revista (cuando no hay ISSN)
     # ------------------------------------------------------------------
+
+    def get_issn_from_eid(self, eid: str) -> tuple[str | None, str | None]:
+        """
+        Consulta el Abstract Retrieval API de Scopus por EID (2-s2.0-...)
+        y extrae el ISSN y el nombre de la fuente.
+
+        Se usa como fallback cuando no hay ISSN ni DOI disponibles.
+
+        Args:
+            eid: EID de Scopus (ej: '2-s2.0-85207865300').
+
+        Returns:
+            Tuple (issn, source_title) — cualquiera puede ser None.
+        """
+        eid_clean = eid.strip()
+        try:
+            resp = self.session.get(
+                f"{self.ABSTRACT_URL}/eid/{eid_clean}",
+                params={"field": "prism:issn,prism:eissn,prism:isbn,prism:publicationName", "view": "META"},
+                timeout=scopus_config.timeout,
+            )
+            if resp.status_code in (404, 400):
+                logger.debug(f"EID no encontrado en Scopus: {eid_clean}")
+                return None, None
+            resp.raise_for_status()
+            data = resp.json()
+        except requests.exceptions.RequestException as e:
+            logger.warning(f"Error consultando EID '{eid_clean}': {e}")
+            return None, None
+
+        coredata = (
+            data.get("abstracts-retrieval-response", {})
+            .get("coredata", {})
+        ) or (
+            data.get("full-text-retrieval-response", {})
+            .get("coredata", {})
+        )
+
+        # Intentar ISSN impreso, luego eISSN, luego ISBN
+        issn_raw = (
+            coredata.get("prism:issn")
+            or coredata.get("prism:eIssn")
+            or coredata.get("prism:isbn")
+        )
+        if isinstance(issn_raw, list):
+            issn_raw = issn_raw[0] if issn_raw else None
+        if isinstance(issn_raw, dict):
+            issn_raw = issn_raw.get("$") or issn_raw.get("#text")
+
+        issn = _clean_issn(str(issn_raw)) if issn_raw else None
+
+        source_title = coredata.get("prism:publicationName")
+        if isinstance(source_title, dict):
+            source_title = source_title.get("$")
+
+        logger.debug(f"EID {eid_clean} → ISSN={issn}, fuente={source_title}")
+        return issn, source_title or None
 
     def get_issn_from_doi(self, doi: str) -> tuple[str | None, str | None]:
         """
@@ -324,34 +402,61 @@ class SerialTitleExtractor:
                 - 'coverage_error'         str o None
         """
         # ── 1. Identificar journals únicos ────────────────────────────
-        # Prioridad: ISSN > ISBN (como ISSN) > DOI (para resolver ISSN) > nombre revista
-        journal_keys: dict[str, dict] = {}   # key → {type, value}
-        for pub in publications:
-            issn = _clean_issn(pub.get("issn", ""))
-            isbn = _clean_issn(pub.get("isbn", ""))   # ISBN puede funcionar como ISSN de serie
-            doi  = (pub.get("doi") or "").strip()
-            src  = (pub.get("source_title") or "").strip()
+        # Prioridad: todos los ISSNs > ISBN > DOI > nombre revista
+        # Valores previos válidos = registros que ya fueron consultados antes
+        # y se omiten para no gastar cuota de API innecesariamente.
+        _SKIP_VALUES = {"", "sin datos", "no encontrada", "—"}
 
-            if issn:
-                key = f"issn:{issn}"
-                if key not in journal_keys:
-                    journal_keys[key] = {"type": "issn", "value": issn}
+        def _has_prev_data(pub: dict) -> bool:
+            """True si la publicación ya tiene datos de cobertura válidos."""
+            in_cov = str(pub.get("_prev_in_coverage") or "").strip().lower()
+            found  = str(pub.get("_prev_journal_found") or "").strip().lower()
+            return in_cov not in _SKIP_VALUES and found in ("sí", "si", "true", "1")
+
+        journal_keys: dict[str, dict] = {}   # key → {type, value}
+        skipped_prev = 0
+        for pub in publications:
+            if _has_prev_data(pub):
+                skipped_prev += 1
+                continue   # ya tiene datos buenos — no consultar
+
+            issns = _split_issns(pub.get("issn", ""))   # puede haber varios
+            isbn  = _clean_issn(pub.get("isbn", ""))     # ISBN como ISSN de serie
+            doi   = (pub.get("doi") or "").strip()
+            eid   = (pub.get("eid") or "").strip()
+            src   = (pub.get("source_title") or "").strip()
+
+            if issns:
+                for issn in issns:
+                    key = f"issn:{issn}"
+                    if key not in journal_keys:
+                        journal_keys[key] = {"type": "issn", "value": issn, "title_fallback": src}
             elif isbn:
                 # Algunos libros/series tienen ISSN válido donde va el ISBN
                 key = f"issn:{isbn}"
                 if key not in journal_keys:
-                    journal_keys[key] = {"type": "issn", "value": isbn}
+                    journal_keys[key] = {"type": "issn", "value": isbn, "title_fallback": src}
+            elif src:
+                # Sin ISSN: preferir source_title para deduplicar por revista
+                # (evita N llamadas a Abstract Retrieval API via DOI/EID)
+                key = f"title:{src.lower()}"
+                if key not in journal_keys:
+                    journal_keys[key] = {
+                        "type": "title", "value": src,
+                        "doi_fallback": doi, "eid_fallback": eid,
+                    }
             elif doi:
                 key = f"doi:{doi.lower()}"
                 if key not in journal_keys:
                     journal_keys[key] = {"type": "doi", "value": doi}
-            elif src:
-                key = f"title:{src.lower()}"
+            elif eid:
+                key = f"eid:{eid.lower()}"
                 if key not in journal_keys:
-                    journal_keys[key] = {"type": "title", "value": src}
+                    journal_keys[key] = {"type": "eid", "value": eid}
 
         logger.info(
             f"check_publications_coverage: {len(publications)} publicaciones, "
+            f"{skipped_prev} ya con datos previos, "
             f"{len(journal_keys)} journals únicos a consultar."
         )
 
@@ -371,7 +476,28 @@ class SerialTitleExtractor:
                     elif resolved_title:
                         result = self.search_journal_by_title(resolved_title)
                     else:
-                        result = {"issn": info["value"], "error": "DOI no encontrado en Scopus o sin ISSN asociado."}
+                        # Fallback: buscar por título de la revista si estaba disponible
+                        title_fallback = (info.get("title_fallback") or "").strip()
+                        if title_fallback:
+                            logger.debug(f"DOI sin ISSN — usando source_title como fallback: {title_fallback!r}")
+                            result = self.search_journal_by_title(title_fallback)
+                        else:
+                            result = {"issn": info["value"], "error": "DOI no encontrado en Scopus o sin ISSN asociado."}
+                elif info["type"] == "eid":
+                    # Resolver EID → ISSN via Abstract Retrieval API
+                    resolved_issn, resolved_title = self.get_issn_from_eid(info["value"])
+                    if resolved_issn:
+                        result = self.get_journal_coverage(resolved_issn)
+                    elif resolved_title:
+                        result = self.search_journal_by_title(resolved_title)
+                    else:
+                        # Fallback: buscar por título de la revista si estaba disponible
+                        title_fallback = (info.get("title_fallback") or "").strip()
+                        if title_fallback:
+                            logger.debug(f"EID sin ISSN — usando source_title como fallback: {title_fallback!r}")
+                            result = self.search_journal_by_title(title_fallback)
+                        else:
+                            result = {"issn": info["value"], "error": "EID no encontrado en Scopus o sin ISSN asociado."}
                 else:
                     result = self.search_journal_by_title(info["value"])
                 return key, result
@@ -392,23 +518,57 @@ class SerialTitleExtractor:
         enriched = []
         for pub in publications:
             row = dict(pub)
-            issn = _clean_issn(pub.get("issn", ""))
-            isbn = _clean_issn(pub.get("isbn", ""))
-            doi  = (pub.get("doi") or "").strip()
-            src  = (pub.get("source_title") or "").strip()
 
-            if issn:
-                cache_key = f"issn:{issn}"
+            # Si ya tenía datos válidos del Excel anterior → restaurarlos tal cual
+            if _has_prev_data(pub):
+                row["scopus_journal_title"]  = pub.get("_prev_scopus_journal_title") or None
+                row["scopus_publisher"]      = pub.get("_prev_scopus_publisher") or None
+                row["journal_status"]        = pub.get("_prev_journal_status") or "Unknown"
+                row["coverage_from"]         = None
+                row["coverage_to"]           = None
+                row["coverage_periods"]      = []
+                row["coverage_periods_str"]  = pub.get("_prev_coverage_periods_str") or "—"
+                row["journal_found"]         = True
+                row["journal_subject_areas"] = None
+                row["in_coverage"]           = pub.get("_prev_in_coverage") or "Sin datos"
+                row["coverage_error"]        = None
+                enriched.append(row)
+                continue
+
+            issns = _split_issns(pub.get("issn", ""))  # lista de ISSNs
+            isbn  = _clean_issn(pub.get("isbn", ""))
+            doi   = (pub.get("doi") or "").strip()
+            eid   = (pub.get("eid") or "").strip()
+            src   = (pub.get("source_title") or "").strip()
+
+            # Buscar en caché probando cada ISSN hasta obtener uno válido
+            journal_info = None
+            cache_key    = None
+            if issns:
+                for issn in issns:
+                    k = f"issn:{issn}"
+                    candidate = journal_cache.get(k)
+                    if candidate and not candidate.get("error"):
+                        journal_info = candidate
+                        cache_key = k
+                        break
+                # Si ninguno tuvo éxito, usar el primero (para mostrar el error)
+                if journal_info is None and issns:
+                    cache_key = f"issn:{issns[0]}"
+                    journal_info = journal_cache.get(cache_key)
             elif isbn:
                 cache_key = f"issn:{isbn}"
+                journal_info = journal_cache.get(cache_key)
+            elif src:
+                # Sin ISSN/ISBN: la clave primaria en caché es title (ver Step 1)
+                cache_key = f"title:{src.lower()}"
+                journal_info = journal_cache.get(cache_key)
             elif doi:
                 cache_key = f"doi:{doi.lower()}"
-            elif src:
-                cache_key = f"title:{src.lower()}"
-            else:
-                cache_key = None
-
-            journal_info = journal_cache.get(cache_key) if cache_key else None
+                journal_info = journal_cache.get(cache_key)
+            elif eid:
+                cache_key = f"eid:{eid.lower()}"
+                journal_info = journal_cache.get(cache_key)
 
             if journal_info and not journal_info.get("error"):
                 row["scopus_journal_title"]   = journal_info.get("title")
@@ -552,8 +712,19 @@ class SerialTitleExtractor:
         if isinstance(explicit_status, dict):
             explicit_status = explicit_status.get("$")
 
+        # Normalizar códigos de un carácter que devuelve el API de Scopus:
+        #   "d" → Discontinued,  "n" / "a" → Active
+        _STATUS_MAP: dict[str, str] = {
+            "d":              "Discontinued",
+            "discontinued":   "Discontinued",
+            "inactive":       "Discontinued",
+            "n":              "Active",
+            "a":              "Active",
+            "active":         "Active",
+        }
+
         if explicit_status:
-            status = explicit_status
+            status = _STATUS_MAP.get(str(explicit_status).strip().lower(), explicit_status)
         elif coverage_to and coverage_to >= current_year - 1:
             status = "Active"
         elif coverage_to:

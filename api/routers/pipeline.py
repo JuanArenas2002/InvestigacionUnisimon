@@ -469,14 +469,39 @@ async def scopus_check_publications_coverage(
     logger.info(f"[check-coverage] Excel leído: {len(rows)} publicaciones, {len(headers)} columnas")
 
     # 2. Mapear a formato que acepta check_publications_coverage
+    # Incluir datos previos de cobertura (si el Excel ya fue procesado antes)
+    # para que check_publications_coverage solo re-consulte los que tienen 'Sin datos'.
+    import re as _re
+    _EID_FROM_URL = _re.compile(r"[?&]eid=([^&\s]+)", _re.IGNORECASE)
+
+    def _resolve_eid(row: dict) -> str:
+        """Devuelve el EID directo o lo extrae del Link si la columna EID está vacía."""
+        eid = str(row.get("__eid", "") or "").strip()
+        if eid:
+            return eid
+        link = str(row.get("__link", "") or "").strip()
+        if link:
+            m = _EID_FROM_URL.search(link)
+            if m:
+                return m.group(1).strip()
+        return ""
+
     publications = [
         {
             "issn":         str(row.get("__issn", "") or ""),
             "isbn":         str(row.get("__isbn", "") or ""),
             "doi":          str(row.get("__doi", "") or ""),
+            "eid":          _resolve_eid(row),
             "source_title": str(row.get("__source_title", "") or ""),
             "year":         row.get("__year"),
             "title":        str(row.get("__title", "") or ""),
+            # Valores previos (presentes si se re-sube el Excel resultado)
+            "_prev_in_coverage":         str(row.get("¿En cobertura?", "") or ""),
+            "_prev_journal_found":        row.get("Revista en Scopus", ""),
+            "_prev_journal_status":       str(row.get("Estado revista", "") or ""),
+            "_prev_scopus_journal_title": str(row.get("Título oficial (Scopus)", "") or ""),
+            "_prev_scopus_publisher":     str(row.get("Editorial (Scopus)", "") or ""),
+            "_prev_coverage_periods_str": str(row.get("Periodos de cobertura", "") or ""),
         }
         for row in rows
     ]
@@ -485,13 +510,22 @@ async def scopus_check_publications_coverage(
     n_issn  = sum(1 for p in publications if p["issn"])
     n_isbn  = sum(1 for p in publications if p["isbn"] and not p["issn"])
     n_doi   = sum(1 for p in publications if p["doi"] and not p["issn"] and not p["isbn"])
-    n_title = sum(1 for p in publications if p["source_title"] and not p["issn"] and not p["isbn"] and not p["doi"])
-    n_none  = sum(1 for p in publications if not p["issn"] and not p["isbn"] and not p["doi"] and not p["source_title"])
+    n_eid   = sum(1 for p in publications if p["eid"] and not p["issn"] and not p["isbn"] and not p["doi"])
+    n_title = sum(1 for p in publications if p["source_title"] and not p["issn"] and not p["isbn"] and not p["doi"] and not p["eid"])
+    n_none  = sum(1 for p in publications if not p["issn"] and not p["isbn"] and not p["doi"] and not p["eid"] and not p["source_title"])
     logger.info(
         f"[check-coverage] Identificadores: ISSN={n_issn}  ISBN={n_isbn}  "
-        f"DOI={n_doi}  Solo-título={n_title}  Sin-id={n_none}  "
+        f"DOI={n_doi}  EID={n_eid}  Solo-título={n_title}  Sin-id={n_none}  "
         f"|| workers={max_workers}"
     )
+    # Diagnóstico: mostrar primeros 3 registros con sus identificadores extraidos
+    for i, p in enumerate(publications[:3]):
+        logger.info(
+            f"[check-coverage][diag] Pub#{i+1}: "
+            f"issn={p['issn']!r}  isbn={p['isbn']!r}  doi={p['doi']!r}  "
+            f"eid={p['eid']!r}  src={p['source_title']!r}  "
+            f"prev_found={p['_prev_journal_found']!r}  prev_cov={p['_prev_in_coverage']!r}"
+        )
 
     # 3. Consultar Scopus en paralelo (bloqueante — ThreadPoolExecutor interno)
     logger.info(f"[check-coverage] Iniciando consultas a Scopus Serial Title API...")
@@ -511,7 +545,7 @@ async def scopus_check_publications_coverage(
     for row, cov in zip(rows, enriched):
         row.update({
             "journal_found":         cov.get("journal_found", False),
-            "scopus_journal_title":  cov.get("title", ""),
+            "scopus_journal_title":  cov.get("scopus_journal_title", ""),
             "scopus_publisher":      cov.get("scopus_publisher", ""),
             "journal_status":        cov.get("journal_status", ""),
             "coverage_from":         cov.get("coverage_from"),

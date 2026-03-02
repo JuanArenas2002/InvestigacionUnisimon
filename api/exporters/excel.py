@@ -293,6 +293,19 @@ def read_issns_from_excel(file_bytes: bytes) -> list[str]:
 
 # ── Lector de Excel de exportación Scopus ────────────────────────────────────
 
+# Nombres de las columnas que genera el propio exportador de cobertura.
+# Al re-subir el Excel resultado como entrada, estas columnas se detectan
+# automáticamente y se descartan para evitar duplicados en el nuevo reporte.
+_COVERAGE_COL_NAMES: frozenset[str] = frozenset([
+    "Revista en Scopus",
+    "Título oficial (Scopus)",
+    "Editorial (Scopus)",
+    "Estado revista",
+    "Periodos de cobertura",
+    "¿En cobertura?",
+])
+
+
 # Mapeo flexible de nombres de columna del export Scopus → clave interna
 _SCOPUS_COL_MAP = {
     "title":          ["title"],
@@ -304,6 +317,7 @@ _SCOPUS_COL_MAP = {
     "document_type":  ["document type"],
     "authors":        ["authors"],
     "eid":            ["eid"],
+    "link":           ["link"],
     "language":       ["language of original document", "language"],
     "open_access":    ["open access"],
     "cited_by":       ["cited by"],
@@ -315,11 +329,46 @@ def _normalize_header(h: str) -> str:
     return str(h).strip().lower()
 
 
+def _deduplicate_headers(headers: list[str]) -> list[str]:
+    """Añade sufijo _2, _3… a nombres de columna duplicados."""
+    seen: dict[str, int] = {}
+    result = []
+    for h in headers:
+        if h in seen:
+            seen[h] += 1
+            result.append(f"{h}_{seen[h]}")
+        else:
+            seen[h] = 1
+            result.append(h)
+    return result
+
+
+def _looks_like_header_row(row_values: tuple) -> bool:
+    """
+    Devuelve True si la fila parece contener encabezados de columna reales.
+    Comprueba que al menos una celda coincida con palabras clave conocidas
+    de exportaciones Scopus o del propio reporte generado.
+    """
+    _KNOWN_HEADERS = {
+        "title", "year", "issn", "isbn", "doi", "eid",
+        "source title", "document type", "authors", "publisher",
+        "cited by", "open access", "language",
+        # columnas de nuestro reporte
+        "revista en scopus", "estado revista", "¿en cobertura?",
+        "título oficial (scopus)", "editorial (scopus)",
+    }
+    non_empty = [str(c).strip().lower() for c in row_values if c is not None and str(c).strip()]
+    return any(v in _KNOWN_HEADERS for v in non_empty)
+
+
 def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dict]]:
     """
-    Lee un Excel de exportación de Scopus y retorna los datos de publicaciones.
+    Lee un Excel de exportación de Scopus (o el Excel resultado del propio
+    endpoint) y retorna los datos de publicaciones.
 
-    Requiere que la primera fila sea encabezados.
+    Detecta automáticamente si la fila 1 es un título del reporte (celda
+    fusionada) y en ese caso usa la fila 2 como encabezados reales.
+
     Columnas clave detectadas automáticamente (case-insensitive):
       Title, Year, Source title, ISSN, DOI, Document Type, Authors, EID…
 
@@ -329,6 +378,7 @@ def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dic
     Returns:
         Tuple (headers: list[str], rows: list[dict]):
           - headers: nombres originales de columna en orden
+            (sin las columnas de cobertura si el archivo es un resultado previo)
           - rows: cada fila como dict con TODOS los valores originales,
                   MÁS claves internas normalizadas (title, year, issn,
                   source_title, doi, document_type, authors)
@@ -342,26 +392,56 @@ def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dic
         raise ValueError(f"No se pudo leer el archivo Excel: {e}")
 
     ws = wb.active
-    headers: list[str] = []
+
+    # Leer todas las filas en memoria para poder decide cuál es la cabecera
+    all_rows = list(ws.iter_rows(values_only=True))
+    wb.close()
+
+    if not all_rows:
+        raise ValueError("El archivo Excel está vacío.")
+
+    # Detectar fila de encabezados: si la fila 0 parece un título del reporte
+    # (pocas celdas no vacías o no contiene palabras clave), usar la fila 1.
+    header_row_idx = 0
+    if not _looks_like_header_row(all_rows[0]):
+        if len(all_rows) > 1 and _looks_like_header_row(all_rows[1]):
+            header_row_idx = 1
+            logger_excel.info(
+                "[read_publications] Fila 1 detectada como título del reporte; "
+                "usando fila 2 como encabezados."
+            )
+        else:
+            logger_excel.warning(
+                "[read_publications] No se reconoció una fila de encabezados estándar; "
+                "se usará la primera fila como encabezados."
+            )
+
+    raw_headers: list[str] = [
+        str(c).strip() if c is not None else f"Col_{i}"
+        for i, c in enumerate(all_rows[header_row_idx])
+    ]
+    raw_headers = _deduplicate_headers(raw_headers)
+
+    logger_excel.info(
+        f"[read_publications] header_row_idx={header_row_idx}, "
+        f"total filas de datos={len(all_rows) - header_row_idx - 1}, "
+        f"headers detectados ({len(raw_headers)}): {raw_headers[:8]}{'...' if len(raw_headers)>8 else ''}"
+    )
+
     rows: list[dict] = []
+    norm_headers = {_normalize_header(h): h for h in raw_headers}
 
-    for row_idx, row in enumerate(ws.iter_rows(values_only=True), start=1):
-        if row_idx == 1:
-            headers = [str(c).strip() if c is not None else f"Col_{i}"
-                       for i, c in enumerate(row)]
-            continue
-
+    for row in all_rows[header_row_idx + 1:]:
         # Skip filas completamente vacías
         if all(c is None for c in row):
             continue
 
         row_dict: dict = {}
         # Guardar todos los valores originales
-        for col_name, val in zip(headers, row):
+        for col_name, val in zip(raw_headers, row):
             row_dict[col_name] = val if val is not None else ""
 
-        # Agregar claves internas normalizadas
-        norm_headers = {_normalize_header(h): h for h in headers}
+        # Añadir claves internas normalizadas
         for internal_key, candidates in _SCOPUS_COL_MAP.items():
             for cand in candidates:
                 orig_col = norm_headers.get(cand)
@@ -373,12 +453,21 @@ def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dic
 
         rows.append(row_dict)
 
-    wb.close()
-
-    if not headers:
-        raise ValueError("El archivo Excel no tiene encabezados en la primera fila.")
+    if not raw_headers:
+        raise ValueError("El archivo Excel no tiene encabezados reconocibles.")
     if not rows:
         raise ValueError("El archivo Excel no contiene filas de datos.")
+
+    # Si el Excel proviene de una ejecución anterior del exportador,
+    # descartar las columnas de cobertura para que el nuevo reporte
+    # las genere limpias (no aparecen duplicadas).
+    headers = [h for h in raw_headers if h not in _COVERAGE_COL_NAMES]
+    if len(headers) < len(raw_headers):
+        dropped = [h for h in raw_headers if h in _COVERAGE_COL_NAMES]
+        logger_excel.info(
+            f"[read_publications] Excel resultado re-procesado: "
+            f"se ignoraron {len(dropped)} columnas previas de cobertura: {dropped}"
+        )
 
     return headers, rows
 
@@ -386,6 +475,8 @@ def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dic
 # ── Generador del Excel de verificación de cobertura ─────────────────────────
 
 # Columnas nuevas que se añaden al reporte (hoja principal, sin áreas temáticas)
+# Los nombres de display DEBEN coincidir con _COVERAGE_COL_NAMES (para la detección
+# automática al re-procesar el Excel resultado).
 _COVERAGE_NEW_COLS = [
     ("Revista en Scopus",         "journal_found",        10),
     ("Título oficial (Scopus)",   "scopus_journal_title", 40),
@@ -474,7 +565,10 @@ def generate_publications_coverage_excel(
             elif cf:
                 row["coverage_periods_str"] = f"{cf}–actual"
             else:
-                row["coverage_periods_str"] = "—"
+                # Preservar valor previo si ya venía del Excel anterior;
+                # solo poner "—" si realmente no hay nada.
+                prev = str(row.get("coverage_periods_str") or "").strip()
+                row["coverage_periods_str"] = prev if prev and prev != "—" else "—"
 
     # ── Hoja 1: Cobertura ─────────────────────────────────────────────────────
     ws = wb.active
@@ -594,77 +688,87 @@ def generate_publications_coverage_excel(
     last_data_row = 2 + len(rows)                          # row 1=titulo, 2=headers, 3..N=datos
 
     # ── Hoja 3: Descontinuadas ────────────────────────────────────────────────
-    # Scopus puede retornar 'Discontinued', 'Inactive' o derivar el estado como 'Discontinued'
+    # Una fila por REVISTA única descontinuada (no por artículo)
     _DISC_STATUSES = {"discontinued", "inactive"}
 
-    # Log de diagnóstico: mostrar distribución de journal_status en los rows
+    # Log de diagnóstico
     status_counts: dict[str, int] = {}
     for r in rows:
         s = str(r.get("journal_status", "") or "").strip()
         status_counts[s] = status_counts.get(s, 0) + 1
     logger_excel.info(f"[Excel] Distribución journal_status: {status_counts}")
 
-    discontinued_rows = [
-        r for r in rows
-        if str(r.get("journal_status", "")).strip().lower() in _DISC_STATUSES
+    # Deduplicar revistas descontinuadas: clave = título Scopus (o ISSN como fallback)
+    _seen_disc: dict[str, dict] = {}   # clave → datos de la revista
+    _disc_pub_count: dict[str, int] = {}  # clave → # publicaciones afectadas
+    for r in rows:
+        if str(r.get("journal_status", "")).strip().lower() not in _DISC_STATUSES:
+            continue
+        key = (
+            str(r.get("scopus_journal_title") or "").strip().lower()
+            or str(r.get("__issn") or r.get("issn") or "").strip()
+            or str(r.get("__source_title") or "").strip().lower()
+        )
+        if not key:
+            continue
+        _disc_pub_count[key] = _disc_pub_count.get(key, 0) + 1
+        if key not in _seen_disc:
+            _seen_disc[key] = {
+                "issn":              str(r.get("__issn") or r.get("issn") or "—"),
+                "titulo_scopus":     r.get("scopus_journal_title") or r.get("__source_title") or "—",
+                "editorial":         r.get("scopus_publisher") or "—",
+                "estado":            r.get("journal_status") or "Discontinued",
+                "periodos":          r.get("coverage_periods_str") or "—",
+                "areas":             r.get("journal_subject_areas") or "—",
+            }
+
+    _disc_journals = [
+        {**datos, "publicaciones_afectadas": _disc_pub_count[clave]}
+        for clave, datos in _seen_disc.items()
     ]
-    logger_excel.info(f"[Excel] Filas descontinuadas encontradas: {len(discontinued_rows)} / {len(rows)}")
-    if discontinued_rows:
+    # Ordenar por título
+    _disc_journals.sort(key=lambda x: str(x.get("titulo_scopus", "")).lower())
+
+    logger_excel.info(f"[Excel] Revistas descontinuadas únicas: {len(_disc_journals)} / {len(_seen_disc)} (sobre {len(rows)} filas)")
+
+    if _disc_journals:
         ws_disc = wb.create_sheet("Descontinuadas")
+        _DISC_COLS = [
+            ("ISSN",                   "issn",                   14),
+            ("Título oficial (Scopus)", "titulo_scopus",          44),
+            ("Editorial",              "editorial",               28),
+            ("Estado",                 "estado",                  16),
+            ("Periodos de cobertura",  "periodos",                34),
+            ("Áreas temáticas",        "areas",                   46),
+            ("# Publicaciones afectadas", "publicaciones_afectadas", 20),
+        ]
+        disc_col_names = [c[0] for c in _DISC_COLS]
         _write_sheet_header(
-            ws_disc, main_headers,
+            ws_disc, disc_col_names,
             f"Revistas Descontinuadas en Scopus  —  "
-            f"{len(discontinued_rows)} publicaciones  —  "
+            f"{len(_disc_journals)} revistas únicas  —  "
             f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
         )
-        for row_idx, row in enumerate(discontinued_rows, start=3):
-            in_cov = str(row.get("in_coverage", ""))
-            row_fill_color = _coverage_row_color(in_cov, row.get("journal_found", False), row_idx)
-            row_fill = PatternFill(fill_type="solid", fgColor=row_fill_color)
+        disc_fill = PatternFill(fill_type="solid", fgColor=COLOR_DISCONT)
+        alt_fill  = PatternFill(fill_type="solid", fgColor="FFE8E8")
 
-            for col_idx, col_name in enumerate(article_headers, start=1):
-                val = row.get(col_name, "")
-                cell = ws_disc.cell(row=row_idx, column=col_idx, value=val)
-                cell.border = THIN_BORDER
-                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
-
-            for extra_idx, (col_label, col_key, _) in enumerate(_COVERAGE_NEW_COLS):
-                col_idx = new_col_start + extra_idx
-                raw_val = row.get(col_key)
-                if col_key == "journal_found":
-                    val = "Sí" if raw_val else "No"
-                elif raw_val is None or raw_val == "":
-                    val = "—"
-                else:
-                    val = raw_val
+        for row_idx, jrn in enumerate(_disc_journals, start=3):
+            row_fill = disc_fill if row_idx % 2 == 0 else alt_fill
+            for col_idx, (_, col_key, _) in enumerate(_DISC_COLS, start=1):
+                val = jrn.get(col_key, "—")
                 cell = ws_disc.cell(row=row_idx, column=col_idx, value=val)
                 cell.fill = row_fill
                 cell.border = THIN_BORDER
-                cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
-                if col_key == "in_coverage":
-                    cell.font = Font(bold=True)
-            ws_disc.row_dimensions[row_idx].height = 18
+                cell.alignment = Alignment(
+                    horizontal="center" if col_key == "publicaciones_afectadas" else "left",
+                    vertical="center",
+                    wrap_text=True,
+                )
+            ws_disc.row_dimensions[row_idx].height = 20
 
-        # Anchos hoja Descontinuadas (mismos que Cobertura)
-        for col_idx, col_name in enumerate(article_headers, start=1):
-            col_letter = get_column_letter(col_idx)
-            norm = _normalize_header(col_name)
-            if "title" in norm and "source" not in norm:
-                ws_disc.column_dimensions[col_letter].width = 50
-            elif "source title" in norm:
-                ws_disc.column_dimensions[col_letter].width = 32
-            elif norm in ("year", "volume", "issue", "cited by", "art. no.", "page start", "page end"):
-                ws_disc.column_dimensions[col_letter].width = 9
-            elif norm in ("doi", "link", "eid"):
-                ws_disc.column_dimensions[col_letter].width = 42
-            elif norm in ("issn", "isbn", "coden"):
-                ws_disc.column_dimensions[col_letter].width = 14
-            else:
-                ws_disc.column_dimensions[col_letter].width = 18
-        for extra_idx, (_, _, width) in enumerate(_COVERAGE_NEW_COLS):
-            col_letter = get_column_letter(new_col_start + extra_idx)
-            ws_disc.column_dimensions[col_letter].width = width
-        ws_disc.freeze_panes = "C3"
+        for col_idx, (_, _, width) in enumerate(_DISC_COLS, start=1):
+            ws_disc.column_dimensions[get_column_letter(col_idx)].width = width
+        ws_disc.freeze_panes = "A3"
 
     # ── Hoja 4: Resumen ───────────────────────────────────────────────────────
     ws_sum = wb.create_sheet("Resumen")
