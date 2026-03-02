@@ -22,12 +22,43 @@ from fastapi.middleware.cors import CORSMiddleware
 from db.session import create_all_tables, check_connection
 
 # ── Logging ──────────────────────────────────────────────────
+# NO usar basicConfig aquí: uvicorn instala su propio log config con
+# disable_existing_loggers=True, lo que silencia los loggers creados antes.
+# La solución es configurarlos explícitamente con handlers propios.
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s │ %(name)-25s │ %(levelname)-7s │ %(message)s",
+_LOG_FMT = logging.Formatter(
+    "%(asctime)s │ %(name)-28s │ %(levelname)-7s │ %(message)s",
     datefmt="%H:%M:%S",
 )
+
+# Loggers de la aplicación que queremos ver en consola
+_APP_LOGGERS = [
+    "api",
+    "pipeline",
+    "excel",
+    "extractors.serial_title",
+    "extractors.scopus",
+    "extractors.openalex",
+    "extractors.wos",
+    "extractors.cvlac",
+    "reconciliation.engine",
+]
+
+def _setup_app_logging():
+    """
+    Adjunta un StreamHandler propio a cada logger de la aplicación.
+    Se llama desde el lifespan, DESPUÉS de que uvicorn terminó su setup,
+    así no puede silenciarnos con disable_existing_loggers=True.
+    """
+    handler = logging.StreamHandler()
+    handler.setFormatter(_LOG_FMT)
+    for name in _APP_LOGGERS:
+        lg = logging.getLogger(name)
+        lg.setLevel(logging.INFO)
+        # Reemplazar handlers previos para evitar duplicados en --reload
+        lg.handlers = [handler]
+        lg.propagate = False   # no pasar al root (evita doble impresión)
+
 logger = logging.getLogger("api")
 
 
@@ -36,6 +67,7 @@ logger = logging.getLogger("api")
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Startup / shutdown de la aplicación."""
+    _setup_app_logging()   # ← configurar logging AQUÍ, después de uvicorn
     logger.info("Iniciando API de Reconciliación Bibliográfica...")
     if check_connection():
         logger.info("Conexión a PostgreSQL verificada.")

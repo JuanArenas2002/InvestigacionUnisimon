@@ -1,13 +1,9 @@
-# --- ENDPOINT: Extraer y guardar productos de OpenAlex por ROR ---
-
-# Endpoint temporal para probar extracción de Scopus
 import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Any
 
-
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
+from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body, UploadFile, File, Query
 from sqlalchemy.orm import Session
 from pydantic import BaseModel
 
@@ -23,18 +19,20 @@ from api.schemas.external_records import (
     CrossrefScopusResponse,
     EnrichedFieldDetail,
 )
+from api.schemas.serial_title import (
+    JournalCoverageResponse,
+    BulkCoverageRequest,
+    BulkCoverageResponse,
+)
 from api.schemas.common import MessageResponse
 from config import DATA_DIR
 from extractors.base import StandardRecord
 from reconciliation.engine import ReconciliationEngine
 
-from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Body
+logger = logging.getLogger("pipeline")
 router = APIRouter(prefix="/pipeline", tags=["Pipeline"])
 
-# --- ENDPOINT: Extraer y guardar productos de OpenAlex por ROR ---
-
-# --- ENDPOINT: Extraer y guardar productos de OpenAlex por ROR ---
-from api.schemas.external_records import ExtractionRequest
+# --- ENDPOINTS ---
 
 @router.post("/extract/openalex", response_model=ExtractionResponse, summary="Extraer de OpenAlex por ROR")
 def extract_openalex(body: ExtractionRequest):
@@ -97,7 +95,6 @@ def extract_openalex(body: ExtractionRequest):
 
 
 # --- RECONCILIACIÓN GLOBAL TODOS CONTRA TODOS ---
-from fastapi import HTTPException
 @router.post("/reconcile/all-sources", response_model=dict, summary="Reconciliar todos los registros de todas las fuentes")
 def reconcile_all_sources(db: Session = Depends(get_db)):
     """
@@ -214,12 +211,344 @@ def scopus_test_extract():
     session.commit()
     session.close()
     return {"inserted": inserted, "total": len(records)}
-import logging
-logger = logging.getLogger("pipeline")
-from pydantic import BaseModel
-# --- IMPORTS Y ROUTER ---
-# --- LOGGING ---
-import logging
+
+
+# --- ENDPOINTS: Cobertura de revistas (Serial Title API) --- Módulo desacoplado
+# Extractor: extractors/serial_title.py
+# Exportador: api/exporters/excel.py
+# Schemas:    api/schemas/serial_title.py
+
+@router.get(
+    "/scopus/journal-coverage",
+    response_model=JournalCoverageResponse,
+    summary="Cobertura de una revista en Scopus por ISSN",
+    description=(
+        "Consulta el Serial Title API de Scopus para un ISSN y retorna "
+        "los años de cobertura y si la revista está activa o descontinuada."
+    ),
+)
+def scopus_journal_coverage(issn: str):
+    """
+    Ejemplo: GET /pipeline/scopus/journal-coverage?issn=0028-0836
+    """
+    from extractors.serial_title import SerialTitleExtractor, SerialTitleAPIError
+
+    extractor = SerialTitleExtractor()
+    try:
+        result = extractor.get_journal_coverage(issn)
+    except SerialTitleAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    if result.get("error"):
+        raise HTTPException(status_code=404, detail=result["error"])
+
+    return JournalCoverageResponse(**result)
+
+
+@router.post(
+    "/scopus/journal-coverage/bulk",
+    summary="Cobertura masiva de revistas en Scopus — retorna Excel",
+    description=(
+        "Recibe una lista de ISSNs, los consulta en paralelo al Serial Title API "
+        "de Scopus y devuelve un archivo Excel (.xlsx) con los resultados, "
+        "incluyendo años de cobertura, estado y editorial de cada revista."
+    ),
+    responses={
+        200: {
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+            "description": "Archivo Excel con la cobertura de las revistas consultadas.",
+        }
+    },
+)
+def scopus_journal_coverage_bulk(body: BulkCoverageRequest):
+    """
+    Ejemplo de body:
+    ```json
+    {
+      "issns": ["2595-3982", "0028-0836", "1234-5678"],
+      "max_workers": 5
+    }
+    ```
+    Retorna un archivo `journal_coverage.xlsx` para descargar.
+    """
+    import io
+    from fastapi.responses import StreamingResponse
+    from extractors.serial_title import SerialTitleExtractor, SerialTitleAPIError
+    from api.exporters.excel import generate_journal_coverage_excel
+
+    extractor = SerialTitleExtractor()
+    try:
+        results = extractor.get_bulk_coverage(
+            issns=body.issns,
+            max_workers=body.max_workers,
+        )
+    except SerialTitleAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Convertir subject_areas (lista) a str para serializar correctamente
+    serialized = []
+    for r in results:
+        row = dict(r)
+        if isinstance(row.get("subject_areas"), list):
+            row["subject_areas"] = " | ".join(row["subject_areas"])
+        serialized.append(row)
+
+    excel_bytes = generate_journal_coverage_excel(results)
+
+    filename = f"journal_coverage_{len(body.issns)}_issns.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.post(
+    "/scopus/journal-coverage/bulk-from-file",
+    summary="Cobertura masiva de revistas — carga un Excel con ISSNs",
+    description=(
+        "Sube un archivo Excel (.xlsx) con una columna de ISSNs (columna A). "
+        "El sistema extrae los ISSNs, los consulta en paralelo en Scopus y "
+        "devuelve un nuevo Excel con los resultados de cobertura. "
+        "La primera fila puede ser encabezado; se detecta y omite automáticamente."
+    ),
+    responses={
+        200: {
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+            "description": "Excel con resultados de cobertura por cada ISSN.",
+        }
+    },
+)
+def scopus_journal_coverage_bulk_from_file(
+    file: UploadFile = File(..., description="Archivo .xlsx con ISSNs en la columna A"),
+    max_workers: int = Query(5, ge=1, le=10, description="Hilos paralelos (1-10)"),
+):
+    """
+    Formato del Excel de entrada:
+    | ISSN        |       ← encabezado opcional
+    |-------------|  
+    | 2595-3982   |
+    | 0028-0836   |
+    | 25953982    |  ← con o sin guion
+    """
+    import io
+    from fastapi.responses import StreamingResponse
+    from extractors.serial_title import SerialTitleExtractor, SerialTitleAPIError
+    from api.exporters.excel import generate_journal_coverage_excel, read_issns_from_excel
+
+    # Validar extensión
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(
+            status_code=400,
+            detail="Solo se aceptan archivos Excel (.xlsx). Recibido: " + file.filename,
+        )
+
+    # Leer archivo
+    file_bytes = file.file.read()
+    try:
+        issns = read_issns_from_excel(file_bytes)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+
+    # Consultar Scopus
+    extractor = SerialTitleExtractor()
+    try:
+        results = extractor.get_bulk_coverage(issns=issns, max_workers=max_workers)
+    except SerialTitleAPIError as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Generar Excel de salida
+    excel_bytes = generate_journal_coverage_excel(results)
+    filename = f"journal_coverage_{len(issns)}_issns.xlsx"
+    return StreamingResponse(
+        io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@router.get(
+    "/scopus/journal-coverage/debug",
+    summary="[DEBUG] JSON crudo + resultado parseado del Serial Title API",
+)
+def scopus_journal_coverage_debug(issn: str):
+    """
+    Retorna el JSON sin procesar del Serial Title API **y** el resultado
+    del parser interno, para comparar ambos y detectar discrepancias.
+    Ejemplo: GET /pipeline/scopus/journal-coverage/debug?issn=1473-2130
+    """
+    from extractors.serial_title import SerialTitleExtractor
+
+    extractor = SerialTitleExtractor()
+    clean_issn = issn.strip().replace("-", "")
+    url = f"{extractor.BASE_URL}/{clean_issn}"
+    try:
+        resp = extractor.session.get(
+            url,
+            params={"view": "ENHANCED"},
+            timeout=20,
+        )
+        raw = resp.json()
+    except Exception as e:
+        raise HTTPException(status_code=502, detail=str(e))
+
+    # Parsed result
+    try:
+        parsed = extractor._parse_entry(clean_issn, raw)
+    except Exception as e:
+        parsed = {"parse_error": str(e)}
+
+    # Extraer solo los campos de cobertura del raw para comparar fácilmente
+    entry = (raw.get("serial-metadata-response", {}).get("entry") or [{}])[0]
+    coverage_debug = {
+        "coverageStartYear_root": entry.get("coverageStartYear"),
+        "coverageEndYear_root":   entry.get("coverageEndYear"),
+        "covers_raw":             entry.get("covers"),
+        "coverageInfo_raw":       entry.get("coverageInfo"),
+        "all_entry_keys":         sorted(entry.keys()) if isinstance(entry, dict) else [],
+    }
+
+    return {
+        "status_code": resp.status_code,
+        "url":         str(resp.url),
+        "coverage_fields": coverage_debug,
+        "parsed_result":   parsed,
+        "raw_body":        raw,
+    }
+
+
+@router.post(
+    "/scopus/check-publications-coverage",
+    summary="Verificar cobertura Scopus para publicaciones (Excel)",
+    responses={
+        200: {
+            "description": "Excel con cada publicación enriquecida con datos de cobertura Scopus.",
+            "content": {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}
+            },
+        }
+    },
+)
+async def scopus_check_publications_coverage(
+    file: UploadFile = File(..., description="Excel de exportación Scopus (columnas: Title, Year, Source title, ISSN, DOI, …)"),
+    max_workers: int = Query(5, ge=1, le=10, description="Hilos paralelos para consultar la API de Scopus"),
+):
+    """
+    Acepta un Excel de exportación de Scopus (o similar) con una publicación por fila.
+
+    Para cada publicación:
+    1. Busca la revista por ISSN (fallback: ISBN → DOI → nombre).
+    2. Comprueba si el año de publicación cae dentro de algún periodo de cobertura Scopus.
+
+    Devuelve un Excel enriquecido con columnas adicionales:
+    - **Revista en Scopus** (Sí/No)
+    - **Título oficial (Scopus)**
+    - **Editorial (Scopus)**
+    - **Estado revista** (Active / Discontinued / Unknown)
+    - **Periodos de cobertura** (ej: 2002  |  2006–2026)
+    - **¿En cobertura?** ← coloreada
+    """
+    import io as _io
+    from starlette.concurrency import run_in_threadpool
+    from fastapi.responses import StreamingResponse
+    from extractors.serial_title import SerialTitleExtractor, SerialTitleAPIError
+    from api.exporters.excel import read_publications_from_excel, generate_publications_coverage_excel
+
+    raw = await file.read()
+    if not raw:
+        raise HTTPException(400, "El archivo está vacío.")
+
+    logger.info(f"[check-coverage] Archivo recibido: '{file.filename}' ({len(raw):,} bytes)")
+
+    # 1. Leer Excel (bloqueante — openpyxl)
+    try:
+        headers, rows = await run_in_threadpool(read_publications_from_excel, raw)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+
+    logger.info(f"[check-coverage] Excel leído: {len(rows)} publicaciones, {len(headers)} columnas")
+
+    # 2. Mapear a formato que acepta check_publications_coverage
+    publications = [
+        {
+            "issn":         str(row.get("__issn", "") or ""),
+            "isbn":         str(row.get("__isbn", "") or ""),
+            "doi":          str(row.get("__doi", "") or ""),
+            "source_title": str(row.get("__source_title", "") or ""),
+            "year":         row.get("__year"),
+            "title":        str(row.get("__title", "") or ""),
+        }
+        for row in rows
+    ]
+
+    # Resumen de identifiers disponibles
+    n_issn  = sum(1 for p in publications if p["issn"])
+    n_isbn  = sum(1 for p in publications if p["isbn"] and not p["issn"])
+    n_doi   = sum(1 for p in publications if p["doi"] and not p["issn"] and not p["isbn"])
+    n_title = sum(1 for p in publications if p["source_title"] and not p["issn"] and not p["isbn"] and not p["doi"])
+    n_none  = sum(1 for p in publications if not p["issn"] and not p["isbn"] and not p["doi"] and not p["source_title"])
+    logger.info(
+        f"[check-coverage] Identificadores: ISSN={n_issn}  ISBN={n_isbn}  "
+        f"DOI={n_doi}  Solo-título={n_title}  Sin-id={n_none}  "
+        f"|| workers={max_workers}"
+    )
+
+    # 3. Consultar Scopus en paralelo (bloqueante — ThreadPoolExecutor interno)
+    logger.info(f"[check-coverage] Iniciando consultas a Scopus Serial Title API...")
+    extractor = SerialTitleExtractor()
+    try:
+        enriched = await run_in_threadpool(
+            extractor.check_publications_coverage,
+            publications,
+            max_workers,
+        )
+    except SerialTitleAPIError as e:
+        raise HTTPException(502, f"Error consultando Scopus Serial Title API: {e}")
+
+    logger.info(f"[check-coverage] Consultas finalizadas. {len(enriched)} resultados recibidos.")
+
+    # 4. Fusionar resultados con filas originales
+    for row, cov in zip(rows, enriched):
+        row.update({
+            "journal_found":         cov.get("journal_found", False),
+            "scopus_journal_title":  cov.get("title", ""),
+            "scopus_publisher":      cov.get("scopus_publisher", ""),
+            "journal_status":        cov.get("journal_status", ""),
+            "coverage_from":         cov.get("coverage_from"),
+            "coverage_to":           cov.get("coverage_to"),
+            "coverage_periods":      cov.get("coverage_periods", []),
+            "in_coverage":           cov.get("in_coverage", "Sin datos"),
+            "journal_subject_areas": cov.get("journal_subject_areas", ""),
+        })
+
+    # Resumen de resultados
+    n_found       = sum(1 for r in enriched if r.get("journal_found"))
+    n_in_cov      = sum(1 for r in enriched if r.get("in_coverage") == "Sí")
+    n_discont     = sum(1 for r in enriched if str(r.get("journal_status","")).strip().lower() in ("discontinued", "inactive"))
+    n_sin_datos   = sum(1 for r in enriched if r.get("in_coverage") == "Sin datos")
+    logger.info(
+        f"[check-coverage] Resultados: encontradas={n_found}/{len(enriched)}  "
+        f"en-cobertura={n_in_cov}  descontinuadas={n_discont}  sin-datos={n_sin_datos}"
+    )
+
+    # 5. Generar Excel de salida (bloqueante — openpyxl)
+    logger.info(f"[check-coverage] Generando Excel de salida...")
+    try:
+        excel_bytes = await run_in_threadpool(generate_publications_coverage_excel, headers, rows)
+    except Exception as e:
+        logger.exception("[check-coverage] Error generando Excel")
+        raise HTTPException(500, f"Error generando el archivo Excel de salida: {e}")
+
+    logger.info(f"[check-coverage] Excel generado: {len(excel_bytes):,} bytes. Enviando descarga.")
+
+    filename = f"cobertura_scopus_{len(rows)}_pubs.xlsx"
+    return StreamingResponse(
+        _io.BytesIO(excel_bytes),
+        media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
 @router.get("/scopus/debug/raw", summary="Depuración: respuesta cruda de Scopus")
 def scopus_debug_raw():
     from config import institution
@@ -241,8 +570,7 @@ def scopus_debug_raw():
     }
     resp = extractor.session.get(extractor.SEARCH_URL, params=params, timeout=extractor.config.timeout)
     return resp.json()
-# --- IMPORTS Y ROUTER ---
-# --- LOGGING ---
+
 
 # ── MODELOS PARA BÚSQUEDA DE DOI ──
 class DoiSearchRequest(BaseModel):

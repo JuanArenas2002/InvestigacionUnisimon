@@ -143,6 +143,10 @@ class EnrichedFieldDetail(BaseModel):
     new_value: Optional[str] = None
 
 
+# Re-exportar desde serial_title para compatibilidad con imports existentes
+from api.schemas.serial_title import JournalCoverageResponse  # noqa: F401
+
+
 class CrossrefScopusResponse(BaseModel):
     """Respuesta del cruce/enriquecimiento de inventario con Scopus por DOI."""
     total_canonical_with_doi: int = Field(
