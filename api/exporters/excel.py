@@ -163,6 +163,8 @@ def _row_fill_color(item: dict, row_idx: int) -> str:
     status = (item.get("status") or "").lower()
     if "discontinued" in status or "inactive" in status:
         return COLOR_DISCONT
+    if status == "inactiva":
+        return "FCE5CD"   # naranja muy claro — inactiva (sin confirmación de Scopus)
     if "active" in status:
         # Alternar tono verde para legibilidad
         return COLOR_ACTIVE if row_idx % 2 == 0 else "D9F0DD"
@@ -183,7 +185,7 @@ def _write_summary_sheet(ws, results: List[dict]):
     not_found = sum(1 for r in results if r.get("error") == "Revista no encontrada en Scopus.")
     errors    = sum(1 for r in results if r.get("error") and r.get("error") != "Revista no encontrada en Scopus.")
     active    = sum(1 for r in results if (r.get("status") or "").lower() == "active")
-    discont   = sum(1 for r in results if (r.get("status") or "").lower() in ("discontinued", "inactive"))
+    discont   = sum(1 for r in results if (r.get("status") or "").lower() in ("discontinued", "inactive", "inactiva"))
     unknown   = sum(1 for r in results if (r.get("status") or "").lower() == "unknown" and not r.get("error"))
 
     header_fill = PatternFill(fill_type="solid", fgColor=COLOR_HEADER_BG)
@@ -297,24 +299,44 @@ def read_issns_from_excel(file_bytes: bytes) -> list[str]:
 # Al re-subir el Excel resultado como entrada, estas columnas se detectan
 # automáticamente y se descartan para evitar duplicados en el nuevo reporte.
 _COVERAGE_COL_NAMES: frozenset[str] = frozenset([
+    # ── Formato antiguo (export Scopus re-procesado) ──
     "Revista en Scopus",
     "Título oficial (Scopus)",
     "Editorial (Scopus)",
     "Estado revista",
     "Periodos de cobertura",
     "¿En cobertura?",
+    "ISSN resuelto (Scopus)",
+    "E-ISSN resuelto (Scopus)",
+    # ── Formato nuevo (hoja 'Cobertura' del propio reporte) ──
+    "Fuente",               # columna _source
+    "En Scopus",            # journal_found
+    "¿En cobertura?",       # in_coverage  (ya arriba, pero por claridad)
+    "Estado revista",       # journal_status  (ídem)
+    "Revista (Scopus)",     # scopus_journal_title
+    "Editorial",            # scopus_publisher
+    "Periodos cobertura",   # coverage_periods_str
+    "Áreas temáticas",      # journal_subject_areas
+    "Encontrado vía",       # journal_found_via
+    "ISSN resuelto",        # resolved_issn
+    "E-ISSN resuelto",      # resolved_eissn
+    # ── número de fila (columna '#') ──
+    "#",
 ])
 
 
 # Mapeo flexible de nombres de columna del export Scopus → clave interna
+# Cada lista incluye primero el nombre del export de Scopus original y luego
+# los nombres que usa el propio reporte generado (para re-procesamiento).
 _SCOPUS_COL_MAP = {
-    "title":          ["title"],
-    "year":           ["year"],
-    "source_title":   ["source title"],
-    "issn":           ["issn"],
+    "title":          ["title",        "título del artículo"],
+    "year":           ["year",          "año"],
+    "source_title":   ["source title",  "revista (scopus)"],
+    "issn":           ["issn",          "issn resuelto"],
+    "eissn":          ["eissn", "e-issn", "electronic issn", "e-issn resuelto"],
     "isbn":           ["isbn"],
     "doi":            ["doi"],
-    "document_type":  ["document type"],
+    "document_type":  ["document type", "tipo de publicación"],
     "authors":        ["authors"],
     "eid":            ["eid"],
     "link":           ["link"],
@@ -353,9 +375,14 @@ def _looks_like_header_row(row_values: tuple) -> bool:
         "title", "year", "issn", "isbn", "doi", "eid",
         "source title", "document type", "authors", "publisher",
         "cited by", "open access", "language",
-        # columnas de nuestro reporte
+        # columnas del reporte antiguo (re-procesamiento)
         "revista en scopus", "estado revista", "¿en cobertura?",
         "título oficial (scopus)", "editorial (scopus)",
+        # columnas del reporte nuevo (hoja 'Cobertura')
+        "fuente", "en scopus", "título del artículo", "año",
+        "tipo de publicación",
+        "revista (scopus)", "periodos cobertura", "encontrado vía",
+        "áreas temáticas", "issn resuelto", "e-issn resuelto",
     }
     non_empty = [str(c).strip().lower() for c in row_values if c is not None and str(c).strip()]
     return any(v in _KNOWN_HEADERS for v in non_empty)
@@ -478,13 +505,50 @@ def read_publications_from_excel(file_bytes: bytes) -> tuple[list[str], list[dic
 # Los nombres de display DEBEN coincidir con _COVERAGE_COL_NAMES (para la detección
 # automática al re-procesar el Excel resultado).
 _COVERAGE_NEW_COLS = [
-    ("Revista en Scopus",         "journal_found",        10),
-    ("Título oficial (Scopus)",   "scopus_journal_title", 40),
-    ("Editorial (Scopus)",        "scopus_publisher",     28),
-    ("Estado revista",            "journal_status",       16),
-    ("Periodos de cobertura",     "coverage_periods_str", 34),
-    ("¿En cobertura?",            "in_coverage",          26),
+    ("Revista en Scopus",           "journal_found",        10),
+    ("Título oficial (Scopus)",     "scopus_journal_title", 40),
+    ("Editorial (Scopus)",          "scopus_publisher",     28),
+    ("Estado revista",              "journal_status",       16),
+    ("Periodos de cobertura",       "coverage_periods_str", 34),
+    ("¿En cobertura?",              "in_coverage",          26),
+    ("ISSN resuelto (Scopus)",      "resolved_issn",        18),
+    ("E-ISSN resuelto (Scopus)",    "resolved_eissn",       18),
 ]
+
+# Columnas fijas de la hoja "Cobertura" (vista limpia)
+# (label, row_key, width, halign, wrap_text)
+_CLEAN_MAIN_COLS = [
+    ("#",                    "_row_num",              5,   "center", False),
+    ("Fuente",               "_source",              14,  "center", False),
+    ("En Scopus",            "journal_found",         11,  "center", False),
+    ("¿En cobertura?",       "in_coverage",           22,  "center", False),
+    ("Estado revista",       "journal_status",        15,  "center", False),
+    ("Título del artículo",  "__title",               52,  "left",   True),
+    ("Año",                  "__year",                 7,  "center", False),
+    ("Tipo de publicación",   "__document_type",       20,  "center", False),
+    ("Revista (Scopus)",     "scopus_journal_title",  36,  "left",   False),
+    ("Editorial",            "scopus_publisher",      24,  "left",   False),
+    ("Periodos cobertura",   "coverage_periods_str",  28,  "center", False),
+    ("Áreas temáticas",      "journal_subject_areas", 34,  "left",   True),
+    ("Encontrado vía",       "journal_found_via",     14,  "center", False),
+    ("DOI",                  "__doi",                 40,  "left",   False),
+    ("EID",                  "__eid",                 22,  "left",   False),
+    ("ISSN resuelto",        "resolved_issn",         14,  "center", False),
+    ("E-ISSN resuelto",      "resolved_eissn",        14,  "center", False),
+]
+
+
+def _in_cov_cell_color(in_cov: str) -> tuple[str, str]:
+    """Retorna (bg_color, font_color) según el valor de ¿En cobertura?."""
+    v = str(in_cov).strip().lower()
+    if v == "sí":
+        return ("1E6B2F", "FFFFFF")
+    if v.startswith("no"):
+        return ("922B21", "FFFFFF")
+    if v == "sin datos":
+        return ("7D6608", "FFFFFF")
+    return ("595959", "FFFFFF")
+
 
 # Palabras clave para detectar columnas de autores → van a la hoja "Autores"
 _AUTHOR_COL_KEYWORDS = ("author", "affiliat", "correspondence")
@@ -493,6 +557,7 @@ COLOR_IN_COV      = "C6EFCE"   # verde
 COLOR_OUT_COV     = "FFCCCC"   # rojo
 COLOR_NO_DATA     = "FFF2CC"   # amarillo
 COLOR_NOT_FOUND   = "E0E0E0"   # gris
+COLOR_FALLBACK    = "FFFF99"   # amarillo vivo — resuelto por fallback (sin ISSN directo)
 
 
 def _is_author_col(col_name: str) -> bool:
@@ -527,10 +592,13 @@ def generate_publications_coverage_excel(
     rows: list[dict],
 ) -> bytes:
     """
-    Genera un Excel de verificación de cobertura con 3 hojas:
-      1. "Cobertura" – columnas del artículo/revista (sin autores) + columnas de cobertura
-      2. "Autores"   – DOI + Título + todas las columnas de autores/afiliaciones
-      3. "Resumen"   – estadísticas del cruce
+    Genera un Excel de verificación de cobertura con las siguientes hojas:
+      1. "Cobertura"        – una fila por publicación con datos del artículo/revista
+      2. "Autores"          – una fila por AUTOR: publicación combinada + autores Scopus/OpenAlex
+      3. "Datos originales" – columnas originales del archivo fuente sin modificar
+      4. "Descontinuadas"   – resumen de revistas descontinuadas (condicional)
+      5. "Descont. OpenAlex"– detalle de publicaciones en revistas descontinuadas ×OpenAlex (condicional)
+      6. "Resumen"          – estadísticas del cruce
 
     Args:
         headers: Columnas originales del archivo fuente (en orden).
@@ -547,6 +615,8 @@ def generate_publications_coverage_excel(
 
     # Columnas de cobertura que se agregan a la hoja principal
     cov_col_names = [col[0] for col in _COVERAGE_NEW_COLS]
+
+    logger_excel.info(f"[Excel] Iniciando generación: {len(rows)} filas, {len(headers)} columnas originales")
 
     # Pre-calcular texto de periodos para cada fila
     for row in rows:
@@ -570,126 +640,417 @@ def generate_publications_coverage_excel(
                 prev = str(row.get("coverage_periods_str") or "").strip()
                 row["coverage_periods_str"] = prev if prev and prev != "—" else "—"
 
+    # Pre-crear objetos de estilo reutilizables para evitar crear miles de instancias
+    _fill_pool: dict[str, PatternFill] = {}
+    def _fill(color: str) -> PatternFill:
+        if color not in _fill_pool:
+            _fill_pool[color] = PatternFill(fill_type="solid", fgColor=color)
+        return _fill_pool[color]
+
+    _align_pool: dict[tuple, Alignment] = {}
+    def _align(h: str, v: str = "center", wrap: bool = False) -> Alignment:
+        k = (h, v, wrap)
+        if k not in _align_pool:
+            _align_pool[k] = Alignment(horizontal=h, vertical=v, wrap_text=wrap)
+        return _align_pool[k]
+
+    _font_pool: dict[tuple, Font] = {}
+    def _font(bold: bool = False, color: str = "000000", size: int = 10, italic: bool = False) -> Font:
+        k = (bold, color, size, italic)
+        if k not in _font_pool:
+            _font_pool[k] = Font(bold=bold, color=color, size=size, italic=italic)
+        return _font_pool[k]
+
     # ── Hoja 1: Cobertura ─────────────────────────────────────────────────────
+    logger_excel.info(f"[Excel] Escribiendo hoja 'Cobertura' ({len(rows)} filas)...")
     ws = wb.active
     ws.title = "Cobertura"
 
-    main_headers = article_headers + cov_col_names
+    # ── Hoja 1: Cobertura (vista limpia) ─────────────────────────────────────
+    clean_col_labels = [c[0] for c in _CLEAN_MAIN_COLS]
     _write_sheet_header(
-        ws, main_headers,
+        ws, clean_col_labels,
         f"Verificación de Cobertura Scopus  —  "
         f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}  —  "
         f"{len(rows)} publicaciones",
     )
 
-    new_col_start = len(article_headers) + 1  # columna donde empiezan las de cobertura
+    # Encabezados de columnas «resultado» con fondo azul más oscuro para destacarlas
+    _res_keys   = {"journal_found", "in_coverage", "journal_status"}
+    _dark_hdr   = PatternFill(fill_type="solid", fgColor="1A3A4A")
+    for col_idx, (_, key, *_) in enumerate(_CLEAN_MAIN_COLS, start=1):
+        if key in _res_keys:
+            ws.cell(row=2, column=col_idx).fill = _dark_hdr
 
     for row_idx, row in enumerate(rows, start=3):
-        in_cov = str(row.get("in_coverage", ""))
-        row_fill_color = _coverage_row_color(in_cov, row.get("journal_found", False), row_idx)
-        row_fill = PatternFill(fill_type="solid", fgColor=row_fill_color)
+        in_cov    = str(row.get("in_coverage",   "") or "")
+        jstatus   = str(row.get("journal_status", "") or "")
+        found     = bool(row.get("journal_found", False))
+        found_via = str(row.get("journal_found_via") or "issn")
+        base_color = _coverage_row_color(in_cov, found, row_idx, found_via=found_via)
+        base_fill  = _fill(base_color)
 
-        # Columnas del artículo/revista (sin autores)
-        for col_idx, col_name in enumerate(article_headers, start=1):
-            val = row.get(col_name, "")
-            cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.border = THIN_BORDER
-            cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=False)
-
-        # Columnas nuevas de cobertura (todas con color)
-        for extra_idx, (col_label, col_key, _) in enumerate(_COVERAGE_NEW_COLS):
-            col_idx = new_col_start + extra_idx
-            raw_val = row.get(col_key)
-            if col_key == "journal_found":
-                val = "Sí" if raw_val else "No"
-            elif raw_val is None or raw_val == "":
-                val = "—"
+        for col_idx, (_, col_key, _, halign, wrap) in enumerate(_CLEAN_MAIN_COLS, start=1):
+            if col_key == "_row_num":
+                val = row_idx - 2
+            elif col_key == "journal_found":
+                val = "Sí" if found else "No"
             else:
-                val = raw_val
+                raw = row.get(col_key)
+                val = "—" if (raw is None or raw == "") else raw
 
             cell = ws.cell(row=row_idx, column=col_idx, value=val)
-            cell.fill = row_fill
             cell.border = THIN_BORDER
-            cell.alignment = Alignment(horizontal="center", vertical="center", wrap_text=True)
+            cell.alignment = _align(halign, "center", wrap)
+
+            # Color específico por tipo de columna
             if col_key == "in_coverage":
-                cell.font = Font(bold=True)
+                bg, fg = _in_cov_cell_color(in_cov)
+                cell.fill = _fill(bg)
+                cell.font = _font(bold=True, color=fg)
+            elif col_key == "journal_status":
+                sl = jstatus.strip().lower()
+                if sl in ("discontinued", "inactive"):
+                    cell.fill = _fill("C0392B")
+                    cell.font = _font(bold=True, color="FFFFFF")
+                elif sl == "inactiva":
+                    cell.fill = _fill("CA6F1E")
+                    cell.font = _font(bold=True, color="FFFFFF")
+                elif sl == "active":
+                    cell.fill = _fill("1E8449")
+                    cell.font = _font(bold=True, color="FFFFFF")
+                else:
+                    cell.fill = _fill("797D7F")
+                    cell.font = _font(color="FFFFFF")
+            elif col_key == "journal_found":
+                cell.fill = _fill("1A5276") if found else _fill("922B21")
+                cell.font = _font(bold=True, color="FFFFFF")
+            elif col_key in ("resolved_issn", "resolved_eissn"):
+                if val not in ("—", "", None):
+                    cell.fill = _fill(COLOR_FALLBACK)
+                    cell.font = _font(bold=True)
+                else:
+                    cell.fill = _fill("F2F2F2")
+                    cell.font = _font(color="AAAAAA")
+            elif col_key == "_row_num":
+                cell.fill = _fill("D5D8DC")
+                cell.font = _font(color="555555", size=9)
+            elif col_key == "_source":
+                src = str(val or "").strip()
+                if src == "OpenAlex BD":
+                    cell.fill = _fill("1A5276")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+                else:
+                    cell.fill = _fill("145A32")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+            elif col_key == "__document_type":
+                dt = str(val or "").strip().lower()
+                if dt in ("article", "review", "short survey"):
+                    cell.fill = _fill("0B5345")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif "conference" in dt or "proceedings" in dt:
+                    cell.fill = _fill("154360")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif "book" in dt or "chapter" in dt:
+                    cell.fill = _fill("4A235A")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif dt not in ("", "—"):
+                    cell.fill = _fill("424949")
+                    cell.font = _font(bold=True, color="FFFFFF", size=9)
+                else:
+                    cell.fill = _fill("F2F2F2")
+                    cell.font = _font(color="AAAAAA")
+            else:
+                cell.fill = base_fill
 
-        ws.row_dimensions[row_idx].height = 18
+        ws.row_dimensions[row_idx].height = 20
 
-    # Anchos hoja Cobertura
-    for col_idx, col_name in enumerate(article_headers, start=1):
+    # Anchos de columna
+    for col_idx, (_, _, width, *_) in enumerate(_CLEAN_MAIN_COLS, start=1):
+        ws.column_dimensions[get_column_letter(col_idx)].width = width
+
+    # Leyenda embebida a la derecha — columna separada del área de datos
+    _leg_col = len(_CLEAN_MAIN_COLS) + 2
+    _leg_col_letter = get_column_letter(_leg_col)
+    ws.column_dimensions[_leg_col_letter].width = 36
+    _legend_items = [
+        ("Leyenda  ¿En cobertura?",            None,           None,     True),
+        ("✓  Sí  — publicación cubierta",      "1E6B2F",       "FFFFFF", False),
+        ("✗  No  — fuera de cobertura",        "922B21",       "FFFFFF", False),
+        ("?  Sin datos suficientes",            "7D6608",       "FFFFFF", False),
+        ("—  No encontrada en Scopus",          "595959",       "FFFFFF", False),
+        ("",                                    None,           None,     False),
+        ("Leyenda  Estado revista",             None,           None,     True),
+        ("Active",                              "1E8449",       "FFFFFF", False),
+        ("Inactiva (sin confirmar activa)",      "CA6F1E",       "FFFFFF", False),
+        ("Discontinued / Inactive",             "C0392B",       "FFFFFF", False),
+        ("",                                    None,           None,     False),
+        ("⚠ Amarillo = resuelto sin ISSN",     COLOR_FALLBACK, "000000", False),
+        ("(por título / DOI / EID — verificar)",COLOR_FALLBACK, "000000", False),
+    ]
+    for li, (txt, bg, fg, is_hdr) in enumerate(_legend_items, start=2):
+        lc = ws.cell(row=li, column=_leg_col, value=txt)
+        lc.border = THIN_BORDER
+        lc.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
+        if is_hdr:
+            lc.font = Font(bold=True, color="FFFFFF")
+            lc.fill = PatternFill(fill_type="solid", fgColor=COLOR_HEADER_BG)
+        elif bg:
+            lc.fill = PatternFill(fill_type="solid", fgColor=bg)
+            lc.font = Font(color=fg)
+
+    ws.freeze_panes = "E3"   # fija columnas #, En Scopus, ¿En cobertura?, Estado revista
+
+    # ── Hoja 2: Autores ───────────────────────────────────────────────────────
+    logger_excel.info(f"[Excel] Escribiendo hoja 'Autores' ({len(rows)} publicaciones)...")
+    ws_auth = wb.create_sheet("Autores")
+
+    # Columnas de publicación que se combinarán verticalmente
+    _AUTH_PUB_COLS = [
+        # (label, key, width, halign, wrap)
+        ("#",                    "_row_num",              5,   "center", False),
+        ("Fuente",               "_source",              14,  "center", False),
+        ("¿En cobertura?",       "in_coverage",          22,  "center", False),
+        ("Estado revista",       "journal_status",       16,  "center", False),
+        ("Título del artículo",  "__title",              50,  "left",   True ),
+        ("Año",                  "__year",                7,  "center", False),
+        ("Tipo",                 "__document_type",      20,  "center", False),
+        ("Revista (Scopus)",     "scopus_journal_title", 34,  "left",   False),
+        ("DOI",                  "__doi",                38,  "left",   False),
+    ]
+    _n_pc          = len(_AUTH_PUB_COLS)
+    _col_auth_num  = _n_pc + 1   # "# Autor"
+    _col_auth_name = _n_pc + 2   # "Nombre autor (Scopus)"
+    _col_auth_afil = _n_pc + 3   # "Afiliación (Scopus)"  — opcional
+    _col_auth_oa   = _n_pc + 4   # "Autores (OpenAlex)"  — combinada por pub
+
+    # Detectar si el fuente tiene columna "Authors with affiliations"
+    _afil_header = next(
+        (h for h in headers if "with affiliation" in _normalize_header(h)), None
+    )
+    _auth_labels = (
+        [c[0] for c in _AUTH_PUB_COLS]
+        + ["# Autor", "Nombre autor (Scopus)", "Afiliación (Scopus)", "Autores (OpenAlex)"]
+    )
+    _write_sheet_header(
+        ws_auth, _auth_labels,
+        f"Autores de publicaciones  —  {len(rows)} publicaciones  —  "
+        f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
+    )
+
+    # Encabezados de columnas de autor con color diferenciado
+    _auth_hdr_scopus = PatternFill(fill_type="solid", fgColor="2C3E50")
+    _auth_hdr_oa     = PatternFill(fill_type="solid", fgColor="16537e")
+    for _ci in (_col_auth_num, _col_auth_name, _col_auth_afil):
+        ws_auth.cell(row=2, column=_ci).fill = _auth_hdr_scopus
+    ws_auth.cell(row=2, column=_col_auth_oa).fill = _auth_hdr_oa
+
+    # Anchos de columna
+    for _ci, (_, _, _w, _, _) in enumerate(_AUTH_PUB_COLS, start=1):
+        ws_auth.column_dimensions[get_column_letter(_ci)].width = _w
+    ws_auth.column_dimensions[get_column_letter(_col_auth_num )].width = 8
+    ws_auth.column_dimensions[get_column_letter(_col_auth_name)].width = 35
+    ws_auth.column_dimensions[get_column_letter(_col_auth_afil)].width = 50
+    ws_auth.column_dimensions[get_column_letter(_col_auth_oa  )].width = 46
+
+    _cur_auth_row = 3
+
+    for _pub_idx, _arow in enumerate(rows, start=1):
+        # --- Autores Scopus (del export original) ---
+        _raw_authors = str(_arow.get("__authors") or "")
+        _scopus_names = [p.strip() for p in _raw_authors.split(";") if p.strip()]
+
+        # --- Afiliaciones Scopus (columna "Authors with affiliations") ---
+        if _afil_header:
+            _raw_afil    = str(_arow.get(_afil_header, "") or "")
+            _afil_parts  = [p.strip() for p in _raw_afil.split(";") if p.strip()]
+        else:
+            _afil_parts  = []
+
+        if not _scopus_names:
+            _scopus_names = ["—"]
+
+        _n_auth  = len(_scopus_names)
+        _start_r = _cur_auth_row
+        _end_r   = _cur_auth_row + _n_auth - 1
+
+        # Colores basados en cobertura (iguales a hoja Cobertura)
+        _inc  = str(_arow.get("in_coverage",    "") or "")
+        _jst  = str(_arow.get("journal_status", "") or "")
+        _fnd  = bool(_arow.get("journal_found", False))
+        _fvia = str(_arow.get("journal_found_via") or "issn")
+        _bcol = _coverage_row_color(_inc, _fnd, _pub_idx, found_via=_fvia)
+        _bfil = _fill(_bcol)
+
+        # ── Columnas de publicación (combinadas verticalmente si >1 autor) ──
+        for _ci, (_, _ck, _, _ha, _wr) in enumerate(_AUTH_PUB_COLS, start=1):
+            if _ck == "_row_num":
+                _val = _pub_idx
+            else:
+                _raw = _arow.get(_ck)
+                _val = "—" if (_raw is None or _raw == "") else _raw
+
+            _cell = ws_auth.cell(row=_start_r, column=_ci, value=_val)
+            _cell.border    = THIN_BORDER
+            _cell.alignment = _align(_ha, "center", _wr)
+
+            # Estilos idénticos a la hoja "Cobertura"
+            if _ck == "in_coverage":
+                _bg, _fg = _in_cov_cell_color(_inc)
+                _cell.fill = _fill(_bg); _cell.font = _font(bold=True, color=_fg)
+            elif _ck == "journal_status":
+                _sl = _jst.strip().lower()
+                if _sl in ("discontinued", "inactive"):
+                    _cell.fill = _fill("C0392B"); _cell.font = _font(bold=True, color="FFFFFF")
+                elif _sl == "inactiva":
+                    _cell.fill = _fill("CA6F1E"); _cell.font = _font(bold=True, color="FFFFFF")
+                elif _sl == "active":
+                    _cell.fill = _fill("1E8449"); _cell.font = _font(bold=True, color="FFFFFF")
+                else:
+                    _cell.fill = _fill("797D7F"); _cell.font = _font(color="FFFFFF")
+            elif _ck == "_row_num":
+                _cell.fill = _fill("D5D8DC"); _cell.font = _font(color="555555", size=9)
+            elif _ck == "_source":
+                _src = str(_val or "").strip()
+                if _src == "OpenAlex BD":
+                    _cell.fill = _fill("1A5276"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+                else:
+                    _cell.fill = _fill("145A32"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+            elif _ck == "__document_type":
+                _dt = str(_val or "").strip().lower()
+                if _dt in ("article", "review", "short survey"):
+                    _cell.fill = _fill("0B5345"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif "conference" in _dt or "proceedings" in _dt:
+                    _cell.fill = _fill("154360"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif "book" in _dt or "chapter" in _dt:
+                    _cell.fill = _fill("4A235A"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+                elif _dt not in ("", "—"):
+                    _cell.fill = _fill("424949"); _cell.font = _font(bold=True, color="FFFFFF", size=9)
+                else:
+                    _cell.fill = _bfil
+            else:
+                _cell.fill = _bfil
+
+            if _n_auth > 1:
+                ws_auth.merge_cells(
+                    start_row=_start_r, start_column=_ci,
+                    end_row=_end_r,     end_column=_ci,
+                )
+
+        # ── Columna "Autores (OpenAlex)" — combinada por publicación ──
+        _oa_d   = _arow.get("_openalex") or {}
+        _oa_str = str(_oa_d.get("oa_authors") or "")
+        _oac    = ws_auth.cell(row=_start_r, column=_col_auth_oa,
+                               value=_oa_str if _oa_str else "—")
+        _oac.border    = THIN_BORDER
+        _oac.alignment = _align("left", "center", True)
+        _oac.fill      = _fill("E8F4FD") if _oa_str else _fill("F2F2F2")
+        _oac.font      = _font() if _oa_str else _font(color="AAAAAA", italic=True)
+        if _n_auth > 1:
+            ws_auth.merge_cells(
+                start_row=_start_r, start_column=_col_auth_oa,
+                end_row=_end_r,     end_column=_col_auth_oa,
+            )
+
+        # ── Filas individuales de autores ──
+        for _ai, _aname in enumerate(_scopus_names, start=1):
+            _r = _start_r + _ai - 1
+
+            # # Autor
+            _nc = ws_auth.cell(row=_r, column=_col_auth_num, value=_ai)
+            _nc.fill = _fill("D5D8DC"); _nc.font = _font(bold=True, color="333333", size=9)
+            _nc.alignment = _align("center"); _nc.border = THIN_BORDER
+
+            # Nombre autor (Scopus)
+            _ac = ws_auth.cell(row=_r, column=_col_auth_name, value=_aname)
+            _ac.fill = _bfil; _ac.font = _font()
+            _ac.alignment = _align("left", "center", False); _ac.border = THIN_BORDER
+
+            # Afiliación (Scopus) — si existe la columna
+            _afval = _afil_parts[_ai - 1] if (_ai - 1) < len(_afil_parts) else "—"
+            _afc   = ws_auth.cell(row=_r, column=_col_auth_afil, value=_afval)
+            _afc.fill = _bfil; _afc.font = _font(size=9)
+            _afc.alignment = _align("left", "center", True); _afc.border = THIN_BORDER
+
+            ws_auth.row_dimensions[_r].height = 18
+
+        _cur_auth_row = _end_r + 1
+
+    ws_auth.freeze_panes = "D3"   # fija columnas #, Fuente, ¿En cobertura?
+
+    # ── Hoja 3 (antes 2): Datos originales ────────────────────────────────────
+    logger_excel.info(f"[Excel] Escribiendo hoja 'Datos originales' ({len(rows)} filas)...")
+    # Todas las columnas originales del Excel fuente (artículo + autores/afiliaciones)
+    ws_orig = wb.create_sheet("Datos originales")
+    _orig_headers = ["#"] + list(headers)
+    _write_sheet_header(
+        ws_orig, _orig_headers,
+        f"Datos originales del archivo fuente  —  {len(rows)} publicaciones",
+    )
+
+    ws_orig.column_dimensions["A"].width = 5
+    for col_idx, col_name in enumerate(headers, start=2):
         col_letter = get_column_letter(col_idx)
         norm = _normalize_header(col_name)
         if "title" in norm and "source" not in norm:
-            ws.column_dimensions[col_letter].width = 50
+            ws_orig.column_dimensions[col_letter].width = 52
         elif "source title" in norm:
-            ws.column_dimensions[col_letter].width = 32
-        elif norm in ("year", "volume", "issue", "cited by", "art. no.", "page start", "page end"):
-            ws.column_dimensions[col_letter].width = 9
+            ws_orig.column_dimensions[col_letter].width = 30
+        elif norm in ("year", "volume", "issue", "cited by", "art. no."):
+            ws_orig.column_dimensions[col_letter].width = 9
         elif norm in ("doi", "link", "eid"):
-            ws.column_dimensions[col_letter].width = 42
-        elif norm in ("issn", "isbn", "coden"):
-            ws.column_dimensions[col_letter].width = 14
+            ws_orig.column_dimensions[col_letter].width = 40
+        elif "with affiliation" in norm:
+            ws_orig.column_dimensions[col_letter].width = 55
+        elif "affiliation" in norm:
+            ws_orig.column_dimensions[col_letter].width = 45
+        elif "author" in norm:
+            ws_orig.column_dimensions[col_letter].width = 40
+        elif norm in ("issn", "isbn", "coden", "eissn"):
+            ws_orig.column_dimensions[col_letter].width = 14
         else:
-            ws.column_dimensions[col_letter].width = 18
+            ws_orig.column_dimensions[col_letter].width = 20
 
-    for extra_idx, (_, _, width) in enumerate(_COVERAGE_NEW_COLS):
-        col_letter = get_column_letter(new_col_start + extra_idx)
-        ws.column_dimensions[col_letter].width = width
+    _num_fill  = _fill("D5D8DC")
+    _even_fill = _fill("EBF3FB")
+    _odd_fill  = _fill("FFFFFF")
+    _num_font  = _font(color="555555", size=9)
+    _align_ctr = _align("center")
+    _align_lft = _align("left")
+    for row_idx, row in enumerate(rows, start=3):
+        nc = ws_orig.cell(row=row_idx, column=1, value=row_idx - 2)
+        nc.fill  = _num_fill
+        nc.font  = _num_font
+        nc.alignment = _align_ctr
+        nc.border = THIN_BORDER
 
-    ws.freeze_panes = "C3"   # fijar primeras 2 columnas (título + año) y fila de encabezados
+        alt = _even_fill if row_idx % 2 == 0 else _odd_fill
+        for col_idx, col_name in enumerate(headers, start=2):
+            val  = row.get(col_name, "")
+            cell = ws_orig.cell(row=row_idx, column=col_idx, value=val)
+            cell.fill = alt
+            cell.border = THIN_BORDER
+            cell.alignment = _align_lft
+        ws_orig.row_dimensions[row_idx].height = 16
 
-    # ── Hoja 2: Autores ───────────────────────────────────────────────────────
-    if author_headers:
-        ws_auth = wb.create_sheet("Autores")
+    ws_orig.freeze_panes = "B3"
 
-        # Columnas de referencia: DOI y Título (si existen en article_headers)
-        ref_cols = [h for h in article_headers
-                    if _normalize_header(h) in ("doi", "title", "year")]
-        auth_sheet_headers = ref_cols + author_headers
+    # Letras de columnas clave en la hoja "Cobertura" (determinadas por _CLEAN_MAIN_COLS)
+    def _col_for_key(k: str) -> str:
+        for i, (_, ck, *_) in enumerate(_CLEAN_MAIN_COLS, start=1):
+            if ck == k:
+                return get_column_letter(i)
+        return "A"
 
-        _write_sheet_header(
-            ws_auth, auth_sheet_headers,
-            f"Detalle de Autores y Afiliaciones  —  {len(rows)} publicaciones",
-        )
+    col_revista   = _col_for_key("journal_found")   # "En Scopus" → Sí/No
+    col_status    = _col_for_key("journal_status")  # "Estado revista"
+    col_cobertura = _col_for_key("in_coverage")     # "¿En cobertura?"
+    col_source    = _col_for_key("_source")         # "Fuente" → Scopus Export / OpenAlex BD
+    last_data_row = 2 + len(rows)                   # fila 1=título, 2=encabezados, 3..N=datos
 
-        for row_idx, row in enumerate(rows, start=3):
-            for col_idx, col_name in enumerate(auth_sheet_headers, start=1):
-                val = row.get(col_name, "")
-                cell = ws_auth.cell(row=row_idx, column=col_idx, value=val)
-                cell.border = THIN_BORDER
-                cell.alignment = Alignment(horizontal="left", vertical="center", wrap_text=True)
-            ws_auth.row_dimensions[row_idx].height = 30  # más alto por texto largo
-
-        # Anchos hoja Autores
-        for col_idx, col_name in enumerate(auth_sheet_headers, start=1):
-            col_letter = get_column_letter(col_idx)
-            norm = _normalize_header(col_name)
-            if norm == "doi":
-                ws_auth.column_dimensions[col_letter].width = 40
-            elif norm == "title":
-                ws_auth.column_dimensions[col_letter].width = 42
-            elif norm == "year":
-                ws_auth.column_dimensions[col_letter].width = 8
-            elif "full name" in norm or "with affiliation" in norm:
-                ws_auth.column_dimensions[col_letter].width = 60
-            elif "id" in norm:
-                ws_auth.column_dimensions[col_letter].width = 30
-            else:
-                ws_auth.column_dimensions[col_letter].width = 50
-
-        ws_auth.freeze_panes = "D3"
-
-    # Letras de columnas de cobertura (calculadas a partir de new_col_start)
-    # _COVERAGE_NEW_COLS: [0] Revista en Scopus, [3] Estado revista, [5] ¿En cobertura?
-    col_revista   = get_column_letter(new_col_start)      # Revista en Scopus
-    col_status    = get_column_letter(new_col_start + 3)  # Estado revista
-    col_cobertura = get_column_letter(new_col_start + 5)  # ¿En cobertura?
-    last_data_row = 2 + len(rows)                          # row 1=titulo, 2=headers, 3..N=datos
-
-    # ── Hoja 3: Descontinuadas ────────────────────────────────────────────────
+    # ── Hoja 4: Descontinuadas ────────────────────────────────────────────────
     # Una fila por REVISTA única descontinuada (no por artículo)
-    _DISC_STATUSES = {"discontinued", "inactive"}
+    _DISC_STATUSES = {"discontinued", "inactive", "inactiva"}
 
     # Log de diagnóstico
     status_counts: dict[str, int] = {}
@@ -732,6 +1093,7 @@ def generate_publications_coverage_excel(
     logger_excel.info(f"[Excel] Revistas descontinuadas únicas: {len(_disc_journals)} / {len(_seen_disc)} (sobre {len(rows)} filas)")
 
     if _disc_journals:
+        logger_excel.info(f"[Excel] Escribiendo hoja 'Descontinuadas' ({len(_disc_journals)} revistas)...")
         ws_disc = wb.create_sheet("Descontinuadas")
         _DISC_COLS = [
             ("ISSN",                   "issn",                   14),
@@ -745,7 +1107,7 @@ def generate_publications_coverage_excel(
         disc_col_names = [c[0] for c in _DISC_COLS]
         _write_sheet_header(
             ws_disc, disc_col_names,
-            f"Revistas Descontinuadas en Scopus  —  "
+            f"Revistas Descontinuadas / Inactivas en Scopus  —  "
             f"{len(_disc_journals)} revistas únicas  —  "
             f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}",
         )
@@ -770,20 +1132,158 @@ def generate_publications_coverage_excel(
             ws_disc.column_dimensions[get_column_letter(col_idx)].width = width
         ws_disc.freeze_panes = "A3"
 
-    # ── Hoja 4: Resumen ───────────────────────────────────────────────────────
-    ws_sum = wb.create_sheet("Resumen")
-    _write_publications_summary(ws_sum, col_revista, col_status, col_cobertura, last_data_row)
+    # ── Hoja 5: Descontinuadas detalle + OpenAlex ─────────────────────────────
+    # Una fila por PUBLICACIÓN (no por revista) en revista descontinuada,
+    # cruzada con openalex_records por DOI (campo _openalex adjuntado en pipeline).
+    _OA_SHEET_COLS = [
+        # (label,                       key_en_row,            key_en_oa,             width)
+        # --- datos del Excel original / Scopus ---
+        ("DOI",                          "__doi",               None,                  38),
+        ("Título",                       "__title",             None,                  50),
+        ("Año",                          "__year",              None,                   8),
+        ("Revista (Scopus)",             "scopus_journal_title",None,                  34),
+        ("Estado revista",               "journal_status",      None,                  16),
+        ("Periodos de cobertura",        "coverage_periods_str",None,                  28),
+        ("¿En cobertura?",               "in_coverage",         None,                  16),
+        # --- datos OpenAlex ---
+        ("OpenAlex ID",                  None,                  "oa_work_id",          36),
+        ("Título (OpenAlex)",            None,                  "oa_title",            50),
+        ("Año (OpenAlex)",               None,                  "oa_year",              8),
+        ("Autores",                      None,                  "oa_authors",          50),
+        ("Acceso Abierto",               None,                  "oa_open_access",      14),
+        ("Estado OA",                    None,                  "oa_oa_status",        16),
+        ("Citas (OpenAlex)",             None,                  "oa_citations",        14),
+        ("URL",                          None,                  "oa_url",              38),
+    ]
 
+    # Filas para la hoja: publicaciones en revistas descontinuadas
+    _disc_pub_rows = [
+        r for r in rows
+        if str(r.get("journal_status", "")).strip().lower() in _DISC_STATUSES
+    ]
+    _disc_pub_rows.sort(key=lambda r: (
+        str(r.get("scopus_journal_title") or r.get("__source_title") or "").lower(),
+        str(r.get("__year") or ""),
+    ))
+
+    if _disc_pub_rows:
+        logger_excel.info(f"[Excel] Escribiendo hoja 'Descont. OpenAlex' ({len(_disc_pub_rows)} filas)...")
+        ws_oa = wb.create_sheet("Descont. OpenAlex")
+        n_matched_oa = sum(1 for r in _disc_pub_rows if r.get("_openalex"))
+
+        _write_sheet_header(
+            ws_oa,
+            [c[0] for c in _OA_SHEET_COLS],
+            (
+                f"Publicaciones en Revistas Descontinuadas/Inactivas — Cruce OpenAlex  —  "
+                f"{len(_disc_pub_rows)} publicaciones  |  "
+                f"{n_matched_oa} con datos OpenAlex  —  "
+                f"Generado: {datetime.now().strftime('%d/%m/%Y %H:%M')}"
+            ),
+        )
+
+        # Columna pivote: separador entre datos Scopus/Excel y datos OpenAlex
+        _SPL_COL = 7  # índice (1-based) de la última col Scopus = "¿En cobertura?"
+        _oa_header_fill = PatternFill(fill_type="solid", fgColor="16537e")  # azul OpenAlex
+
+        # Colorear encabezados de columnas OpenAlex con un tono diferente
+        for col_idx, (label, _, oa_key, _) in enumerate(_OA_SHEET_COLS, start=1):
+            if oa_key is not None:
+                cell = ws_oa.cell(row=2, column=col_idx)
+                cell.fill = _oa_header_fill
+
+        disc_row_fill  = PatternFill(fill_type="solid", fgColor=COLOR_DISCONT)
+        disc_alt_fill  = PatternFill(fill_type="solid", fgColor="FFE8E8")
+        oa_match_fill  = PatternFill(fill_type="solid", fgColor="E8F4FD")   # azul muy claro → tiene OA
+        oa_no_fill     = PatternFill(fill_type="solid", fgColor="F5F5F5")   # gris → sin OA
+
+        for row_idx, row in enumerate(_disc_pub_rows, start=3):
+            oa = row.get("_openalex")  # dict con datos OpenAlex o None
+            base_fill = disc_row_fill if row_idx % 2 == 0 else disc_alt_fill
+
+            for col_idx, (_, row_key, oa_key, _) in enumerate(_OA_SHEET_COLS, start=1):
+                if row_key is not None:
+                    # Columna del Excel original / Scopus
+                    val = row.get(row_key, "")
+                    if val is None or val == "":
+                        val = "—"
+                    cell = ws_oa.cell(row=row_idx, column=col_idx, value=val)
+                    cell.fill = base_fill
+                else:
+                    # Columna de OpenAlex
+                    val = oa.get(oa_key, "") if oa else ""
+                    if val is None or val == "":
+                        val = "—"
+                    cell = ws_oa.cell(row=row_idx, column=col_idx, value=val)
+                    cell.fill = oa_match_fill if oa else oa_no_fill
+
+                cell.border = THIN_BORDER
+                cell.alignment = Alignment(
+                    horizontal="left",
+                    vertical="center",
+                    wrap_text=(col_idx in (2, 10, 11)),  # Títulos y Autores
+                )
+                if row_key == "in_coverage" or row_key == "journal_status":
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+                if oa_key in ("oa_year", "oa_citations"):
+                    cell.alignment = Alignment(horizontal="center", vertical="center")
+
+            ws_oa.row_dimensions[row_idx].height = 20
+
+        # Anchos
+        for col_idx, (_, _, _, width) in enumerate(_OA_SHEET_COLS, start=1):
+            ws_oa.column_dimensions[get_column_letter(col_idx)].width = width
+
+        ws_oa.freeze_panes = "B3"
+
+        # Nota informativa en una celda por debajo de los datos
+        note_row = len(_disc_pub_rows) + 3
+        note_cell = ws_oa.cell(
+            row=note_row, column=1,
+            value=(
+                f"ℹ Filas con fondo azul claro = publicación encontrada en openalex_records por DOI. "
+                f"Filas con fondo gris = no encontrada en BD OpenAlex. "
+                f"Total: {n_matched_oa}/{len(_disc_pub_rows)} emparejadas."
+            )
+        )
+        note_cell.font = Font(italic=True, color="444444", size=9)
+        note_cell.alignment = Alignment(wrap_text=True)
+        ws_oa.merge_cells(
+            start_row=note_row, start_column=1,
+            end_row=note_row, end_column=len(_OA_SHEET_COLS)
+        )
+        ws_oa.row_dimensions[note_row].height = 28
+
+    # ── Hoja 6: Resumen ───────────────────────────────────────────────────────
+    logger_excel.info(f"[Excel] Escribiendo hoja 'Resumen'...")
+    ws_sum = wb.create_sheet("Resumen")
+    _write_publications_summary(ws_sum, col_revista, col_status, col_cobertura, col_source, last_data_row)
+
+    logger_excel.info(f"[Excel] Serializando workbook a bytes...")
     buffer = io.BytesIO()
     wb.save(buffer)
     buffer.seek(0)
-    return buffer.read()
+    data = buffer.read()
+    logger_excel.info(f"[Excel] Generación completa: {len(data):,} bytes")
+    return data
 
 
-def _coverage_row_color(in_cov: str, found: bool, row_idx: int) -> str:
-    """Color de fondo para la fila según el resultado de cobertura."""
+def _coverage_row_color(
+    in_cov: str, found: bool, row_idx: int, found_via: str = "issn"
+) -> str:
+    """Color de fondo para la fila según el resultado de cobertura.
+
+    - Verde  : encontrada vía ISSN y en cobertura
+    - Rojo   : encontrada vía ISSN y fuera de cobertura
+    - Amarillo vivo (FFFF99) : encontrada por fallback (title/doi/eid) — puede ser inexacta
+    - Amarillo suave : sin datos de cobertura
+    - Gris   : no encontrada
+    """
     if not found:
         return COLOR_NOT_FOUND
+    # Fallback: resuelto sin ISSN directo → amarillo para indicar menor confianza
+    if found_via and found_via not in ("issn", ""):
+        return COLOR_FALLBACK if row_idx % 2 == 0 else "FFFFCC"
     if in_cov == "Sí":
         return COLOR_IN_COV if row_idx % 2 == 0 else "D9F0DD"
     if in_cov.startswith("No"):
@@ -796,6 +1296,7 @@ def _write_publications_summary(
     col_revista: str,
     col_status: str,
     col_cobertura: str,
+    col_source: str,
     last_data_row: int,
 ):
     """
@@ -806,12 +1307,14 @@ def _write_publications_summary(
         col_revista:    Letra de la columna 'Revista en Scopus' en la hoja Cobertura.
         col_status:     Letra de la columna 'Estado revista' en la hoja Cobertura.
         col_cobertura:  Letra de la columna '¿En cobertura?' en la hoja Cobertura.
+        col_source:     Letra de la columna 'Fuente' en la hoja Cobertura.
         last_data_row:  Última fila con datos en la hoja Cobertura.
     """
     header_fill  = PatternFill(fill_type="solid", fgColor=COLOR_HEADER_BG)
     data_range_r = f"'Cobertura'!{col_revista}{3}:{col_revista}{last_data_row}"
     data_range_s = f"'Cobertura'!{col_status}{3}:{col_status}{last_data_row}"
     data_range_c = f"'Cobertura'!{col_cobertura}{3}:{col_cobertura}{last_data_row}"
+    data_range_f = f"'Cobertura'!{col_source}{3}:{col_source}{last_data_row}"
 
     # (etiqueta, fórmula_o_valor,  color_fill)
     rows_def = [
@@ -820,7 +1323,7 @@ def _write_publications_summary(
         # ─ Totales ────────────────────────────────────────────────────
         ("Total publicaciones analizadas",        f"=COUNTA({data_range_c})",  None),
         ("Revistas encontradas en Scopus",        f'=COUNTIF({data_range_r},"S\u00ed")',    None),
-        ("   de las cuales: activas",             f'=COUNTIF(\'Cobertura\'!{get_column_letter_offset(col_revista, 3)}{3}:{get_column_letter_offset(col_revista, 3)}{last_data_row},"Active")', None),
+        ("   de las cuales: activas",             f'=COUNTIF(\'Cobertura\'!{col_status}{3}:{col_status}{last_data_row},"Active")', None),
         ("Revistas NO encontradas",               f'=COUNTIF({data_range_r},"No")',   None),
         ("",                                      "",                         None),
         # ─ Cobertura por estado ───────────────────────────────────────
@@ -842,11 +1345,25 @@ def _write_publications_summary(
              COLOR_DISCONT),
         ("",                                      "",                         None),        # ─ Metadatos ────────────────────────────────────────────────────
         ("Fecha generación",                     datetime.now().strftime("%d/%m/%Y %H:%M"), None),
+        ("",                                      "",                         None),
+        # ─ Por fuente ─────────────────────────────────────────────────────────
+        ("Publicaciones del Excel de Scopus",
+             f'=COUNTIF({data_range_f},"Scopus Export")',
+             "145A32"),
+        ("Publicaciones de OpenAlex BD",
+             f'=COUNTIF({data_range_f},"OpenAlex BD")',
+             "1A5276"),
+        ("   OA BD · en cobertura",
+             f'=COUNTIFS({data_range_f},"OpenAlex BD",{data_range_c},"S\u00ed")',
+             "1A5276"),
+        ("   OA BD · NO encontradas en Scopus",
+             f'=COUNTIFS({data_range_f},"OpenAlex BD",{data_range_r},"No")',
+             "1A5276"),
     ]
 
     ws.column_dimensions["A"].width = 42
     ws.column_dimensions["B"].width = 14
-    ws.column_dimensions["C"].width = 46
+    ws.column_dimensions["C"].width = 58
 
     # Encabezado de la tercera columna (leyenda de valores válidos)
     legend_header = ws.cell(row=1, column=3, value="Valores válidos en '¿En cobertura?'")
@@ -862,6 +1379,7 @@ def _write_publications_summary(
         ("No (laguna de cobertura)",    COLOR_OUT_COV),
         ("Sin datos",                   COLOR_NO_DATA),
         ("—",                          COLOR_NOT_FOUND),
+        ("[Amarillo] Sin ISSN – resuelto por título/DOI/EID. Verificar manualmente.", COLOR_FALLBACK),
     ]
 
     for row_idx, (label, formula, color) in enumerate(rows_def, start=1):
@@ -894,7 +1412,7 @@ def _write_publications_summary(
             leg_val, leg_color = legend_items[row_idx - 2] if row_idx >= 2 and (row_idx - 2) < len(legend_items) else ("", None)
             cl = ws.cell(row=row_idx, column=3, value=leg_val)
             cl.border = THIN_BORDER
-            cl.alignment = Alignment(horizontal="center")
+            cl.alignment = Alignment(horizontal="left", wrap_text=True)
             if leg_color:
                 cl.fill = PatternFill(fill_type="solid", fgColor=leg_color)
 
@@ -919,3 +1437,10 @@ def get_column_letter_offset(col_letter: str, offset: int) -> str:
     for ch in col_letter.upper():
         col_idx = col_idx * 26 + (ord(ch) - ord('A') + 1)
     return get_column_letter(col_idx + offset)
+
+
+
+
+
+
+

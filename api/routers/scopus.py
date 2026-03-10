@@ -186,6 +186,40 @@ def get_scopus_record(record_id: int, db: Session = Depends(get_db)):
 
 
 # ══════════════════════════════════════════════════════════════
+# GET /scopus/records/by-eid/{eid} — Buscar por EID de Scopus
+# ══════════════════════════════════════════════════════════════
+
+@router.get(
+    "/records/by-eid/{eid:path}",
+    response_model=ExternalRecordDetail,
+    summary="Buscar registro Scopus por EID",
+)
+def get_scopus_record_by_eid(eid: str, db: Session = Depends(get_db)):
+    """
+    Retorna el detalle completo de un registro Scopus buscando por su **EID**.
+
+    Formatos aceptados:
+    - `2-s2.0-105016707528`  (EID completo)
+    - `105016707528`          (solo la parte numérica)
+
+    El EID se almacena en la BD sin el prefijo `2-s2.0-`, por lo que
+    ambos formatos son equivalentes.
+    """
+    # Normalizar: quitar prefijo si viene con él
+    doc_id = eid.strip()
+    if doc_id.startswith("2-s2.0-"):
+        doc_id = doc_id[len("2-s2.0-"):]
+
+    er = db.query(ScopusRecord).filter(ScopusRecord.scopus_doc_id == doc_id).first()
+    if not er:
+        raise HTTPException(
+            status_code=404,
+            detail=f"No se encontró ningún registro Scopus con EID '{eid}' (doc_id buscado: '{doc_id}')",
+        )
+    return _scopus_to_detail(er)
+
+
+# ══════════════════════════════════════════════════════════════
 # GET /scopus/not-found — DOIs no encontrados en Scopus
 # ══════════════════════════════════════════════════════════════
 
