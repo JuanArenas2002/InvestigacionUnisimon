@@ -93,8 +93,9 @@ openapi_tags = [
     {"name": "Registros Externos", "description": "Registros importados de fuentes externas, revisión manual y log de reconciliación."},
     {"name": "Scopus", "description": "Dashboard completo de registros, contribuciones, cobertura y métricas de Scopus."},
     {"name": "Estadísticas", "description": "KPIs del sistema, métricas de calidad, timelines y archivos JSON."},
-    {"name": "Búsqueda", "description": "Búsqueda en vivo contra APIs externas (OpenAlex)."},
-    {"name": "Pipeline", "description": "Extracción desde fuentes, ingesta de registros, reconciliación y creación de tablas."},
+    {"name": "Búsqueda", "description": "Búsqueda en vivo contra APIs externas."},
+    {"name": "OpenAlex", "description": "Extracción, búsqueda y enriquecimiento vía OpenAlex (PyAlex)."},
+    {"name": "Pipeline", "description": "Ingesta desde fuentes, reconciliación y administración de tablas."},
     {"name": "Catálogos", "description": "Gestión de revistas e instituciones normalizadas (tablas de referencia)."},
 ]
 

@@ -2,27 +2,11 @@
 
 Esta documentación describe cada endpoint disponible en el router `/api/pipeline` del sistema de reconciliación bibliográfica, tras la última refactorización.
 
----
-
-## 1. `/api/pipeline/extract/openalex`
-**Método:** POST  
-**Descripción:** Extrae publicaciones desde OpenAlex, las ingesta en la tabla `openalex_records` y reconcilia automáticamente contra las publicaciones canónicas.  
-**Body:**
-```json
-{
-  "year_from": 2020,
-  "year_to": 2025,
-  "max_results": 1000
-}
-```
-**Respuesta:**
-- `extracted`: registros extraídos
-- `inserted`: registros nuevos (no duplicados)
-- `reconciliation`: resumen de la reconciliación
+> **OpenAlex:** los endpoints y clases específicas de OpenAlex están documentados en [OPENALEX_PIPELINE.md](OPENALEX_PIPELINE.md).
 
 ---
 
-## 2. `/api/pipeline/extract/scopus`
+## 1. `/api/pipeline/extract/scopus`
 **Método:** POST  
 **Descripción:** Extrae publicaciones desde Scopus (Elsevier API), las ingesta en `scopus_records` y reconcilia automáticamente. Usa el `SCOPUS_AFFILIATION_ID` de `.env` si no se envía en el body.  
 **Body:**
@@ -37,28 +21,28 @@ Esta documentación describe cada endpoint disponible en el router `/api/pipelin
 
 ---
 
-## 3. `/api/pipeline/extract/wos`
+## 2. `/api/pipeline/extract/wos`
 **Método:** POST  
 **Descripción:** Extrae publicaciones desde Web of Science (Clarivate API), ingesta en `wos_records` y reconcilia automáticamente.  
 **Body:** Similar a OpenAlex/Scopus.
 
 ---
 
-## 4. `/api/pipeline/extract/cvlac`
+## 3. `/api/pipeline/extract/cvlac`
 **Método:** POST  
 **Descripción:** Extrae publicaciones desde CvLAC (scraping Minciencias), ingesta en `cvlac_records` y reconcilia automáticamente.  
 **Body:** Puede requerir códigos de CvLAC.
 
 ---
 
-## 5. `/api/pipeline/extract/datos_abiertos`
+## 4. `/api/pipeline/extract/datos_abiertos`
 **Método:** POST  
 **Descripción:** Extrae publicaciones desde Datos Abiertos Colombia, ingesta en `datos_abiertos_records` y reconcilia automáticamente.  
 **Body:** Similar a OpenAlex.
 
 ---
 
-## 6. `/api/pipeline/load-json`
+## 5. `/api/pipeline/load-json`
 **Método:** POST  
 **Descripción:** Carga un archivo JSON previamente descargado, detecta la fuente, ingesta los registros y reconcilia automáticamente.  
 **Body:**
@@ -71,7 +55,7 @@ Esta documentación describe cada endpoint disponible en el router `/api/pipelin
 
 ---
 
-## 7. `/api/pipeline/reconcile`
+## 6. `/api/pipeline/reconcile`
 **Método:** POST  
 **Descripción:** Ejecuta la reconciliación manual de un batch de registros pendientes (de todas las fuentes).  
 **Body:**
@@ -84,7 +68,7 @@ Esta documentación describe cada endpoint disponible en el router `/api/pipelin
 
 ---
 
-## 8. `/api/pipeline/reconcile-all`
+## 7. `/api/pipeline/reconcile-all`
 **Método:** POST  
 **Descripción:** Ejecuta la reconciliación manual de **todos** los registros pendientes (de todas las fuentes), procesando en lotes hasta terminar.  
 **Body:** vacío
@@ -92,7 +76,7 @@ Esta documentación describe cada endpoint disponible en el router `/api/pipelin
 
 ---
 
-## 9. `/api/pipeline/crossref-scopus`
+## 8. `/api/pipeline/crossref-scopus`
 **Método:** POST  
 **Descripción:** Cruza las publicaciones canónicas con Scopus por DOI, enriquece campos faltantes y actualiza autores. Trabaja por lotes.  
 **Body:**

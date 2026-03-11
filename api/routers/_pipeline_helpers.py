@@ -87,8 +87,11 @@ def _rescue_not_found_via_openalex(rows_local: list[dict], extractor_inst) -> No
     from extractors.serial_title import SerialTitleAPIError as _STErr
     from config import institution as _inst
     import re as _re
-    import time as _time
-    import requests as _requests
+    import pyalex as _pyalex
+    from pyalex import Works as _Works
+    _pyalex.config.email           = getattr(_inst, "contact_email", "") or "api@openalex.org"
+    _pyalex.config.max_retries     = 3
+    _pyalex.config.retry_backoff_factor = 0.5
 
     def _ndoi(d: str) -> str:
         d = (d or "").strip().lower()
@@ -170,33 +173,19 @@ def _rescue_not_found_via_openalex(rows_local: list[dict], extractor_inst) -> No
         f"[rescue-oa] OpenAlex BD devolvió {len(oa_map)} registros de {len(dois_needed)} buscados."
     )
 
-    # 2b. Para DOIs que la BD no tiene → llamar OpenAlex API directamente por DOI.
-    _OA_WORKS_URL = "https://api.openalex.org/works"
-    _OA_MAILTO    = getattr(_inst, "contact_email", "") or "api@openalex.org"
+    # 2b. Para DOIs que la BD no tiene → consultar OpenAlex API vía PyAlex.
+    #     Works()[doi_url] hace GET /works/{doi_url} y maneja retry/rate-limit.
     dois_missing_from_db = [d for d in dois_needed if d not in oa_map]
 
     if dois_missing_from_db:
         logger.info(
             f"[rescue-oa] {len(dois_missing_from_db)} DOIs no están en BD → "
-            f"consultando OpenAlex API directamente..."
+            f"consultando OpenAlex API (PyAlex)..."
         )
         for doi_key in dois_missing_from_db:
             try:
-                _time.sleep(0.12)
-                resp = _requests.get(
-                    f"{_OA_WORKS_URL}/https://doi.org/{doi_key}",
-                    params={"mailto": _OA_MAILTO},
-                    timeout=10,
-                )
-                if resp.status_code == 404:
-                    logger.debug(f"[rescue-oa] DOI {doi_key} → 404 en OpenAlex API (no existe)")
-                    continue
-                if resp.status_code == 429:
-                    logger.warning("[rescue-oa] Rate limit OpenAlex API — pausando 5 s")
-                    _time.sleep(5)
-                    continue
-                resp.raise_for_status()
-                work = resp.json()
+                doi_url = f"https://doi.org/{doi_key}"
+                work = _Works()[doi_url]
                 primary_loc = work.get("primary_location") or {}
                 source      = primary_loc.get("source") or {}
                 oa_issn     = source.get("issn_l") or ""
@@ -206,11 +195,10 @@ def _rescue_not_found_via_openalex(rows_local: list[dict], extractor_inst) -> No
                     oa_issn = issn_list[0] if issn_list else ""
                 oa_map[doi_key] = (oa_issn, oa_journal)
                 logger.debug(
-                    f"[rescue-oa] DOI {doi_key} → OpenAlex API: "
-                    f"issn={oa_issn!r} revista={oa_journal!r}"
+                    f"[rescue-oa] DOI {doi_key} → issn={oa_issn!r} revista={oa_journal!r}"
                 )
             except Exception as exc:
-                logger.debug(f"[rescue-oa] DOI {doi_key} → error OpenAlex API: {exc}")
+                logger.debug(f"[rescue-oa] DOI {doi_key} → no encontrado en OpenAlex: {exc}")
                 continue
 
         n_api_hits = sum(1 for d in dois_missing_from_db if d in oa_map)

@@ -8,7 +8,8 @@ Este documento describe todos los endpoints disponibles en el sistema, agrupados
 
 ## 1. `/pipeline` (Extracción, reconciliación y administración)
 
-- **POST `/extract/openalex`**: Extrae registros de OpenAlex y los almacena en la tabla correspondiente.
+> Los procesos de OpenAlex (extracción, enriquecimiento, búsqueda) están documentados en [OPENALEX_PIPELINE.md](OPENALEX_PIPELINE.md).
+
 - **POST `/extract/scopus`**: Extrae registros de Scopus usando el ID institucional configurado y los almacena.
 - **POST `/load-json`**: Carga registros desde un archivo JSON local a la base de datos.
 - **POST `/reconcile`**: Ejecuta la reconciliación solo sobre registros pendientes.
@@ -74,7 +75,7 @@ Este documento describe todos los endpoints disponibles en el sistema, agrupados
 
 ## 7. `/search` (Búsqueda avanzada)
 
-- **GET `/openalex`**: Búsqueda directa en OpenAlex.
+- **GET `/openalex`**: Búsqueda directa en OpenAlex — ver [OPENALEX_PIPELINE.md](OPENALEX_PIPELINE.md).
 
 ---
 
