@@ -61,6 +61,7 @@ class InstitutionConfig:
 class OpenAlexConfig:
     """Configuración de OpenAlex API"""
     base_url: str = "https://api.openalex.org/works"
+    api_key: str = os.getenv("OA_KEY", "")
     max_per_page: int = 200
     timeout: int = 30
     rate_limit_delay: float = 0.1

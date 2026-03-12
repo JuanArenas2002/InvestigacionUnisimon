@@ -28,33 +28,35 @@ router = APIRouter(prefix="/search", tags=["Búsqueda"])
 
 _FOUND_COLS: list[tuple[str, str, int]] = [
     # Datos aportados por el usuario
-    ("titulo",         "Título (input)",      50),
-    ("año",            "Año (input)",           8),
-    ("doi",            "DOI (input)",          36),
-    # Método de localización
-    ("oa_metodo",      "Método búsqueda",      16),
+    ("titulo",                    "Título (input)",          50),
+    ("año",                       "Año (input)",              8),
+    ("doi",                       "DOI (input)",             36),
+    # Método de localización + afiliación
+    ("oa_metodo",                 "Método búsqueda",          16),
+    ("oa_autor_institucional",    "Autor de la U",           14),
+    ("oa_autores_institucionales","Autores de la U",         46),
     # Revista e ISSN  ← prioridad
-    ("oa_revista",     "Revista",              40),
-    ("oa_issn",        "ISSN-L",               16),
-    ("oa_issn_todos",  "Todos los ISSN",       28),
-    ("oa_editorial",   "Editorial",            28),
+    ("oa_revista",                "Revista",                 40),
+    ("oa_issn",                   "ISSN-L",                  16),
+    ("oa_issn_todos",             "Todos los ISSN",          28),
+    ("oa_editorial",              "Editorial",               28),
     # Datos de la publicación
-    ("oa_titulo",      "Título en OpenAlex",   50),
-    ("oa_año",         "Año (OA)",              8),
-    ("oa_doi",         "DOI (OA)",             36),
-    ("oa_tipo",        "Tipo",                 18),
-    ("oa_idioma",      "Idioma",               10),
+    ("oa_titulo",                 "Título en OpenAlex",      50),
+    ("oa_año",                    "Año (OA)",                8),
+    ("oa_doi",                    "DOI (OA)",                36),
+    ("oa_tipo",                   "Tipo",                    18),
+    ("oa_idioma",                 "Idioma",                  10),
     # Acceso abierto
-    ("oa_open_access", "Acceso abierto",       16),
-    ("oa_status_oa",   "Estado OA",            16),
+    ("oa_open_access",            "Acceso abierto",          16),
+    ("oa_status_oa",              "Estado OA",               16),
     # Métricas
-    ("oa_citas",       "Citas",                10),
+    ("oa_citas",                  "Citas",                   10),
     # Enlace
-    ("oa_url",         "URL",                  40),
+    ("oa_url",                    "URL",                     40),
     # Autores
-    ("oa_autores",     "Autores",              52),
+    ("oa_autores",                "Autores",                 52),
     # ID OpenAlex (al final, referencia técnica)
-    ("oa_work_id",     "Work ID (OA)",         32),
+    ("oa_work_id",                "Work ID (OA)",            32),
 ]
 
 _NOT_FOUND_COLS: list[tuple[str, str, int]] = [
@@ -65,24 +67,29 @@ _NOT_FOUND_COLS: list[tuple[str, str, int]] = [
 
 # Colores de encabezado por grupo de columna
 _COL_HEADER_COLOR: dict[str, str] = {
-    "titulo":        "1F4E79",
-    "año":           "1F4E79",
-    "doi":           "1F4E79",
-    "oa_metodo":     "2E75B6",
-    "oa_revista":    "375623",
-    "oa_issn":       "375623",
-    "oa_issn_todos": "375623",
-    "oa_editorial":  "375623",
+    "titulo":                     "1F4E79",
+    "año":                        "1F4E79",
+    "doi":                        "1F4E79",
+    "oa_metodo":                  "2E75B6",
+    "oa_autor_institucional":     "7030A0",
+    "oa_autores_institucionales": "7030A0",
+    "oa_revista":                 "375623",
+    "oa_issn":                    "375623",
+    "oa_issn_todos":              "375623",
+    "oa_editorial":               "375623",
 }
 _DEFAULT_HDR_COLOR = "16537E"
 
 
 def _build_enrich_excel(
     found: list[dict],
+    verify_inst: list[dict],
+    found_no_inst: list[dict],
+    verify: list[dict],
     not_found: list[dict],
     total: int,
 ) -> io.BytesIO:
-    """Genera un Excel de dos hojas: Encontrados y No encontrados."""
+    """Genera un Excel de 5 hojas: Encontrados (U), Revisar inst. U, Sin afiliación U, Verificación manual, No encontrados."""
     try:
         import openpyxl
         from openpyxl.styles import Font, PatternFill, Alignment, Border, Side
@@ -126,14 +133,15 @@ def _build_enrich_excel(
     ws1.row_dimensions[2].height = 16
     _group_ranges = [
         (1,  3,  "DATOS ORIGINALES",   "1F4E79"),
-        (4,  4,  "BÚSQUEDA",           "2E75B6"),
-        (5,  8,  "REVISTA / ISSN",     "375623"),
-        (9,  15, "PUBLICACIÓN",        "16537E"),
-        (16, 17, "ACCESO ABIERTO",     "7030A0"),
-        (18, 18, "MÉTRICAS",           "833C00"),
-        (19, 19, "ENLACE",             "595959"),
-        (20, 20, "AUTORES",            "404040"),
-        (21, 21, "ID TÉCNICO",         "808080"),
+        (4,  4,  "BÚSQL./CONFIANZA",   "2E75B6"),
+        (5,  6,  "AFILIACIÓN U",       "7030A0"),
+        (7,  10, "REVISTA / ISSN",     "375623"),
+        (11, 17, "PUBLICACIÓN",        "16537E"),
+        (18, 19, "ACCESO ABIERTO",     "7030A0"),
+        (20, 20, "MÉTRICAS",           "833C00"),
+        (21, 21, "ENLACE",             "595959"),
+        (22, 22, "AUTORES",            "404040"),
+        (23, 23, "ID TÉCNICO",         "808080"),
     ]
     for c1, c2, label, color in _group_ranges:
         if c1 == c2:
@@ -158,11 +166,14 @@ def _build_enrich_excel(
     ws1.row_dimensions[3].height = 36
 
     # Filas de datos
-    _ISSN_FILL   = _fill("E2EFDA")   # verde claro para ISSN
-    _DATA_FILL   = _fill("EBF3FB")   # azul muy claro para el resto
-    _OA_YES_FILL = _fill("C6EFCE")   # verde acceso abierto
-    _OA_NO_FILL  = _fill("FFCCCC")   # rojo sin acceso abierto
-    _ISSN_BOLD   = {"oa_issn", "oa_issn_todos", "oa_revista"}
+    _ISSN_FILL     = _fill("E2EFDA")   # verde claro para ISSN
+    _DATA_FILL     = _fill("EBF3FB")   # azul muy claro para el resto
+    _OA_YES_FILL   = _fill("C6EFCE")   # verde acceso abierto
+    _OA_NO_FILL    = _fill("FFCCCC")   # rojo sin acceso abierto
+    _INST_YES_FILL = _fill("C6EFCE")   # verde institucional
+    _INST_NO_FILL  = _fill("FFCCCC")   # rojo sin afiliación
+    _ISSN_BOLD     = {"oa_issn", "oa_issn_todos", "oa_revista"}
+    _WRAP_KEYS     = {"titulo", "oa_titulo", "oa_autores", "oa_issn_todos", "oa_autores_institucionales"}
 
     for ri, row in enumerate(found, start=4):
         for ci, (key, _, _) in enumerate(_FOUND_COLS, start=1):
@@ -171,13 +182,16 @@ def _build_enrich_excel(
                 val = "Sí" if val else "No"
             cell = ws1.cell(row=ri, column=ci, value=(val if val is not None else ""))
             cell.border    = _border
-            cell.alignment = _left(wrap=(key in ("titulo", "oa_titulo", "oa_autores", "oa_issn_todos")))
+            cell.alignment = _left(wrap=(key in _WRAP_KEYS))
 
             if key in ("oa_issn", "oa_issn_todos", "oa_revista", "oa_editorial"):
                 cell.fill = _ISSN_FILL
                 cell.font = _font(bold=(key in _ISSN_BOLD), size=10)
             elif key == "oa_open_access":
                 cell.fill = _OA_YES_FILL if val == "Sí" else _OA_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            elif key == "oa_autor_institucional":
+                cell.fill = _INST_YES_FILL if val == "Sí" else _INST_NO_FILL
                 cell.font = _font(bold=True, size=10)
             else:
                 cell.fill = _DATA_FILL
@@ -190,7 +204,202 @@ def _build_enrich_excel(
     ws1.freeze_panes = "A4"
     ws1.auto_filter.ref = f"A3:{get_column_letter(ncols1)}3"
 
-    # ── HOJA 2: No encontrados ───────────────────────────────────────────────
+    # ── HOJA 2: Revisión de institucionalidad ────────────────────────────────
+    ws_vi = wb.create_sheet(title=f"Revisar inst. U ({len(verify_inst)})")
+    ws_vi.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols1)
+    t_vi = ws_vi.cell(row=1, column=1)
+    t_vi.value     = (
+        f"Revisar inst. U  ·  {len(verify_inst)} registros  ·  "
+        f"Algunos autores con afiliación U (≤50%) — revisar manualmente  ·  {now_str}"
+    )
+    t_vi.font      = _font(bold=True, color="FFFFFF", size=12)
+    t_vi.fill      = _fill("7030A0")   # púrpura
+    t_vi.alignment = _center()
+    ws_vi.row_dimensions[1].height = 24
+
+    for c1, c2, label, color in _group_ranges:
+        if c1 == c2:
+            ws_vi.cell(row=2, column=c1).value = label
+        else:
+            ws_vi.merge_cells(start_row=2, start_column=c1, end_row=2, end_column=c2)
+            ws_vi.cell(row=2, column=c1).value = label
+        for ci in range(c1, c2 + 1):
+            cell = ws_vi.cell(row=2, column=ci)
+            cell.fill      = _fill(color)
+            cell.font      = _font(bold=True, color="FFFFFF", size=9)
+            cell.alignment = _center()
+            cell.border    = _border
+    ws_vi.row_dimensions[2].height = 16
+
+    for ci, (key, label, _) in enumerate(_FOUND_COLS, start=1):
+        cell = ws_vi.cell(row=3, column=ci, value=label)
+        cell.fill      = _fill(_COL_HEADER_COLOR.get(key, _DEFAULT_HDR_COLOR))
+        cell.font      = _font(bold=True, color="FFFFFF", size=10)
+        cell.alignment = _center(wrap=True)
+        cell.border    = _border
+    ws_vi.row_dimensions[3].height = 36
+
+    _VI_FILL = _fill("EAD1DC")   # lavanda rosado — revisión de institucionalidad
+    for ri, row in enumerate(verify_inst, start=4):
+        for ci, (key, _, _) in enumerate(_FOUND_COLS, start=1):
+            val = row.get(key, "")
+            if isinstance(val, bool):
+                val = "Sí" if val else "No"
+            elif key == "oa_autor_institucional" and val == "verificar":
+                val = "Revisar"
+            cell = ws_vi.cell(row=ri, column=ci, value=(val if val is not None else ""))
+            cell.border    = _border
+            cell.alignment = _left(wrap=(key in _WRAP_KEYS))
+            if key in ("oa_issn", "oa_issn_todos", "oa_revista", "oa_editorial"):
+                cell.fill = _ISSN_FILL
+                cell.font = _font(bold=(key in _ISSN_BOLD), size=10)
+            elif key == "oa_open_access":
+                cell.fill = _OA_YES_FILL if val == "Sí" else _OA_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            elif key == "oa_autor_institucional":
+                cell.fill = _fill("FFEB9C")   # amarillo — en revisión
+                cell.font = _font(bold=True, size=10)
+            else:
+                cell.fill = _VI_FILL
+        ws_vi.row_dimensions[ri].height = 15
+
+    for ci, (_, _, width) in enumerate(_FOUND_COLS, start=1):
+        ws_vi.column_dimensions[get_column_letter(ci)].width = width
+    ws_vi.freeze_panes = "A4"
+    ws_vi.auto_filter.ref = f"A3:{get_column_letter(ncols1)}3"
+
+    # ── HOJA 3: Sin afiliación institucional ─────────────────────────────────
+    ws_ni = wb.create_sheet(title=f"Sin afiliación U ({len(found_no_inst)})")
+    ws_ni.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols1)
+    t_ni = ws_ni.cell(row=1, column=1)
+    t_ni.value     = (
+        f"Sin autor de la U  ·  {len(found_no_inst)} registros  ·  "
+        f"Encontrados en OpenAlex pero sin afiliación institucional  ·  {now_str}"
+    )
+    t_ni.font      = _font(bold=True, color="FFFFFF", size=12)
+    t_ni.fill      = _fill("843C0C")   # rojo-ladrillo
+    t_ni.alignment = _center()
+    ws_ni.row_dimensions[1].height = 24
+
+    for c1, c2, label, color in _group_ranges:
+        if c1 == c2:
+            ws_ni.cell(row=2, column=c1).value = label
+        else:
+            ws_ni.merge_cells(start_row=2, start_column=c1, end_row=2, end_column=c2)
+            ws_ni.cell(row=2, column=c1).value = label
+        for ci in range(c1, c2 + 1):
+            cell = ws_ni.cell(row=2, column=ci)
+            cell.fill      = _fill(color)
+            cell.font      = _font(bold=True, color="FFFFFF", size=9)
+            cell.alignment = _center()
+            cell.border    = _border
+    ws_ni.row_dimensions[2].height = 16
+
+    for ci, (key, label, _) in enumerate(_FOUND_COLS, start=1):
+        cell = ws_ni.cell(row=3, column=ci, value=label)
+        cell.fill      = _fill(_COL_HEADER_COLOR.get(key, _DEFAULT_HDR_COLOR))
+        cell.font      = _font(bold=True, color="FFFFFF", size=10)
+        cell.alignment = _center(wrap=True)
+        cell.border    = _border
+    ws_ni.row_dimensions[3].height = 36
+
+    _NI_FILL = _fill("FCE4D6")   # salmón claro
+    for ri, row in enumerate(found_no_inst, start=4):
+        for ci, (key, _, _) in enumerate(_FOUND_COLS, start=1):
+            val = row.get(key, "")
+            if isinstance(val, bool):
+                val = "Sí" if val else "No"
+            cell = ws_ni.cell(row=ri, column=ci, value=(val if val is not None else ""))
+            cell.border    = _border
+            cell.alignment = _left(wrap=(key in _WRAP_KEYS))
+            if key in ("oa_issn", "oa_issn_todos", "oa_revista", "oa_editorial"):
+                cell.fill = _ISSN_FILL
+                cell.font = _font(bold=(key in _ISSN_BOLD), size=10)
+            elif key == "oa_open_access":
+                cell.fill = _OA_YES_FILL if val == "Sí" else _OA_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            elif key == "oa_autor_institucional":
+                cell.fill = _INST_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            else:
+                cell.fill = _NI_FILL
+        ws_ni.row_dimensions[ri].height = 15
+
+    for ci, (_, _, width) in enumerate(_FOUND_COLS, start=1):
+        ws_ni.column_dimensions[get_column_letter(ci)].width = width
+    ws_ni.freeze_panes = "A4"
+    ws_ni.auto_filter.ref = f"A3:{get_column_letter(ncols1)}3"
+
+    # ── HOJA 4: Verificación manual ──────────────────────────────────────────
+    ws_v = wb.create_sheet(title=f"Verificación manual ({len(verify)})")
+    ws_v.merge_cells(start_row=1, start_column=1, end_row=1, end_column=ncols1)
+    t_v = ws_v.cell(row=1, column=1)
+    t_v.value     = (
+        f"Verificación manual  ·  {len(verify)} registros  ·  "
+        f"Coincidencia parcial (año u otros datos difieren)  ·  {now_str}"
+    )
+    t_v.font      = _font(bold=True, color="FFFFFF", size=12)
+    t_v.fill      = _fill("7F3F00")   # naranja oscuro
+    t_v.alignment = _center()
+    ws_v.row_dimensions[1].height = 24
+
+    for c1, c2, label, color in _group_ranges:
+        if c1 == c2:
+            ws_v.cell(row=2, column=c1).value = label
+        else:
+            ws_v.merge_cells(start_row=2, start_column=c1, end_row=2, end_column=c2)
+            ws_v.cell(row=2, column=c1).value = label
+        for ci in range(c1, c2 + 1):
+            cell = ws_v.cell(row=2, column=ci)
+            cell.fill      = _fill(color)
+            cell.font      = _font(bold=True, color="FFFFFF", size=9)
+            cell.alignment = _center()
+            cell.border    = _border
+    ws_v.row_dimensions[2].height = 16
+
+    for ci, (key, label, _) in enumerate(_FOUND_COLS, start=1):
+        cell = ws_v.cell(row=3, column=ci, value=label)
+        cell.fill      = _fill(_COL_HEADER_COLOR.get(key, _DEFAULT_HDR_COLOR))
+        cell.font      = _font(bold=True, color="FFFFFF", size=10)
+        cell.alignment = _center(wrap=True)
+        cell.border    = _border
+    ws_v.row_dimensions[3].height = 36
+
+    _V_FILL = _fill("FFF2CC")   # amarillo claro
+    for ri, row in enumerate(verify, start=4):
+        for ci, (key, _, _) in enumerate(_FOUND_COLS, start=1):
+            val = row.get(key, "")
+            if isinstance(val, bool):
+                val = "Sí" if val else "No"
+            elif key == "oa_autor_institucional" and val == "verificar":
+                val = "Revisar"
+            cell = ws_v.cell(row=ri, column=ci, value=(val if val is not None else ""))
+            cell.border    = _border
+            cell.alignment = _left(wrap=(key in _WRAP_KEYS))
+            if key in ("oa_issn", "oa_issn_todos", "oa_revista", "oa_editorial"):
+                cell.fill = _ISSN_FILL
+                cell.font = _font(bold=(key in _ISSN_BOLD), size=10)
+            elif key == "oa_open_access":
+                cell.fill = _OA_YES_FILL if val == "Sí" else _OA_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            elif key == "oa_autor_institucional":
+                if val == "Sí":
+                    cell.fill = _INST_YES_FILL
+                elif val == "Revisar":
+                    cell.fill = _fill("FFEB9C")   # amarillo — en revisión
+                else:
+                    cell.fill = _INST_NO_FILL
+                cell.font = _font(bold=True, size=10)
+            else:
+                cell.fill = _V_FILL
+        ws_v.row_dimensions[ri].height = 15
+
+    for ci, (_, _, width) in enumerate(_FOUND_COLS, start=1):
+        ws_v.column_dimensions[get_column_letter(ci)].width = width
+    ws_v.freeze_panes = "A4"
+    ws_v.auto_filter.ref = f"A3:{get_column_letter(ncols1)}3"
+
+    # ── HOJA 5: No encontrados ───────────────────────────────────────────────
     ws2 = wb.create_sheet(title=f"No encontrados ({len(not_found)})")
     ncols2 = len(_NOT_FOUND_COLS) + 1  # +1 para la columna Nota
 
@@ -216,12 +425,18 @@ def _build_enrich_excel(
     # Filas de datos
     _NF_FILL = _fill("FFF2CC")   # amarillo claro
     for ri, row in enumerate(not_found, start=3):
-        has_doi   = bool(str(row.get("doi",    "")).strip())
-        has_title = bool(str(row.get("titulo", "")).strip())
+        has_doi    = bool(str(row.get("doi",    "")).strip())
+        has_title  = bool(str(row.get("titulo", "")).strip())
+        has_issn   = bool(str(row.get("issn",   "")).strip())
+        has_rev    = bool(str(row.get("revista","")).strip())
         if has_doi:
             nota = "DOI consultado en OpenAlex — no encontrado"
+        elif has_issn:
+            nota = "Búsqueda por ISSN + título (6 etapas) — sin coincidencia suficiente"
+        elif has_rev:
+            nota = "Búsqueda por nombre de revista + título — sin coincidencia suficiente"
         elif has_title:
-            nota = "Búsqueda por título (fuzzy) — similitud insuficiente o sin resultados"
+            nota = "Búsqueda por título (6 etapas) — similitud insuficiente o sin resultados"
         else:
             nota = "Sin título ni DOI — no se pudo buscar"
 
@@ -251,9 +466,9 @@ def _build_enrich_excel(
 
 
 def _get_session() -> requests.Session:
-    """Sesión HTTP con retry."""
+    """Sesión HTTP con retry. No reintenta en 429 (rate-limit debe respetarse)."""
     s = requests.Session()
-    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[429, 500, 502, 503])
+    retries = Retry(total=3, backoff_factor=0.5, status_forcelist=[500, 502, 503])
     s.mount("https://", HTTPAdapter(max_retries=retries))
     return s
 
@@ -278,6 +493,8 @@ def search_openalex(
         "per_page": min(max_results, 200),
         "mailto": institution.contact_email,
     }
+    if openalex_config.api_key:
+        params["api_key"] = openalex_config.api_key
 
     # Construir filtros
     filters = []
@@ -313,11 +530,37 @@ def search_openalex(
     try:
         session = _get_session()
         resp = session.get(openalex_config.base_url, params=params, timeout=openalex_config.timeout)
+    except requests.RequestException as e:
+        logger.error(f"Error de red consultando OpenAlex: {e}")
+        raise HTTPException(502, f"Error al consultar OpenAlex: {e}")
+
+    if resp.status_code == 429:
+        retry_after = resp.headers.get("Retry-After", "desconocido")
+        try:
+            body = resp.json()
+            msg = body.get("message") or "Límite de créditos diarios agotado."
+        except Exception:
+            msg = "Límite d e solicitudes superado en OpenAlex."
+        logger.warning(f"OpenAlex rate-limit. Retry-After: {retry_after}s. {msg}")
+        raise HTTPException(
+            status_code=429,
+            detail={
+                "error": "rate_limit",
+                "message": msg,
+                "retry_after_seconds": retry_after,
+                "hint": "Configure OA_KEY en el .env para mayor cuota, o espere al reset de medianoche UTC.",
+            },
+        )
+
+    try:
         resp.raise_for_status()
         data = resp.json()
-    except requests.RequestException as e:
-        logger.error(f"Error buscando en OpenAlex: {e}")
+    except requests.HTTPError as e:
+        logger.error(f"HTTP error desde OpenAlex: {e}")
         raise HTTPException(502, f"Error al consultar OpenAlex: {e}")
+    except Exception as e:
+        logger.error(f"Error parseando respuesta OpenAlex: {e}")
+        raise HTTPException(502, "Respuesta inesperada de OpenAlex")
 
     results = data.get("results", [])
     ror_id = institution.ror_id
@@ -407,10 +650,15 @@ async def enrich_excel_openalex(
     - **No encontrados** — Publicaciones que OpenAlex no pudo resolver, con
       una nota explicando el motivo.
 
-    **Estrategia de búsqueda (por prioridad):**
-    1. Con DOI → consulta exacta por lotes (hasta 50 DOIs por request).
-    2. Sin DOI → búsqueda full-text por título + filtro de año. Se acepta el
-       resultado si la similitud (token_sort_ratio) supera el umbral indicado.
+    **Estrategia de búsqueda (6 etapas en cascada):**
+    1. **DOI** — consulta exacta por lotes (hasta 25 DOIs por request).
+    2. **Título + año** — fallback para DOIs no resueltos; 4 reintentos
+       (título original, normalizado, sin año, truncado).
+    3. **Título + año** — igual para registros sin DOI.
+    4. **ISSN + título** — filtra por `primary_location.source.issn` **y**
+       `locations.source.issn`; admite múltiples ISSNs separados por `;`.
+    5. **Nombre de revista + título** — cuando hay columna `revista` pero no ISSN.
+    6. **Solo título (umbral alto 88%)** — último recurso para los restantes.
     """
     fname = (file.filename or "").lower()
     if not fname.endswith((".xlsx", ".xls")):
@@ -421,26 +669,36 @@ async def enrich_excel_openalex(
         raise HTTPException(400, "El archivo está vacío")
 
     try:
-        from extractors.openalex import OpenAlexEnricher
+        from extractors.openalex import OpenAlexEnricher, OpenAlexRateLimitError
         enricher = OpenAlexEnricher()
         enricher.MIN_SCORE = float(fuzzy_threshold)
         all_rows = enricher.enrich_from_excel_bytes(data)
+    except OpenAlexRateLimitError as exc:
+        raise HTTPException(
+            status_code=429,
+            detail=str(exc),
+            headers={"Retry-After": str(exc.retry_after)},
+        )
     except ValueError as exc:
         raise HTTPException(422, str(exc))
     except Exception as exc:
         logger.error(f"[enrich-excel] Error procesando archivo: {exc}")
         raise HTTPException(500, f"Error al procesar el archivo: {exc}")
 
-    found     = [r for r in all_rows if r.get("oa_encontrado")]
-    not_found = [r for r in all_rows if not r.get("oa_encontrado")]
+    found          = [r for r in all_rows if r.get("oa_encontrado") and r.get("oa_confianza") != "verificar" and r.get("oa_autor_institucional") is True]
+    verify_inst    = [r for r in all_rows if r.get("oa_encontrado") and r.get("oa_confianza") != "verificar" and r.get("oa_autor_institucional") == "verificar"]
+    found_no_inst  = [r for r in all_rows if r.get("oa_encontrado") and r.get("oa_confianza") != "verificar" and r.get("oa_autor_institucional") is False]
+    verify         = [r for r in all_rows if r.get("oa_encontrado") and r.get("oa_confianza") == "verificar"]
+    not_found      = [r for r in all_rows if not r.get("oa_encontrado")]
 
     logger.info(
         f"[enrich-excel] Total: {len(all_rows)} | "
-        f"Encontrados: {len(found)} | No encontrados: {len(not_found)}"
+        f"Con autor U: {len(found)} | Revisar inst.: {len(verify_inst)} | Sin autor U: {len(found_no_inst)} | "
+        f"Verificar: {len(verify)} | No encontrados: {len(not_found)}"
     )
 
     try:
-        buf = _build_enrich_excel(found, not_found, len(all_rows))
+        buf = _build_enrich_excel(found, verify_inst, found_no_inst, verify, not_found, len(all_rows))
     except Exception as exc:
         logger.error(f"[enrich-excel] Error generando Excel: {exc}")
         raise HTTPException(500, f"Error generando el Excel de respuesta: {exc}")
