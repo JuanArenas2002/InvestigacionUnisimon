@@ -27,8 +27,8 @@ from extractors.base import (
     BaseExtractor,
     StandardRecord,
     normalize_doi,
-    normalize_author_name,
 )
+from .domain.author_names import normalize_author_display_name
 from ._rate_limit import OpenAlexAPIError
 
 logger = logging.getLogger(__name__)
@@ -220,7 +220,7 @@ class OpenAlexExtractor(BaseExtractor):
         for authorship in work.get("authorships", []):
             author_data = authorship.get("author") or {}
             raw_name    = author_data.get("display_name") or ""
-            clean_name  = normalize_author_name(raw_name)
+            clean_name  = normalize_author_display_name(raw_name)
 
             info = {
                 "name":             clean_name,
