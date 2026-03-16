@@ -3,6 +3,9 @@ import unicodedata
 from typing import Any
 
 
+_DASH_CHARS_RE = re.compile(r"[\u2010\u2011\u2012\u2013\u2014\u2015\u2212\-]+")
+
+
 _TITLE_STOPWORDS = frozenset({
     "de", "del", "la", "el", "los", "las", "un", "una", "unos", "unas",
     "en", "y", "o", "a", "para", "por", "con", "sin", "sobre", "entre",
@@ -24,12 +27,75 @@ def sanitize_title(title: str) -> str:
     return str(title or "").strip().lstrip("¿¡").strip().lower()
 
 
+def title_query_variants(title: str) -> list[str]:
+    """
+    Genera variantes para consulta en OpenAlex cuando hay diferencias de
+    indexación por puntuación y separadores (coma, guion, etc.).
+
+        Orden de prioridad:
+            1) cadena sin puntuación (segura para search_filter)
+            2) frase clave compacta (2-3 tokens distintivos)
+            3) texto saneado original
+            4) cadena con guiones compactados (sin espacios alrededor)
+    """
+    base = re.sub(r"\s+", " ", sanitize_title(title)).strip()
+    if not base:
+        return []
+
+    punct_relaxed = re.sub(r"[^\w\s]", " ", base)
+    punct_relaxed = re.sub(r"\s+", " ", punct_relaxed).strip()
+    variants: list[str] = []
+    if punct_relaxed:
+        variants.append(punct_relaxed)
+
+    norm = normalize_title(base)
+    norm_tokens = [t for t in norm.split() if t]
+    if len(norm_tokens) >= 3:
+        key_tokens = [norm_tokens[0], norm_tokens[1], norm_tokens[-1]]
+        keyphrase = " ".join(dict.fromkeys(key_tokens))
+        if keyphrase and keyphrase not in variants:
+            variants.append(keyphrase)
+
+    if base and base not in variants:
+        variants.append(base)
+
+    dash_compact = _DASH_CHARS_RE.sub("-", base)
+    dash_compact = re.sub(r"\s*-\s*", "-", dash_compact)
+    dash_compact = re.sub(r"\s+", " ", dash_compact).strip()
+    if dash_compact and dash_compact not in variants:
+        variants.append(dash_compact)
+
+    return variants
+
+
 def truncate_title_for_search(title: str, max_words: int = 10) -> str:
     normalized = normalize_title(title)
     words = normalized.split()
     if len(words) <= max_words:
         return normalized
     return " ".join(words[:max_words])
+
+
+def title_bigrams_for_search(title: str, max_bigrams: int = 3) -> list[str]:
+    """
+    Genera bigramas de términos significativos para fallback de recall.
+
+    Ejemplo: "relacion universidad empresa america" ->
+             ["relacion universidad", "universidad empresa", ...]
+    """
+    normalized = normalize_title(title)
+    tokens = [t for t in normalized.split() if len(t) >= 4]
+    if len(tokens) < 2:
+        return []
+
+    bigrams: list[str] = []
+    for i in range(len(tokens) - 1):
+        bg = f"{tokens[i]} {tokens[i + 1]}"
+        if bg not in bigrams:
+            bigrams.append(bg)
+        if len(bigrams) >= max_bigrams:
+            break
+    return bigrams
 
 
 def normalize_issn(raw: str) -> str:

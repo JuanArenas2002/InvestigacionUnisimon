@@ -548,3 +548,55 @@ def list_publication_authors(pub_id: int, db: Session = Depends(get_db)):
         )
         for pa, a in pub_authors
     ]
+
+
+@router.get("/author/{author_id}/possible-duplicates", response_model=DuplicatePublicationsSummary, 
+            summary="Detectar posibles publicaciones duplicadas de un autor")
+def get_author_possible_duplicates(
+    author_id: int,
+    min_similarity: float = Query(0.80, ge=0.0, le=1.0, description="Umbral mínimo de similitud (0-1)"),
+    include_low: bool = Query(False, description="Incluir pares con similitud baja (0.80-0.85)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Detecta posibles publicaciones duplicadas para un autor específico.
+    
+    Compara todas las publicaciones canónicas del autor usando:
+    - **Similitud de títulos** (40% del peso)
+    - **Mismo DOI** (40% del peso)  
+    - **Mismo año de publicación** (10% del peso)
+    - **Similitud de autores** (10% del peso)
+    
+    **Niveles de confianza:**
+    - 🔴 **Alta (≥0.95 o mismo DOI)**: Recomendación "merge" - Fusionar publicaciones
+    - 🟠 **Media (0.85-0.95)**: Recomendación "review" - Revisar manualmente (posible fusión)
+    - 🟡 **Baja (0.80-0.85)**: Recomendación "keep_both" - Mantener separadas (similar pero distinto)
+    
+    **Casos especiales:**
+    - Mismo DOI pero IDs canónicos diferentes = Error de reconciliación crítico
+    - Mismo año + similitud alta + autores compartidos = Probable duplicado
+    
+    **Headers de respuesta:**
+    - `total_pairs`: Número total de pares candidatos encontrados
+    - `high_confidence`: Pares muy similares (fusión recomendada)
+    - `medium_confidence`: Pares moderadamente similares (revisar)
+    - `low_confidence`: Pares levemente similares (mantener separados)
+    - `same_doi_different_id`: Pares con mismo DOI pero diferente ID canónico
+    """
+    from api.routers.publications_duplicates import find_possible_duplicates
+    
+    # Verificar que el autor existe
+    author = db.query(Author).filter(Author.id == author_id).first()
+    if not author:
+        raise HTTPException(status_code=404, detail=f"Autor con ID {author_id} no encontrado")
+    
+    # Detectar duplicados
+    result = find_possible_duplicates(
+        db,
+        author_id=author_id,
+        min_title_similarity=min_similarity,
+        include_low_confidence=include_low,
+    )
+    
+    return result
+

@@ -26,6 +26,8 @@ from .domain.matching import (
     normalize_issn,
     normalize_title,
     sanitize_title,
+    title_bigrams_for_search,
+    title_query_variants,
     truncate_title_for_search,
 )
 from .infrastructure.excel_reader import read_excel_bytes, read_excel_path
@@ -512,6 +514,14 @@ class  OpenAlexEnricher:
     @staticmethod
     def _sanitize_title(title: str) -> str:
         return sanitize_title(title)
+
+    @staticmethod
+    def _title_query_variants(title: str) -> list[str]:
+        return title_query_variants(title)
+
+    @staticmethod
+    def _title_bigrams_for_search(title: str, max_bigrams: int = 3) -> list[str]:
+        return title_bigrams_for_search(title, max_bigrams=max_bigrams)
 
     def _best_match_loose(
         self,

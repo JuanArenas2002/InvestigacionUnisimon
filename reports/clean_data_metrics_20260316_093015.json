@@ -1,0 +1,9 @@
+{
+  "total_processed": 0,
+  "accepted": 0,
+  "accepted_with_warnings": 0,
+  "pending_review": 0,
+  "rejected_incomplete": 0,
+  "rejected_corrupted": 0,
+  "rejected_non_scientific": 0
+}

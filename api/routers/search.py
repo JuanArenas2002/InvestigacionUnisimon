@@ -670,6 +670,11 @@ async def enrich_excel_openalex(
 
     try:
         from extractors.openalex import OpenAlexEnricher, OpenAlexRateLimitError
+    except Exception as exc:
+        logger.error(f"[enrich-excel] Error cargando módulo OpenAlex: {exc}")
+        raise HTTPException(500, f"Error inicializando OpenAlex: {exc}")
+
+    try:
         enricher = OpenAlexEnricher()
         enricher.MIN_SCORE = float(fuzzy_threshold)
         all_rows = enricher.enrich_from_excel_bytes(data)

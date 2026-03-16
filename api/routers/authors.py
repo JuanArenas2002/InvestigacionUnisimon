@@ -200,26 +200,51 @@ def enrich_authors_missing_orcid(
 
 def _batch_source_records(db: Session, pub_ids: List[int]):
     """
-    Devuelve un dict  pub_id -> {source_name: url}  y  pub_id -> [source_names]
-    usando UNION ALL en vez de un loop de queries por fuente.
-
-    Antes: len(SOURCE_MODELS) × 1 query = N queries
-    Ahora: 1 query UNION ALL
+    🚀 OPTIMIZADO: Devuelve dict pub_id -> {source_name: url} usando UNION ALL.
+    
+    Antes: len(SOURCE_MODELS) × 1 query = 5 queries LENTAS
+    Ahora: 1 query UNION ALL + IN = 1 query rápida
+    
+    Índices clave (deben estar en models.py):
+    - canonical_publication_id (índice obligatorio)
+    - doi (para búsqueda)
     """
     if not pub_ids:
         return {}, {}
 
+    # Caché static del mapeo columnas
+    SOURCE_ID_MAPPING = {
+        "OpenalexRecord": "openalex_work_id",
+        "ScopusRecord": "scopus_doc_id",
+        "WosRecord": "wos_uid",
+        "CvlacRecord": "cvlac_product_id",
+        "DatosAbiertosRecord": "datos_source_id",
+    }
+
     # Construir UNION ALL de los SELECT de cada modelo fuente
     selects = []
     for src_name, Model in SOURCE_MODELS.items():
+        model_class_name = Model.__name__
+        source_id_col_name = SOURCE_ID_MAPPING.get(model_class_name)
+        
+        if not source_id_col_name:
+            continue
+        
+        source_id_col = getattr(Model, source_id_col_name, None)
+        if source_id_col is None:
+            continue
+        
+        # OPT: Solo selectear columnas necesarias (no SELECT *)
         s = (
             select(
                 Model.canonical_publication_id.label("pub_id"),
                 literal(src_name).label("source"),
-                Model.source_id.label("source_id"),
+                source_id_col.label("source_id"),
                 Model.doi.label("doi"),
             )
             .where(Model.canonical_publication_id.in_(pub_ids))
+            # OPT: Solo registros que tengan source_id o DOI (evita filas vacías)
+            .where(or_(source_id_col.isnot(None), Model.doi.isnot(None)))
         )
         selects.append(s)
 
@@ -229,11 +254,11 @@ def _batch_source_records(db: Session, pub_ids: List[int]):
     stmt = union_all(*selects)
     rows = db.execute(stmt).fetchall()
 
-    sources_map: dict = {}
-    sources_list_map: dict = {}
+    # OPT: Prealocar diccionarios con las keys conocidas
+    sources_map: dict = {pid: {} for pid in pub_ids}
+    sources_list_map: dict = {pid: [] for pid in pub_ids}
+    
     for pub_id, sname, sid, edoi in rows:
-        sources_map.setdefault(pub_id, {})
-        sources_list_map.setdefault(pub_id, [])
         url = build_source_url(sname, sid, edoi)
         if url:
             sources_map[pub_id][sname] = url
@@ -681,11 +706,15 @@ def get_author_inventory(
     year: Optional[int]        = Query(None),
     publication_type: Optional[str] = Query(None),
     source: Optional[str]      = Query(None),
+    institutional_only: bool   = Query(False, description="Si es True, solo publicaciones con autores institucionales (institutional_authors_count > 0)"),
     db: Session = Depends(get_db),
 ):
     """
     Inventario completo de un autor.
     OPTIMIZACIÓN: JOIN directo en lugar de IN (subquery), fuentes externas en UNION ALL.
+    
+    Parámetro `institutional_only`: Si es True, filtra solo publicaciones donde 
+    institutional_authors_count > 0 (publicaciones que incluyen coautores de la institución).
     """
     if not any([author_id, name, orcid, scopus_id, openalex_id, cvlac_id]):
         raise HTTPException(
@@ -733,6 +762,8 @@ def get_author_inventory(
         q = q.filter(CanonicalPublication.publication_year == year)
     if publication_type:
         q = q.filter(CanonicalPublication.publication_type == publication_type)
+    if institutional_only:
+        q = q.filter(CanonicalPublication.institutional_authors_count > 0)
 
     pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).all()
     pub_ids = [p.id for p in pubs]

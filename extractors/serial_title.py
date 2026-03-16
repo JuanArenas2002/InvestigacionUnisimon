@@ -260,17 +260,20 @@ class SerialTitleExtractor:
 
     def get_journal_coverage(self, issn: str) -> dict:
         """
-        Consulta el Serial Title API de Scopus para un ISSN.
+        Consulta el Serial Title API de Scopus para un ISSN/E-ISSN.
+        Si encuentra un resultado "Active", busca también el identificador complementario
+        (E-ISSN si se buscó ISSN, o ISSN si se buscó E-ISSN) para reforzar confiabilidad.
 
         Args:
-            issn: ISSN con o sin guion (ej: '2595-3982' o '25953982').
+            issn: ISSN/E-ISSN con o sin guion (ej: '2595-3982' o '25953982').
 
         Returns:
-            dict con:
-              issn, title, source_id, publisher,
-              status, is_discontinued,
-              coverage_from, coverage_to,
-              subject_areas, error (si no se encontró)
+            dict con datos del identificador encontrado, incluyendo:
+              - issn, identifier_type, title, source_id, publisher
+              - status, is_discontinued
+              - coverage_from, coverage_to
+              - subject_areas, error (si no se encontró)
+              - _complementary_data: resultados del identificador complementario si status="Active"
         """
         if not self.api_key:
             raise SerialTitleAPIError("SCOPUS_API_KEY no configurada.")
@@ -290,7 +293,49 @@ class SerialTitleExtractor:
             logger.error(f"Error Serial Title API para ISSN {issn}: {e}")
             raise SerialTitleAPIError(f"Error en Serial Title API: {e}")
 
-        return self._parse_entry(issn, data)
+        result = self._parse_entry(issn, data)
+        
+        # Si encontró un resultado "Active" (confiable), buscar complementario para reforzar
+        if not result.get("error") and result.get("status") == "Active":
+            resolved_issn = result.get("resolved_issn") or ""
+            resolved_eissn = result.get("resolved_eissn") or ""
+            identifier_type = result.get("identifier_type", "issn")
+            
+            # Determinar qué identificador buscar como complemento
+            complementary_id = None
+            if identifier_type == "issn" and resolved_eissn and resolved_eissn != clean_issn:
+                # Se buscó ISSN y existe E-ISSN diferente → buscar E-ISSN
+                complementary_id = resolved_eissn
+            elif identifier_type == "eissn" and resolved_issn and resolved_issn != clean_issn:
+                # Se buscó E-ISSN y existe ISSN diferente → buscar ISSN
+                complementary_id = resolved_issn
+            
+            if complementary_id:
+                try:
+                    logger.debug(
+                        f"  [dual-verify] Status 'Active' encontrado con {identifier_type.upper()} {clean_issn}. "
+                        f"Buscando identificador complementario ({complementary_id}) para reforzar confiabilidad."
+                    )
+                    resp_comp = self._get(f"{self.BASE_URL}/{complementary_id}", {"view": "ENHANCED"})
+                    if resp_comp.status_code == 200:
+                        data_comp = resp_comp.json()
+                        result_comp = self._parse_entry(complementary_id, data_comp)
+                        if not result_comp.get("error"):
+                            result["_complementary_data"] = result_comp
+                            logger.info(
+                                f"  [dual-verify] Complementario encontrado: {identifier_type.upper()}→"
+                                f"{'EISSN' if identifier_type == 'issn' else 'ISSN'}, "
+                                f"Status: {result.get('status')} vs {result_comp.get('status')}"
+                            )
+                    elif resp_comp.status_code == 404:
+                        logger.debug(
+                            f"  [dual-verify] Identificador complementario {complementary_id} no encontrado (solo {identifier_type.upper()})"
+                        )
+                        result["_complementary_data"] = {"issn": complementary_id, "error": "No encontrado"}
+                except Exception as e:
+                    logger.debug(f"  [dual-verify] Error buscando complementario {complementary_id}: {e}")
+        
+        return result
 
     # ------------------------------------------------------------------
     # Consulta masiva (paralela)
@@ -303,33 +348,81 @@ class SerialTitleExtractor:
         delay: float = 0.2,
     ) -> list[dict]:
         """
-        Consulta múltiples ISSNs de forma concurrente.
+        Consulta múltiples ISSNs O nombres de revistas de forma concurrente.
+
+        Detecta automáticamente si cada entrada es un ISSN o un nombre de revista
+        y llama al método apropiado.
 
         Args:
-            issns:       Lista de ISSNs a consultar.
+            issns:       Lista de ISSNs o nombres de revistas.
             max_workers: Máximo de hilos paralelos (default 5, respeta rate-limit).
             delay:       Pausa entre batches (segundos).
 
         Returns:
-            Lista de dicts, uno por ISSN, en el mismo orden de entrada.
+            Lista de dicts, uno por entrada, en el mismo orden de entrada.
+            Cada dict contiene los campos: issn, title, status, coverage_from,
+            coverage_to, publisher, subject_areas, error (si no encuentra).
         """
         results: dict[str, dict] = {}
 
-        def _fetch(issn: str) -> tuple[str, dict]:
+        def _is_issn_format(value: str) -> bool:
+            """Detecta si el string tiene formato de ISSN."""
+            clean = value.strip().replace("-", "")
+            # ISSN: 7-8 dígitos (o ISSN-L que puede tener X al final)
+            import re
+            return bool(re.match(r"^[\dXx]{7,8}$", clean))
+
+        def _fetch(identifier: str) -> tuple[str, dict]:
             try:
-                return issn, self.get_journal_coverage(issn)
+                if _is_issn_format(identifier):
+                    logger.debug(f"  SerialTitle: detectado ISSN {identifier}")
+                    result = self.get_journal_coverage(identifier)
+                    
+                    # Si falló y podría ser por cero inicial perdido por Excel
+                    # Reintenta con "0" prepended si el ISSN tiene < 8 dígitos y no comienza con "0"
+                    if result.get("error"):
+                        clean = identifier.strip().replace("-", "")
+                        if clean and len(clean) < 8 and not clean.startswith("0"):
+                            logger.debug(
+                                f"  SerialTitle: reintentando '{identifier}' con 0 prepended: 0{identifier}"
+                            )
+                            result_with_zero = self.get_journal_coverage(f"0{identifier}")
+                            if not result_with_zero.get("error"):
+                                result = result_with_zero
+                                result["_prepended_zero"] = True
+                                logger.debug(f"  SerialTitle: ✓ encontrado con 0 prepended: 0{identifier}")
+                        
+                        # Si sigue fallando con 7 dígitos, también intenta agregar un 0 al final
+                        # (algunos ISSNs pueden tener el check digit al final)
+                        if result.get("error") and clean and len(clean) == 7:
+                            logger.debug(
+                                f"  SerialTitle: reintentando '{identifier}' con 0 al final: {identifier}0"
+                            )
+                            result_with_zero_end = self.get_journal_coverage(f"{identifier}0")
+                            if not result_with_zero_end.get("error"):
+                                result = result_with_zero_end
+                                result["_prepended_zero"] = False
+                                result["_appended_zero"] = True
+                                logger.debug(f"  SerialTitle: ✓ encontrado con 0 al final: {identifier}0")
+                    
+                    return identifier, result
+                else:
+                    logger.debug(f"  SerialTitle: detectado nombre de revista '{identifier}'")
+                    return identifier, self.search_journal_by_title(identifier)
             except SerialTitleAPIError as e:
-                return issn, {"issn": issn, "error": str(e)}
+                return identifier, {"issn": identifier, "error": str(e)}
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_fetch, issn): issn for issn in issns}
             for future in as_completed(futures):
-                original_issn, result = future.result()
-                results[original_issn] = result
-                logger.info(f"  SerialTitle: procesado ISSN {original_issn}")
+                original_identifier, result = future.result()
+                results[original_identifier] = result
+                result_title = result.get("title", "sin título")
+                result_status = "✓" if not result.get("error") else "✗"
+                logger.info(f"  SerialTitle: {result_status} '{original_identifier}' → {result_title}")
 
         # Devolver en el mismo orden que la entrada
-        return [results[issn] for issn in issns]
+        return [results[identifier] for identifier in issns]
 
     # ------------------------------------------------------------------
     # Búsqueda por nombre de revista (cuando no hay ISSN)
@@ -755,6 +848,18 @@ class SerialTitleExtractor:
             # 2) ISSN → Serial Title API
             if r_issn:
                 res = self.get_journal_coverage(r_issn)
+                
+                # Si falló y podría ser por cero inicial perdido por Excel
+                if res.get("error"):
+                    clean = r_issn.strip().replace("-", "")
+                    if clean and len(clean) < 8 and not clean.startswith("0"):
+                        logger.debug(
+                            f"  {found_via}→ISSN '{r_issn}' falló, reintentando con 0 prepended"
+                        )
+                        res = self.get_journal_coverage(f"0{r_issn}")
+                        if not res.get("error"):
+                            res["_prepended_zero"] = True
+                
                 if not res.get("error"):
                     res["_found_via"] = found_via
                     src_id = res.get("source_id")
@@ -788,6 +893,18 @@ class SerialTitleExtractor:
             # 1) ISSN → Serial Title API directo
             if issn_fb:
                 res = self.get_journal_coverage(issn_fb)
+                
+                # Si falló y podría ser por cero inicial perdido por Excel
+                if res.get("error"):
+                    clean = issn_fb.strip().replace("-", "")
+                    if clean and len(clean) < 8 and not clean.startswith("0"):
+                        logger.debug(
+                            f"  [try-fallbacks] reintentando ISSN fallback '{issn_fb}' con 0 prepended"
+                        )
+                        res = self.get_journal_coverage(f"0{issn_fb}")
+                        if not res.get("error"):
+                            res["_prepended_zero"] = True
+                
                 if not res.get("error"):
                     res["_found_via"] = "issn_fallback"
                     src_id = res.get("source_id")
@@ -832,6 +949,18 @@ class SerialTitleExtractor:
                         )
                 elif info["type"] == "issn":
                     result = self.get_journal_coverage(info["value"])
+                    
+                    # Si falló y podría ser por cero inicial perdido por Excel
+                    if result.get("error"):
+                        clean = info["value"].strip().replace("-", "")
+                        if clean and len(clean) < 8 and not clean.startswith("0"):
+                            logger.debug(
+                                f"  [check-coverage] reintentando ISSN '{info['value']}' con 0 prepended"
+                            )
+                            result = self.get_journal_coverage(f"0{info['value']}")
+                            if not result.get("error"):
+                                result["_prepended_zero"] = True
+                    
                     if not result.get("error"):
                         result["_found_via"] = "issn"
                         src_id = result.get("source_id")
@@ -1022,10 +1151,15 @@ class SerialTitleExtractor:
     # Parser de respuesta JSON
     # ------------------------------------------------------------------
 
-    def _parse_entry(self, issn: str, data: dict) -> dict:
+    def _parse_entry(self, issn: str, data: dict, identifier_type: str = "auto") -> dict:
         """
         Parsea el JSON del Serial Title API y retorna un dict normalizado.
         Basado en la estructura real confirmada de la respuesta ENHANCED.
+        
+        Args:
+            issn: El identificador buscado (ISSN o E-ISSN)
+            data: JSON de respuesta de Scopus
+            identifier_type: Tipo de identificador buscado ("issn", "eissn", "auto")
         """
         entry_list = (
             data.get("serial-metadata-response", {})
@@ -1176,8 +1310,27 @@ class SerialTitleExtractor:
         resolved_issn  = _entry_issn("prism:issn")  or _entry_issn("prism:isbn")
         resolved_eissn = _entry_issn("prism:eIssn") or _entry_issn("prism:e-issn")
 
+        # ── Detectar tipo de búsqueda ─────────────────────────────────
+        # Si se conoce el tipo, usarlo. Si no, deducir a partir del resultado.
+        clean_search = issn.strip().replace("-", "")
+        if identifier_type == "auto":
+            # Si el buscado coincide con E-ISSN → se buscó E-ISSN
+            if clean_search == (resolved_eissn or ""):
+                detected_type = "eissn"
+            # Si el buscado coincide con ISSN → se buscó ISSN
+            elif clean_search == (resolved_issn or ""):
+                detected_type = "issn"
+            # Si tiene 8 dígitos normalmente es E-ISSN
+            elif len(clean_search) == 8:
+                detected_type = "eissn"
+            else:
+                detected_type = "issn"
+        else:
+            detected_type = identifier_type
+
         return {
             "issn": issn,
+            "identifier_type": detected_type,  # Lo que se buscó: "issn" o "eissn"
             "resolved_issn":  resolved_issn,
             "resolved_eissn": resolved_eissn,
             "title": entry.get("dc:title"),

@@ -112,6 +112,60 @@ class DatosAbiertosConfig:
 # RECONCILIACIÓN
 # =============================================================
 
+# =============================================================
+# CRITERIOS DE INCLUSIÓN/EXCLUSIÓN
+# =============================================================
+
+@dataclass
+class CriteriaConfig:
+    """
+    Criterios de validación de registros bibliográficos.
+    Define qué registros se aceptan, rechazan o marcan para revisión.
+    
+    Ver: docs/CRITERIA.md
+    """
+
+    # --- Campos obligatorios ---
+    min_title_length: int = 5
+    max_title_length: int = 500
+    min_year: int = 1900
+    max_year: int = 2099
+
+    # --- Completitud de metadatos (en limpieza) ---
+    min_completeness_accepted: float = 0.70      # 70% para aceptar
+    min_completeness_review: float = 0.50        # 50% para revisar manualmente
+    # < 50% se rechaza
+
+    # --- Fuzzy matching (en reconciliación) ---
+    fuzzy_auto_accept: float = 0.95              # >= 95% = aceptar automático
+    fuzzy_manual_review: float = 0.85            # 85-95% = revisar manualmente
+
+    # --- Tolerancia temporal ---
+    year_tolerance: int = 2                      # +/- años permitidos
+
+    # --- Palabras prohibidas (contenido no científico) ---
+    blacklist_keywords: list = field(default_factory=lambda: [
+        "404", "error", "not found", "confidencial",
+        "borrador", "draft", "untitled", "sin titulo"
+    ])
+
+    # --- Fuentes válidas ---
+    valid_sources: list = field(default_factory=lambda: [
+        "openalex", "scopus", "wos", "cvlac", "datos_abiertos"
+    ])
+
+    # --- Tipos de publicación válidos ---
+    valid_publication_types: list = field(default_factory=lambda: [
+        "journal-article", "review-article", "conference-paper",
+        "book-chapter", "book", "report", "dataset", "preprint",
+        "monograph", "technical-report", "working-paper"
+    ])
+
+
+# =============================================================
+# RECONCILIACIÓN
+# =============================================================
+
 @dataclass
 class ReconciliationConfig:
     """Parámetros del motor de reconciliación"""
@@ -132,6 +186,9 @@ class ReconciliationConfig:
     weight_title: float = 0.55
     weight_year: float = 0.20
     weight_authors: float = 0.25
+    title_weight: float = 0.55  # Alias para compatibility
+    year_weight: float = 0.20
+    author_weight: float = 0.25
 
     # Año: ¿debe coincidir exactamente?
     year_must_match: bool = True
@@ -186,4 +243,5 @@ scopus_config = ScopusConfig()
 wos_config = WosConfig()
 cvlac_config = CvlacConfig()
 datos_abiertos_config = DatosAbiertosConfig()
+criteria_config = CriteriaConfig()
 reconciliation_config = ReconciliationConfig()

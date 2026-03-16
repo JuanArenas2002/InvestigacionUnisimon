@@ -95,8 +95,9 @@ openapi_tags = [
     {"name": "Estadísticas", "description": "KPIs del sistema, métricas de calidad, timelines y archivos JSON."},
     {"name": "Búsqueda", "description": "Búsqueda en vivo contra APIs externas."},
     {"name": "OpenAlex", "description": "Extracción, búsqueda y enriquecimiento vía OpenAlex (PyAlex)."},
-    {"name": "Pipeline", "description": "Ingesta desde fuentes, reconciliación y administración de tablas."},
+
     {"name": "Catálogos", "description": "Gestión de revistas e instituciones normalizadas (tablas de referencia)."},
+    {"name": "Administración", "description": "Limpieza, deduplicación, reportes de calidad y validación de integridad."},
 ]
 
 app = FastAPI(
@@ -125,7 +126,7 @@ app.add_middleware(
 
 # ── Registrar routers ────────────────────────────────────────
 
-from api.routers import publications, authors, external_records, stats, search, pipeline, catalogs, scopus
+from api.routers import publications, authors, external_records, stats, search, pipeline, catalogs, scopus, admin
 
 app.include_router(publications.router, prefix="/api")
 app.include_router(authors.router,      prefix="/api")
@@ -135,6 +136,7 @@ app.include_router(stats.router,        prefix="/api")
 app.include_router(search.router,       prefix="/api")
 app.include_router(pipeline.router,     prefix="/api")
 app.include_router(catalogs.router,     prefix="/api")
+app.include_router(admin.router,        prefix="/api")
 
 
 # ── Root ─────────────────────────────────────────────────────

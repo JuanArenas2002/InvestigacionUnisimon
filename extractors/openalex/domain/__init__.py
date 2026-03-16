@@ -10,6 +10,8 @@ from .matching import (
     normalize_issn,
     normalize_title,
     sanitize_title,
+    title_bigrams_for_search,
+    title_query_variants,
     truncate_title_for_search,
 )
 
@@ -23,5 +25,7 @@ __all__ = [
     "normalize_issn",
     "normalize_title",
     "sanitize_title",
+    "title_bigrams_for_search",
+    "title_query_variants",
     "truncate_title_for_search",
 ]

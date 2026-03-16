@@ -14,6 +14,9 @@ def enrich_by_issn(enricher, oa_map: list, method: list, indexed: list[tuple[int
         if seq % 25 == 1:
             logger.info(f"[OpenAlexEnricher] ISSN fallback: {seq}/{total}")
         title_clean = enricher._sanitize_title(title)
+        title_variants = enricher._title_query_variants(title)
+        primary_query_title = title_variants[0] if title_variants else title_clean
+        secondary_query_title = title_variants[1] if len(title_variants) > 1 else None
         best: dict | None = None
         matched_issn = ""
 
@@ -28,12 +31,27 @@ def enrich_by_issn(enricher, oa_map: list, method: list, indexed: list[tuple[int
                     enricher._Works()
                     .select(enricher._SELECT)
                     .filter(**{"primary_location.source.issn": issn_clean})
-                    .search_filter(title=title_clean)
+                    .search_filter(title=primary_query_title)
                 )
                 if year:
                     q = q.filter(publication_year=year)
                 candidates_a = q.get(per_page=10)
                 best = enricher._best_match(title, candidates_a, year, min_score=enricher.MIN_SCORE_ISSN)
+
+                if best is None and secondary_query_title:
+                    q_alt = (
+                        enricher._Works()
+                        .select(enricher._SELECT)
+                        .filter(**{"primary_location.source.issn": issn_clean})
+                        .search_filter(title=secondary_query_title)
+                    )
+                    if year:
+                        q_alt = q_alt.filter(publication_year=year)
+                    candidates_a_alt = q_alt.get(per_page=10)
+                    candidates_a = list(candidates_a) + list(candidates_a_alt)
+                    best = enricher._best_match(title, candidates_a_alt, year, min_score=enricher.MIN_SCORE_ISSN)
+                    if best:
+                        time.sleep(0.1)
 
                 candidates_b: list = []
                 if best is None and year:
@@ -41,7 +59,7 @@ def enrich_by_issn(enricher, oa_map: list, method: list, indexed: list[tuple[int
                         enricher._Works()
                         .select(enricher._SELECT)
                         .filter(**{"primary_location.source.issn": issn_clean})
-                        .search_filter(title=title_clean)
+                        .search_filter(title=primary_query_title)
                     )
                     candidates_b = q_ny.get(per_page=10)
                     best = enricher._best_match(title, candidates_b, year, min_score=enricher.MIN_SCORE_ISSN)
@@ -66,7 +84,7 @@ def enrich_by_issn(enricher, oa_map: list, method: list, indexed: list[tuple[int
                         enricher._Works()
                         .select(enricher._SELECT)
                         .filter(**{"locations.source.issn": issn_clean})
-                        .search_filter(title=title_clean)
+                        .search_filter(title=primary_query_title)
                     )
                     if year:
                         q_loc = q_loc.filter(publication_year=year)
@@ -116,17 +134,35 @@ def enrich_by_source_name(enricher, oa_map: list, method: list, indexed: list[tu
         if seq % 25 == 1:
             logger.info(f"[OpenAlexEnricher] Fallback revista: {seq}/{total}")
         title_clean = enricher._sanitize_title(title)
+        title_variants = enricher._title_query_variants(title)
+        primary_query_title = title_variants[0] if title_variants else title_clean
+        secondary_query_title = title_variants[1] if len(title_variants) > 1 else None
         try:
             q = (
                 enricher._Works()
                 .select(enricher._SELECT)
                 .filter(**{"primary_location.source.display_name.search": revista})
-                .search_filter(title=title_clean)
+                .search_filter(title=primary_query_title)
             )
             if year:
                 q = q.filter(publication_year=year)
             candidates = q.get(per_page=10)
             best = enricher._best_match(title, candidates, year, min_score=enricher.MIN_SCORE_SOURCE)
+
+            if best is None and secondary_query_title:
+                q_alt = (
+                    enricher._Works()
+                    .select(enricher._SELECT)
+                    .filter(**{"primary_location.source.display_name.search": revista})
+                    .search_filter(title=secondary_query_title)
+                )
+                if year:
+                    q_alt = q_alt.filter(publication_year=year)
+                candidates_alt = q_alt.get(per_page=10)
+                candidates = list(candidates) + list(candidates_alt)
+                best = enricher._best_match(title, candidates_alt, year, min_score=enricher.MIN_SCORE_SOURCE)
+                if best:
+                    time.sleep(0.1)
 
             candidates_ny: list = []
             if best is None and year:
@@ -134,7 +170,7 @@ def enrich_by_source_name(enricher, oa_map: list, method: list, indexed: list[tu
                     enricher._Works()
                     .select(enricher._SELECT)
                     .filter(**{"primary_location.source.display_name.search": revista})
-                    .search_filter(title=title_clean)
+                    .search_filter(title=primary_query_title)
                 )
                 candidates_ny = q_ny.get(per_page=10)
                 best = enricher._best_match(title, candidates_ny, year, min_score=enricher.MIN_SCORE_SOURCE)

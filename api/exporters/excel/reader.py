@@ -98,18 +98,23 @@ def _looks_like_header_row(row_values: tuple) -> bool:
 
 def read_issns_from_excel(file_bytes: bytes) -> list:
     """
-    Lee un archivo .xlsx y extrae todos los ISSNs de la primera columna (A).
+    Lee un archivo .xlsx y extrae ISSNs/E-ISSNs de la columna A.
 
-    - Omite la primera fila si parece un encabezado (texto, no ISSN).
-    - Acepta ISSNs con o sin guion: '2595-3982' ó '25953982'.
-    - Elimina duplicados preservando el orden de aparición.
-    - Ignora celdas vacías.
+    Modo automático:
+    - Lee ISSN/E-ISSN de columna A (pueden estar separados por ; o ,)
+    - Detecta si el contenido son ISSNs o nombres de revistas
+    - Omite la primera fila si parece un encabezado
+    - Acepta ISSNs con o sin guion: '2595-3982' ó '25953982'
+    - E-ISSNs: '2146-4553'
+    - Nombres de revistas: "Nature", "Journal of Biochemistry", etc.
+    - Elimina duplicados preservando el orden
+    - Ignora celdas vacías
 
     Returns:
-        Lista de ISSNs únicos como strings.
+        Lista de [ISSNs | E-ISSNs | Nombres] como strings. El extractor maneja todos los tipos.
 
     Raises:
-        ValueError: Si el archivo no es válido o no contiene ISSNs.
+        ValueError: Si el archivo no es válido o la columna A está vacía.
     """
     try:
         wb = openpyxl.load_workbook(
@@ -122,7 +127,7 @@ def read_issns_from_excel(file_bytes: bytes) -> list:
     ISSN_RE = re.compile(r"^\d{4}-?\d{3}[\dXx]$", re.IGNORECASE)
 
     seen: set = set()
-    issns: list = []
+    items: list = []
 
     for row_idx, row in enumerate(
         ws.iter_rows(min_col=1, max_col=1, values_only=True), start=1
@@ -134,27 +139,41 @@ def read_issns_from_excel(file_bytes: bytes) -> list:
         if not value:
             continue
 
-        normalized = value.replace("-", "")
-        if row_idx == 1 and not ISSN_RE.match(value) and not re.match(
-            r"^[\dXx]{7,8}$", normalized, re.I
-        ):
+        # Skip header row (solo si es claramente un encabezado)
+        if row_idx == 1 and value.lower() in ("issn", "e-issn", "eissn", "source title", "journal", "year", "id"):
             continue
 
-        if ISSN_RE.match(value) or re.match(r"^[\dXx]{7,8}$", normalized, re.I):
-            if value not in seen:
-                seen.add(value)
-                issns.append(value)
+        # Dividir múltiples valores separados por ; o , (ej: "ISSN; E-ISSN" o "ISSN, E-ISSN")
+        parts = re.split(r'[;,]', value)
+        
+        for part in parts:
+            part = part.strip()
+            if not part:
+                continue
+            
+            normalized = part.replace("-", "")
+            
+            # Es un ISSN/E-ISSN válido (XXXX-XXXD o XXXXXXXD)
+            if ISSN_RE.match(part) or re.match(r"^[\dXx]{7,8}$", normalized, re.I):
+                if part not in seen:
+                    seen.add(part)
+                    items.append(part)
+            # Es un nombre de revista (texto con al menos 3 caracteres)
+            elif len(part) >= 3 and not part.isdigit():
+                if part not in seen:
+                    seen.add(part)
+                    items.append(part)
 
     wb.close()
 
-    if not issns:
+    if not items:
         raise ValueError(
-            "No se encontraron ISSNs válidos en la columna A del archivo. "
-            "Asegúrese de que la columna A contenga ISSNs "
-            "(formatos aceptados: 2595-3982 ó 25953982)."
+            "No se encontraron datos válidos en la columna A del archivo. "
+            "Aceptamos: ISSNs (2595-3982 o 25953982), E-ISSNs (2146-4553), nombres de revistas, "
+            "o múltiples separados por punto y coma (ISSN; E-ISSN)."
         )
 
-    return issns
+    return items
 
 
 # ── read_publications_from_excel ──────────────────────────────────────────────
