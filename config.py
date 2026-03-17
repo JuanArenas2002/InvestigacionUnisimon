@@ -8,6 +8,14 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
+# Cargar variables de entorno desde .env
+try:
+    from dotenv import load_dotenv
+    env_path = Path(__file__).resolve().parent / ".env"
+    load_dotenv(env_path)
+except ImportError:
+    pass  # Si dotenv no está instalado, usar solo variables de entorno del sistema
+
 
 # =============================================================
 # RUTAS DEL PROYECTO

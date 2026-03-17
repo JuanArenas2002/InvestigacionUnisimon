@@ -90,6 +90,7 @@ openapi_tags = [
     {"name": "Inicio", "description": "Información general del servicio."},
     {"name": "Publicaciones", "description": "CRUD y consultas sobre publicaciones canónicas del inventario bibliográfico."},
     {"name": "Autores", "description": "Gestión de autores, coautorías y cobertura de identificadores."},
+    {"name": "Gráficos de Investigadores", "description": "Generación de gráficos de publicaciones desde Scopus con visualizaciones profesionales."},
     {"name": "Registros Externos", "description": "Registros importados de fuentes externas, revisión manual y log de reconciliación."},
     {"name": "Scopus", "description": "Dashboard completo de registros, contribuciones, cobertura y métricas de Scopus."},
     {"name": "Estadísticas", "description": "KPIs del sistema, métricas de calidad, timelines y archivos JSON."},
@@ -126,10 +127,11 @@ app.add_middleware(
 
 # ── Registrar routers ────────────────────────────────────────
 
-from api.routers import publications, authors, external_records, stats, search, pipeline, catalogs, scopus, admin
+from api.routers import publications, authors, external_records, stats, search, pipeline, catalogs, scopus, admin, charts
 
 app.include_router(publications.router, prefix="/api")
 app.include_router(authors.router,      prefix="/api")
+app.include_router(charts.router,       prefix="/api")
 app.include_router(external_records.router, prefix="/api")
 app.include_router(scopus.router,       prefix="/api")
 app.include_router(stats.router,        prefix="/api")

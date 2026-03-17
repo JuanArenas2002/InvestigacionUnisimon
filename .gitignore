@@ -18,3 +18,9 @@ __pycache__/
 # Archivos de sistema
 .DS_Store
 Thumbs.db
+
+# Reportes generados (no versionamos artefactos)
+reports/charts/
+reports/exports/
+reports/clean_data*.json
+reports/clean_data*.csv

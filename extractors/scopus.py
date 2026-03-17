@@ -171,15 +171,18 @@ class ScopusExtractor(BaseExtractor):
 
                     # Autores
                     authors = []
-                    for author in entry.findall('author', ns):
-                        name = author.findtext('authname', default=None)
-                        authid = author.findtext('authid', default=None)
-                        authors.append({
-                            "name": name,
-                            "orcid": None,
-                            "scopus_id": authid,
-                            "is_institutional": False,
-                        })
+                    # Buscar con ambos formatos de namespace por si acaso
+                    author_elements = entry.findall('atom:author', ns) or entry.findall('author', ns)
+                    for author in author_elements:
+                        name = author.findtext('atom:authname', default=None, namespaces=ns) or author.findtext('authname', default=None)
+                        authid = author.findtext('atom:authid', default=None, namespaces=ns) or author.findtext('authid', default=None)
+                        if name:  # Solo agregar si tiene nombre
+                            authors.append({
+                                "name": name,
+                                "orcid": None,
+                                "scopus_id": authid,
+                                "is_institutional": False,
+                            })
 
                     record = StandardRecord(
                         source_name=self.source_name,
