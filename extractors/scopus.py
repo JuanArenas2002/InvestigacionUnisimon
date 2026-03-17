@@ -82,6 +82,8 @@ class ScopusExtractor(BaseExtractor):
 
         return session
 
+
+
     # ---------------------------------------------------------
     # INTERFAZ BaseExtractor
     # ---------------------------------------------------------
@@ -165,9 +167,13 @@ class ScopusExtractor(BaseExtractor):
                     source_journal = entry.findtext('prism:publicationName', default=None, namespaces=ns)
                     issn = entry.findtext('prism:issn', default=None, namespaces=ns)
                     subtype = entry.findtext('subtypeDescription', default=None, namespaces=ns)
-                    citedby_count = int(entry.findtext('citedby-count', default='0', namespaces=ns))
+                    # citedby-count está en el namespace atom
+                    citedby_count = int(entry.findtext('atom:citedby-count', default='0', namespaces=ns))
                     oa_flag = entry.findtext('openaccessFlag', default=None, namespaces=ns)
                     is_oa = oa_flag == "true" if oa_flag else None
+                    
+                    # Obtener total de citaciones desde Scopus
+                    # (No disponible años precisos de citación desde Scopus API)
 
                     # Autores
                     authors = []
@@ -197,6 +203,7 @@ class ScopusExtractor(BaseExtractor):
                         is_open_access=is_oa,
                         authors=authors,
                         citation_count=citedby_count,
+                        citations_by_year={},  # No disponible desde Scopus API
                         url=None,
                         raw_data=None,
                     )

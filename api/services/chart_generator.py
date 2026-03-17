@@ -84,9 +84,9 @@ def extract_publications_by_year(
     year_from: Optional[int] = None,
     year_to: Optional[int] = None,
     verbose: bool = True
-) -> Tuple[List[int], List[int], Dict, str]:
+) -> Tuple[List[int], List[int], List[int], Dict, str]:
     """
-    Extrae publicaciones de Scopus agrupadas por año.
+    Extrae publicaciones de Scopus agrupadas por año (con citaciones).
     
     Args:
         query: Query avanzada de Scopus
@@ -95,7 +95,7 @@ def extract_publications_by_year(
         verbose: Imprimir información de depuración
     
     Returns:
-        (years_list, publications_list, stats_dict, first_author_name)
+        (years_list, publications_list, citations_list, stats_dict, first_author_name)
     """
     
     extractor = ScopusExtractor()
@@ -134,8 +134,10 @@ def extract_publications_by_year(
     if verbose:
         logger.info(f"Autor encontrado: {author_name}")
     
-    # Agrupar por año con filtro opcional
+    # Agrupar por año y sumar citaciones
     pub_by_year = Counter()
+    citations_by_year = Counter()  # Citaciones asociadas al año de publicación
+    
     for record in records:
         if record.publication_year:
             year = record.publication_year
@@ -147,34 +149,45 @@ def extract_publications_by_year(
                 continue
                 
             pub_by_year[year] += 1
+            
+            # Sumar citaciones por año de PUBLICACIÓN del artículo citado
+            # (Scopus no proporciona años precisos de cuándo fue citado)
+            if record.citation_count > 0:
+                citations_by_year[year] += record.citation_count
     
     # Crear series ordenada
     if pub_by_year:
         years = sorted(pub_by_year.keys())
         publications = [pub_by_year[year] for year in years]
+        citations = [citations_by_year.get(year, 0) for year in years]
     else:
         logger.warning("No se encontraron publicaciones en el rango especificado")
-        return [], [], {}, author_name
+        return [], [], [], {}, author_name
     
     # Calcular estadísticas
-    total = sum(publications)
+    total_pubs = sum(publications)
+    total_cites = sum(citations)
     stats = {
-        'total_publications': total,
+        'total_publications': total_pubs,
+        'total_citations': total_cites,
+        'avg_citations_per_pub': round(total_cites / total_pubs, 2) if total_pubs > 0 else 0,
         'min_year': min(years),
         'max_year': max(years),
-        'avg_per_year': total / len(years) if years else 0,
-        'peak_year': get_peak(publications, years)[0],
+        'avg_per_year': total_pubs / len(years) if years else 0,
+        'peak_year': get_peak(publications, years)[0] if publications else (min(years) if years else 2020),
         'peak_publications': max(publications) if publications else 0,
-        'active_years': len(years),
+        'peak_citations': max(citations) if citations else 0,
+        'active_years': len([p for p in publications if p > 0]),
     }
     
     if verbose:
         logger.info(f"Autor: {author_name}")
-        logger.info(f"Años: {years}")
+        logger.info(f"Años (de citación): {years}")
         logger.info(f"Publicaciones por año: {publications}")
-        logger.info(f"Total: {total} publicaciones")
+        logger.info(f"Citaciones por año: {citations}")
+        logger.info(f"Total: {total_pubs} publicaciones, {total_cites} citaciones (por año de citación)")
     
-    return years, publications, stats, author_name
+    return years, publications, citations, stats, author_name
 
 
 def make_investigator_chart(
@@ -183,12 +196,16 @@ def make_investigator_chart(
     ax_table,
     years_data: List[int],
     publications_data: List[int],
+    citations_data: List[int] = None,
     bar_peak_note: Optional[str] = None,
     bar_peak_color: str = CHART_COLORS['green'],
     num_years: int = None,
 ):
     """
-    Genera el gráfico de investigador con tabla de datos.
+    Genera el gráfico de investigador con tabla de datos y citaciones.
+    
+    Args:
+        citations_data: Lista de citaciones por año (opcional)
     """
     
     x = np.arange(len(years_data))
@@ -343,6 +360,41 @@ def make_investigator_chart(
     leg = [
         mpatches.Patch(facecolor="#388BFD", alpha=0.7, label="Publicaciones"),
     ]
+    
+    # Eje secundario para citaciones
+    if citations_data and sum(citations_data) > 0:
+        ax2 = ax1.twinx()
+        max_cit_val = max(citations_data) if citations_data else 0
+        
+        if max_cit_val > 0:
+            # Dibujar línea de citaciones
+            line = ax2.plot(
+                x, citations_data,
+                color="#EA4335",
+                marker="o",
+                markersize=5,
+                linewidth=2.5,
+                label="Citaciones",
+                zorder=3,
+            )
+            
+            # Configurar eje Y secundario
+            ax2.set_ylabel("N.° de citaciones", fontsize=ylabel_size, color="#EA4335", labelpad=10)
+            ax2.tick_params(axis="y", labelcolor="#EA4335")
+            ax2.set_ylim(0, max_cit_val * 1.25 if max_cit_val > 0 else 5)
+            ax2.yaxis.set_major_locator(
+                ticker.MultipleLocator(
+                    max(1, int(max_cit_val / 5)) if max_cit_val > 0 else 1
+                )
+            )
+            
+            # Añadir a la leyenda
+            leg.append(mpatches.Patch(facecolor="#EA4335", label="Citaciones"))
+        else:
+            ax2 = None
+    else:
+        ax2 = None
+    
     ax1.legend(
         handles=leg,
         loc="upper left",
@@ -363,8 +415,15 @@ def make_investigator_chart(
         [str(v) if v > 0 else "—" for v in publications_data],
     ]
     row_labels = ["Publicaciones"]
+    
+    # Añadir fila de citaciones si existen
+    if citations_data and sum(citations_data) > 0:
+        cell_data.append([str(v) if v > 0 else "—" for v in citations_data])
+        row_labels.append("Citaciones")
 
     cell_colors = []
+    
+    # Colores para fila de publicaciones
     row_c = []
     for col_i in range(len(years_data)):
         if max_pub_val > 0:
@@ -374,13 +433,27 @@ def make_investigator_chart(
         else:
             row_c.append((*[int(CHART_COLORS['grid'][i : i + 2], 16) / 255 for i in (1, 3, 5)], 1.0))
     cell_colors.append(row_c)
+    
+    # Colores para fila de citaciones si existen
+    if citations_data and sum(citations_data) > 0:
+        max_cit_val = max(citations_data) if citations_data else 0
+        row_c_cit = []
+        for col_i in range(len(years_data)):
+            if max_cit_val > 0:
+                intensity = citations_data[col_i] / max_cit_val
+                # Usar colores rojos/naranjas para citaciones
+                r, g, b, _ = plt.cm.Oranges(0.10 + 0.40 * intensity)
+                row_c_cit.append((r, g, b, 0.60))
+            else:
+                row_c_cit.append((*[int(CHART_COLORS['grid'][i : i + 2], 16) / 255 for i in (1, 3, 5)], 1.0))
+        cell_colors.append(row_c_cit)
 
     table = ax_table.table(
         cellText=cell_data,
         rowLabels=row_labels,
         colLabels=col_labels,
         cellColours=cell_colors,
-        rowColours=[CHART_COLORS['border']],
+        rowColours=[CHART_COLORS['border']] * len(row_labels),  # Un color por cada fila de datos
         colColours=[CHART_COLORS['border']] * len(col_labels),
         loc="center",
         cellLoc="center",
@@ -396,7 +469,13 @@ def make_investigator_chart(
             cell.set_text_props(color=CHART_COLORS['text'], fontweight="bold", fontsize=8.5)
         elif row == 0:  # Column labels (years)
             cell.set_text_props(color=CHART_COLORS['muted'], fontsize=8)
-        else:  # Data cells
+        elif row == 2 and len(row_labels) > 1:  # Data cells de citaciones
+            val_text = cell.get_text().get_text()
+            if val_text != "—":
+                cell.set_text_props(color="#EA4335", fontweight="bold", fontsize=8.5)
+            else:
+                cell.set_text_props(color=CHART_COLORS['muted'], fontsize=8.5)
+        else:  # Data cells de publicaciones
             val_text = cell.get_text().get_text()
             if val_text != "—":
                 cell.set_text_props(color=CHART_COLORS['blue'], fontweight="bold", fontsize=8.5)
@@ -442,9 +521,9 @@ def generate_investigator_chart_file(
         
         logger.info(f"[CHART] Query Scopus: {query}")
         
-        # Extraer datos (ahora retorna también el nombre del autor)
+        # Extraer datos (ahora retorna también el nombre del autor y citaciones)
         logger.info(f"[CHART] Extrayendo publicaciones...")
-        years, publications, stats, investigator_name = extract_publications_by_year(
+        years, publications, citations, stats, investigator_name = extract_publications_by_year(
             query=query,
             author_id=author_id,
             year_from=year_from,
@@ -452,7 +531,7 @@ def generate_investigator_chart_file(
             verbose=True
         )
         
-        logger.info(f"[CHART] Datos extraídos: {len(years)} años, {sum(publications)} publicaciones")
+        logger.info(f"[CHART] Datos extraídos: {len(years)} años, {sum(publications)} publicaciones, {sum(citations)} citaciones")
         logger.info(f"[CHART] Investigador: {investigator_name}")
         
         if not years:
@@ -521,11 +600,13 @@ def generate_investigator_chart_file(
             fig, ax_chart, ax_table,
             years_data=years,
             publications_data=publications,
+            citations_data=citations,
             num_years=num_years,
         )
         
         # Metadatos
         total_pub = sum(publications)
+        total_cit = sum(citations) if citations else 0
         min_year, max_year = years[0], years[-1]
         
         fig.text(
@@ -537,7 +618,7 @@ def generate_investigator_chart_file(
         
         fig.text(
             0.065, 0.956,
-            f"Total de publicaciones: {total_pub}  ·  Fuente: Scopus ID: {author_id}",
+            f"Total de publicaciones: {total_pub}  ·  Total de citaciones: {total_cit}  ·  Fuente: Scopus ID: {author_id}",
             fontsize=9, color=CHART_COLORS['muted'],
             va="bottom",
         )

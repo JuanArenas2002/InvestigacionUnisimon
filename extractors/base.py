@@ -61,6 +61,7 @@ class StandardRecord:
 
     # --- Métricas ---
     citation_count: int = 0
+    citations_by_year: Dict[int, int] = field(default_factory=dict)  # {año: cantidad}
 
     # --- URLs ---
     url: Optional[str] = None
