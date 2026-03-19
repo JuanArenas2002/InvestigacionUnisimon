@@ -2,8 +2,9 @@
 Schemas Pydantic para generación de gráficos de investigadores y exportación de datos.
 """
 
-from typing import Optional, List
+from typing import Optional, List, Dict
 from pydantic import BaseModel, Field
+from api.services.analysis import CampoDisciplinar
 
 
 class InvestigatorChartRequest(BaseModel):
@@ -33,6 +34,11 @@ class InvestigatorChartRequest(BaseModel):
         le=2100,
         example=2025
     )
+    campo: CampoDisciplinar = Field(
+        CampoDisciplinar.CIENCIAS_SALUD,
+        description="Campo disciplinar para aplicar umbrales de evaluación específicos",
+        example="CIENCIAS_SALUD"
+    )
 
     class Config:
         json_schema_extra = {
@@ -40,7 +46,8 @@ class InvestigatorChartRequest(BaseModel):
                 "author_id": "57193767797",
                 "affiliation_ids": ["60106970", "60112687"],
                 "year_from": 2015,
-                "year_to": 2025
+                "year_to": 2025,
+                "campo": "CIENCIAS_SALUD"
             }
         }
 
@@ -72,7 +79,8 @@ class InvestigatorChartResponse(BaseModel):
     investigator_name: str
     institution_name: str
     filename: str = Field(description="Nombre del archivo PNG generado")
-    file_path: str = Field(description="Ruta relativa del archivo")
+    file_path: str = Field(description="Ruta relativa del archivo PNG")
+    pdf_path: Optional[str] = Field(None, description="Ruta del archivo PDF generado (solo si se requirió)")
     statistics: ChartStatistics
     query_used: str = Field(description="Query de Scopus utilizada")
     generated_at: str = Field(description="Timestamp de generación (ISO 8601)")
@@ -125,6 +133,8 @@ class ChartGenerationError(BaseModel):
 # SCHEMAS PARA EXPORTACIÓN A EXCEL
 # ════════════════════════════════════════════════════════════════════════════════
 
+
+
 class PublicationsExportRequest(BaseModel):
     """Solicitud para exportar publicaciones a Excel"""
     
@@ -171,6 +181,247 @@ class PublicationsExportResponse(BaseModel):
                 "file_path": "reports/exports/produccion_aroca_martinez_g_20260317_093800.xlsx",
                 "total_publications": 105,
                 "size_mb": 2.35
+            }
+        }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SCHEMAS PROFESIONALES — ENDPOINT MULTI-FUENTE CON BD
+# ════════════════════════════════════════════════════════════════════════════════
+
+class AuthorDataRequest(BaseModel):
+    """
+    Solicitud de datos bibliométricos de un autor desde BD.
+    
+    Agnóstica de fuente: obtiene datos unificados de la BD canónica.
+    """
+    
+    author_id: int = Field(
+        ...,
+        description="ID del autor en tabla 'authors' (BD local)",
+        example=1
+    )
+    year_from: Optional[int] = Field(
+        None,
+        description="Año inicial para filtrar publicaciones",
+        ge=1900,
+        le=2100,
+        example=2015
+    )
+    year_to: Optional[int] = Field(
+        None,
+        description="Año final para filtrar publicaciones",
+        ge=1900,
+        le=2100,
+        example=2025
+    )
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "author_id": 1,
+                "year_from": 2015,
+                "year_to": 2025
+            }
+        }
+
+
+class SourceIdentifiers(BaseModel):
+    """Identificadores del autor en diferentes bases de datos"""
+    scopus: Optional[str] = Field(None, description="Scopus Author ID (AU-ID)")
+    openalex: Optional[str] = Field(None, description="OpenAlex Author ID")
+    wos: Optional[str] = Field(None, description="Web of Science ResearcherID")
+    cvlac: Optional[str] = Field(None, description="CvLAC ID (Colombia)")
+
+
+class BibliometricMetrics(BaseModel):
+    """Indicadores bibliométricos calculados"""
+    
+    total_publications: int = Field(description="Total de artículos publicados")
+    total_citations: int = Field(description="Total de citas recibidas")
+    h_index: int = Field(description="Índice h (h papers con h+ citas)")
+    cpp: float = Field(description="Citas por publicación (promedio)")
+    median_citations: float = Field(description="Mediana de citas por artículo")
+    percent_cited: float = Field(description="Porcentaje de artículos citados (%)")
+
+
+class YearlyMetrics(BaseModel):
+    """Datos agregados por año"""
+    year: int
+    publications: int
+    citations: int
+    cpp: float = Field(description="Citas por publicación ese año")
+
+
+class AuthorDataResponse(BaseModel):
+    """
+    Respuesta profesional: datos bibliométricos completos de un autor.
+    
+    Incluye información de autor, métricas, series temporales y detalles.
+    """
+    
+    success: bool = True
+    author_id: int
+    author_name: str
+    source_ids: SourceIdentifiers
+    year_range: str = Field(description="Rango de años (ej: '2015 - 2025')")
+    extraction_date: str = Field(description="Fecha de extracción (ISO 8601)")
+    
+    metrics: BibliometricMetrics
+    yearly_data: List[YearlyMetrics] = Field(description="Serie temporal de publicaciones y citas")
+    
+    source_distribution: Dict[str, int] = Field(
+        description="Distribución de registros por fuente (ej: {scopus: 50, openalex: 45})"
+    )
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "author_id": 1,
+                "author_name": "Juan Arenas",
+                "source_ids": {
+                    "scopus": "57193767797",
+                    "openalex": "A1234567890",
+                    "wos": "AAH-1234-2022",
+                    "cvlac": "00123456789"
+                },
+                "year_range": "2015 - 2025",
+                "extraction_date": "2026-03-17T12:34:56.789Z",
+                "metrics": {
+                    "total_publications": 62,
+                    "total_citations": 850,
+                    "h_index": 15,
+                    "cpp": 13.7,
+                    "median_citations": 8.5,
+                    "percent_cited": 85.5
+                },
+                "yearly_data": [
+                    {"year": 2015, "publications": 5, "citations": 120, "cpp": 24.0},
+                    {"year": 2016, "publications": 6, "citations": 95, "cpp": 15.8}
+                ],
+                "source_distribution": {
+                    "scopus": 62,
+                    "openalex": 58,
+                    "wos": 45
+                }
+            }
+        }
+
+
+class AuthorDataErrorResponse(BaseModel):
+    """Error en consulta de datos de autor"""
+    
+    success: bool = False
+    error: str = Field(description="Mensaje de error")
+    details: Optional[str] = Field(None, description="Detalles adicionales")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": False,
+                "error": "Autor no encontrado",
+                "details": "El ID 999 no existe en la tabla 'authors'"
+            }
+        }
+
+
+class GenerateChartRequest(BaseModel):
+    """
+    Solicitud para generar gráfico PNG desde BD (v2).
+    
+    Agnóstica de fuente: obtiene datos unificados y genera PNG.
+    """
+    
+    author_id: int = Field(
+        ...,
+        description="ID del autor en tabla 'authors' (BD local)",
+        example=1
+    )
+    year_from: Optional[int] = Field(
+        None,
+        description="Año inicial para filtrar publicaciones",
+        ge=1900,
+        le=2100,
+        example=2015
+    )
+    year_to: Optional[int] = Field(
+        None,
+        description="Año final para filtrar publicaciones",
+        ge=1900,
+        le=2100,
+        example=2025
+    )
+    institution_name: str = Field(
+        "Universidad Simón Bolívar",
+        description="Nombre de institución para pie gráfico",
+        example="Universidad Simón Bolívar"
+    )
+    campo: str = Field(
+        "CIENCIAS_SALUD",
+        description="Campo disciplinar (CIENCIAS_SALUD, CIENCIAS_BASICAS, INGENIERIA, etc.)",
+        example="CIENCIAS_SALUD"
+    )
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "author_id": 1,
+                "year_from": 2015,
+                "year_to": 2025,
+                "institution_name": "Universidad Simón Bolívar",
+                "campo": "CIENCIAS_SALUD"
+            }
+        }
+
+
+class GenerateChartResponse(BaseModel):
+    """
+    Respuesta: gráfico PNG generado desde datos de BD.
+    """
+    
+    success: bool = True
+    investigator_name: str
+    filename: str = Field(description="Nombre del archivo PNG")
+    file_path: str = Field(description="Ruta relativa del archivo")
+    file_size_mb: float = Field(description="Tamaño en MB")
+    metrics: BibliometricMetrics = Field(description="Métricas incluidas en el gráfico")
+    year_range: str = Field(description="Rango de años mostrado")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": True,
+                "investigator_name": "Juan Arenas",
+                "filename": "grafico_juan_arenas_20260318_141530.png",
+                "file_path": "reports/charts/grafico_juan_arenas_20260318_141530.png",
+                "file_size_mb": 2.15,
+                "metrics": {
+                    "total_publications": 62,
+                    "total_citations": 850,
+                    "h_index": 15,
+                    "cpp": 13.7,
+                    "median_citations": 8.5,
+                    "percent_cited": 85.5
+                },
+                "year_range": "2015 - 2025"
+            }
+        }
+
+
+class GenerateChartErrorResponse(BaseModel):
+    """Error en generación de gráfico"""
+    
+    success: bool = False
+    error: str = Field(description="Mensaje de error")
+    details: Optional[str] = Field(None, description="Detalles adicionales")
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "success": False,
+                "error": "Autor no encontrado",
+                "details": "El ID 1 no existe en la tabla 'authors'"
             }
         }
 

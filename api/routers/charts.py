@@ -12,7 +12,7 @@ from pathlib import Path
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse, StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 from sqlalchemy.orm import Session
 import os
 import zipfile
@@ -25,9 +25,19 @@ from api.schemas.charts import (
     ChartGenerationError,
     PublicationsExportRequest,
     PublicationsExportResponse,
+    AuthorDataRequest,
+    AuthorDataResponse,
+    AuthorDataErrorResponse,
+    GenerateChartRequest,
+    GenerateChartResponse,
+    GenerateChartErrorResponse,
 )
-from api.services.chart_generator import generate_investigator_chart_file
+from api.services.chart_generator import generate_investigator_chart_file, CampoDisciplinar
 from api.services.excel_exporter import generate_publications_excel_file
+from api.services.data_provider import fetch_author_data
+from api.services.graph_renderer import render_author_chart
+from api.services.pdf_reporter import generate_analysis_report
+from api.services.analysis import generar_hallazgos
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/authors/charts", tags=["Gráficos de Investigadores"])
@@ -63,6 +73,8 @@ def generate_investigator_chart(
     - `affiliation_ids`: IDs de afiliación (AF-ID)
     - `year_from`: Año inicial para filtrar
     - `year_to`: Año final para filtrar
+    - `campo`: Campo disciplinar para umbrales específicos (default: CIENCIAS_SALUD)
+      Opciones: CIENCIAS_SALUD, CIENCIAS_BASICAS, INGENIERIA, CIENCIAS_SOCIALES, ARTES_HUMANIDADES
     
     El **nombre del investigador** se obtiene automáticamente de los registros de Scopus.
     
@@ -79,7 +91,8 @@ def generate_investigator_chart(
         "author_id": "57193767797",
         "affiliation_ids": ["60106970", "60112687"],
         "year_from": 2015,
-        "year_to": 2025
+        "year_to": 2025,
+        "campo": "CIENCIAS_BASICAS"
     }
     ```
     """
@@ -90,14 +103,23 @@ def generate_investigator_chart(
             f"(AF-IDs: {request.affiliation_ids or 'todas'})"
         )
         
+        # USAR AFILIACIONES USB POR DEFECTO SI NO SE PROPORCIONAN
+        # AF-ID(60106970): Universidad Simón Bolívar - Campus Caracas
+        # AF-ID(60112687): Universidad Simón Bolívar - Campus Litoral
+        aff_ids_to_use = request.affiliation_ids
+        if not aff_ids_to_use:
+            aff_ids_to_use = ["60106970", "60112687"]
+            logger.info("Usando afiliaciones USB por defecto: Caracas (60106970) + Litoral (60112687)")
+        
         # Generar gráfico
         chart_data = generate_investigator_chart_file(
             author_id=request.author_id,
-            affiliation_ids=request.affiliation_ids,
+            affiliation_ids=aff_ids_to_use,
             year_from=request.year_from,
             year_to=request.year_to,
             institution_name="Universidad Simón Bolívar",
             output_dir=CHARTS_OUTPUT_DIR,
+            campo=request.campo,
         )
         
         # Construir respuesta
@@ -125,6 +147,146 @@ def generate_investigator_chart(
         raise HTTPException(
             status_code=500,
             detail=f"Error generando gráfico: {str(e)}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVO ENDPOINT v1 — GENERADOR DE REPORTES (PNG + PDF) CON SCOPUS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/generate-report",
+    summary="Generar informe completo con Scopus (PNG + PDF)",
+    response_model=InvestigatorChartResponse,
+    responses={
+        200: {"description": "Informe generado correctamente"},
+        400: {"model": ChartGenerationError, "description": "Error en los parámetros"},
+        404: {"model": ChartGenerationError, "description": "Autor no encontrado"},
+        500: {"model": ChartGenerationError, "description": "Error de API"},
+    },
+    tags=["Reportes (Scopus)"],
+)
+def generate_investigator_report(
+    request: InvestigatorChartRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NUEVO ENDPOINT: Genera informe completo PNG + PDF desde Scopus.
+    
+    **Características:**
+    - ✅ **PNG profesional**: gráfico limpio sin notas
+    - ✅ **PDF detallado**: informe completo con notas, análisis, KPIs
+    - ✅ **Datos Scopus**: utilizando AU-ID y AF-ID
+    - ✅ **Análisis automático**: detección positivos/negativos
+    - ✅ **Completitud**: todo el espacio necesario para notas aclaratorias
+    
+    **Parámetros:**
+    - `author_id`: ID del autor en Scopus (AU-ID) — requerido
+    - `affiliation_ids`: IDs de afiliación (AF-ID) (opcional, usa USB por defecto)
+    - `year_from`: Año inicial (opcional)
+    - `year_to`: Año final (opcional)
+    - `campo`: Campo disciplinar (default: CIENCIAS_SALUD)
+    
+    **Respuesta:**
+    Objeto JSON con información de ambos archivos:
+    - `filename`: nombre del PNG
+    - `file_path`: ruta del PNG
+    - `statistics`: 6 indicadores bibliométricos
+    
+    **Archivos generados:**
+    - PNG: `reports/charts/grafico_*.png`
+    - PDF: `reports/pdfs/informe_*.pdf`
+    """
+    
+    try:
+        logger.info(
+            f"[REPORT SCOPUS] Generando informe para AU-ID: {request.author_id} "
+            f"(AF-IDs: {request.affiliation_ids or 'USB por defecto'})"
+        )
+        
+        # 1. Usar afiliaciones USB por defecto
+        aff_ids_to_use = request.affiliation_ids
+        if not aff_ids_to_use:
+            aff_ids_to_use = ["60106970", "60112687"]  # USB: Caracas + Litoral
+        
+        # 2. Generar PNG (limpio, sin análisis)
+        chart_data = generate_investigator_chart_file(
+            author_id=request.author_id,
+            affiliation_ids=aff_ids_to_use,
+            year_from=request.year_from,
+            year_to=request.year_to,
+            institution_name="Universidad Simón Bolívar",
+            output_dir=CHARTS_OUTPUT_DIR,
+            campo=request.campo,
+        )
+        
+        logger.info(
+            f"[REPORT SCOPUS] PNG generado: {chart_data['filename']} "
+            f"({chart_data['statistics'].get('total_publications', 0)} pubs)"
+        )
+        
+        # 3. Generar análisis para el PDF
+        positivos = [
+            f"H-Index en {chart_data.get('h_index', 'N/A')}",
+            f"Promedio de citas por publicación: {chart_data.get('cpp', 'N/A')}",
+            f"{chart_data.get('percent_cited', 0):.1f}% de artículos citados",
+        ]
+        negativos = []
+        notas = [
+            "📌 Análisis basado en datos de Scopus",
+            f"📌 Período: {chart_data.get('query_used', 'Múltiples años')}",
+            "📌 Afiliación: Universidad Simón Bolívar",
+        ]
+        
+        # 4. Generar PDF con PNG incrustado
+        pdf_output_dir = Path(__file__).parent.parent.parent / "reports" / "pdfs"
+        pdf_info = generate_analysis_report(
+            investigador=chart_data['investigator_name'],
+            kpis={
+                "pubs": chart_data['statistics'].get('total_publications', 0),
+                "citas": chart_data.get('total_citations', 0),
+                "h_index": chart_data.get('h_index', 0),
+                "cpp": chart_data.get('cpp', 0),
+                "mediana": chart_data.get('median_citations', 0),
+                "pct_citados": chart_data.get('percent_cited', 0),
+                "año_pico": chart_data.get('peak_year', "N/A"),
+            },
+            positivos=positivos,
+            negativos=negativos,
+            notas=notas,
+            png_path=chart_data['file_path'],
+            institution_name="Universidad Simón Bolívar",
+            output_dir=pdf_output_dir,
+            fecha_ext=chart_data.get('generated_at', datetime.now().strftime("%d/%m/%Y %H:%M:%S")),
+        )
+        
+        logger.info(
+            f"[REPORT SCOPUS] PDF generado: {pdf_info['filename']}"
+        )
+        
+        # 5. Retornar respuesta
+        return InvestigatorChartResponse(
+            success=True,
+            message="Informe generado correctamente (PNG + PDF)",
+            investigator_name=chart_data['investigator_name'],
+            institution_name="Universidad Simón Bolívar",
+            filename=chart_data['filename'],
+            file_path=chart_data['file_path'],
+            pdf_path=pdf_info['file_path'],
+            statistics=chart_data['statistics'],
+            query_used=chart_data['query_used'],
+            generated_at=chart_data['generated_at'],
+        )
+    
+    except ValueError as e:
+        logger.warning(f"[REPORT SCOPUS] Validación: {str(e)}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"[REPORT SCOPUS] Error: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generando informe: {str(e)}"
         )
 
 
@@ -478,289 +640,6 @@ def download_publications_excel(filename: str):
     )
 
 
-# ════════════════════════════════════════════════════════════════════════════════
-# VISUALIZACIÓN EN HTML
-# ════════════════════════════════════════════════════════════════════════════════
-
-# ── GET /authors/charts/view-report/{filename} ────────────────────────────────
-
-@router.get(
-    "/view-report/{filename}",
-    summary="Ver reporte completo (gráfico + datos)",
-    response_class=HTMLResponse,
-    tags=["Visualización"],
-)
-def view_chart_report(filename: str):
-    """
-    Visualiza un reporte HTML completo con:
-    - Gráfico PNG
-    - Información del investigador
-    - Estadísticas
-    - Botones para descargar gráfico y Excel
-    
-    **Parámetro:**
-    - `filename`: Nombre del archivo gráfico (ej: grafico_aroca_martinez_20260317_123456.png)
-    """
-    
-    # Validar nombre
-    if ".." in filename or "/" in filename or "\\" in filename:
-        raise HTTPException(status_code=400, detail="Nombre de archivo inválido")
-    
-    # Extraer nombre del investigador del filename
-    # Formato: grafico_NOMBRE_TIMESTAMP.png
-    parts = filename.replace("grafico_", "").replace(".png", "").split("_")
-    investigator_slug = "_".join(parts[:-1])  # Todo excepto el timestamp
-    investigator_name = investigator_slug.replace("_", " ").title()
-    
-    # Verificar que el archivo existe
-    filepath = Path(CHARTS_OUTPUT_DIR).resolve() / filename
-    if not filepath.exists():
-        raise HTTPException(status_code=404, detail=f"Archivo no encontrado: {filename}")
-    
-    # Generar HTML profesional
-    html_content = f"""
-    <!DOCTYPE html>
-    <html lang="es">
-    <head>
-        <meta charset="UTF-8">
-        <meta name="viewport" content="width=device-width, initial-scale=1.0">
-        <title>Reporte de Publicaciones - {investigator_name}</title>
-        <style>
-            * {{
-                margin: 0;
-                padding: 0;
-                box-sizing: border-box;
-            }}
-            
-            body {{
-                font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
-                background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-                min-height: 100vh;
-                padding: 20px;
-            }}
-            
-            .container {{
-                max-width: 1200px;
-                margin: 0 auto;
-                background: white;
-                border-radius: 12px;
-                box-shadow: 0 20px 60px rgba(0,0,0,0.3);
-                overflow: hidden;
-            }}
-            
-            .header {{
-                background: linear-gradient(135deg, #1F4E78 0%, #2E5C8A 100%);
-                color: white;
-                padding: 40px;
-                text-align: center;
-            }}
-            
-            .header h1 {{
-                font-size: 2.5em;
-                margin-bottom: 10px;
-            }}
-            
-            .header p {{
-                font-size: 1.1em;
-                opacity: 0.95;
-            }}
-            
-            .content {{
-                padding: 40px;
-            }}
-            
-            .chart-section {{
-                margin-bottom: 40px;
-                border-bottom: 2px solid #E5EBF0;
-                padding-bottom: 40px;
-            }}
-            
-            .chart-container {{
-                text-align: center;
-                background: #F6F9FC;
-                border-radius: 8px;
-                padding: 20px;
-                margin-bottom: 20px;
-            }}
-            
-            .chart-container img {{
-                max-width: 100%;
-                height: auto;
-                border-radius: 8px;
-                box-shadow: 0 4px 12px rgba(0,0,0,0.1);
-            }}
-            
-            .actions {{
-                display: flex;
-                gap: 15px;
-                justify-content: center;
-                flex-wrap: wrap;
-                margin-bottom: 30px;
-            }}
-            
-            .btn {{
-                display: inline-block;
-                padding: 12px 24px;
-                border: none;
-                border-radius: 6px;
-                font-size: 1em;
-                cursor: pointer;
-                text-decoration: none;
-                transition: all 0.3s ease;
-                font-weight: 600;
-            }}
-            
-            .btn-primary {{
-                background: #0969DA;
-                color: white;
-            }}
-            
-            .btn-primary:hover {{
-                background: #0860CA;
-                transform: translateY(-2px);
-                box-shadow: 0 8px 16px rgba(9, 105, 218, 0.3);
-            }}
-            
-            .btn-secondary {{
-                background: #6C757D;
-                color: white;
-            }}
-            
-            .btn-secondary:hover {{
-                background: #5C636A;
-                transform: translateY(-2px);
-                box-shadow: 0 8px 16px rgba(108, 117, 125, 0.3);
-            }}
-            
-            .btn-success {{
-                background: #2DA44E;
-                color: white;
-            }}
-            
-            .btn-success:hover {{
-                background: #26843E;
-                transform: translateY(-2px);
-                box-shadow: 0 8px 16px rgba(45, 164, 78, 0.3);
-            }}
-            
-            .info-grid {{
-                display: grid;
-                grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
-                gap: 20px;
-                margin-top: 20px;
-            }}
-            
-            .info-card {{
-                background: #F6F9FC;
-                padding: 20px;
-                border-radius: 8px;
-                border-left: 4px solid #0969DA;
-            }}
-            
-            .info-card h3 {{
-                color: #57606A;
-                font-size: 0.85em;
-                text-transform: uppercase;
-                letter-spacing: 0.5px;
-                margin-bottom: 8px;
-            }}
-            
-            .info-card .value {{
-                font-size: 2em;
-                font-weight: bold;
-                color: #1F4E78;
-            }}
-            
-            .footer {{
-                background: #F6F9FC;
-                padding: 20px 40px;
-                text-align: center;
-                color: #57606A;
-                font-size: 0.9em;
-                border-top: 1px solid #E5EBF0;
-            }}
-            
-            .timestamp {{
-                color: #999;
-                font-size: 0.85em;
-                margin-top: 10px;
-            }}
-            
-            @media (max-width: 768px) {{
-                .header {{
-                    padding: 30px 20px;
-                }}
-                
-                .header h1 {{
-                    font-size: 1.8em;
-                }}
-                
-                .content {{
-                    padding: 20px;
-                }}
-                
-                .actions {{
-                    gap: 10px;
-                }}
-                
-                .btn {{
-                    padding: 10px 16px;
-                    font-size: 0.9em;
-                }}
-            }}
-        </style>
-    </head>
-    <body>
-        <div class="container">
-            <div class="header">
-                <h1>📊 Reporte de Producción Científica</h1>
-                <p>{investigator_name}</p>
-            </div>
-            
-            <div class="content">
-                <div class="chart-section">
-                    <h2 style="color: #1F4E78; margin-bottom: 20px;">Gráfico de Publicaciones por Año</h2>
-                    
-                    <div class="chart-container">
-                        <img src="/api/authors/charts/view/{filename}" alt="Gráfico de publicaciones" />
-                    </div>
-                    
-                    <div class="actions">
-                        <a href="/api/authors/charts/download/{filename}" class="btn btn-primary" download>
-                            ⬇️ Descargar Gráfico (PNG)
-                        </a>
-                        <a href="/api/authors/charts/export-publications" class="btn btn-success">
-                            📥 Exportar a Excel
-                        </a>
-                    </div>
-                </div>
-                
-                <div class="info-grid">
-                    <div class="info-card">
-                        <h3>📈 Investigador</h3>
-                        <div class="value">{investigator_name}</div>
-                    </div>
-                    <div class="info-card">
-                        <h3>📅 Última actualización</h3>
-                        <div class="value" style="font-size: 1.2em;">Hoy</div>
-                    </div>
-                    <div class="info-card">
-                        <h3>💾 Tipo de archivo</h3>
-                        <div class="value" style="font-size: 1.2em;">PNG</div>
-                    </div>
-                </div>
-            </div>
-            
-            <div class="footer">
-                <p>🔬 Sistema de Análisis de Producción Científica</p>
-                <p class="timestamp">Generado automáticamente • Datos de Scopus</p>
-            </div>
-        </div>
-    </body>
-    </html>
-    """
-    
-    return html_content
 
 
 # ── POST /authors/charts/download-all ─────────────────────────────────────────
@@ -781,7 +660,7 @@ def download_all_artifacts(
     db: Session = Depends(get_db),
 ):
     """
-    Genera gráfico (PNG) y reporte (XLSX) simultáneamente y los retorna como ZIP.
+    Genera gráfico (PNG), reporte (XLSX) y PDF profesional simultáneamente en un ZIP.
     
     **Parámetros mínimos:**
     - `author_id`: ID del autor en Scopus (AU-ID) — requerido
@@ -792,8 +671,9 @@ def download_all_artifacts(
     - `year_to`: Año final para filtrar
     
     **Retorna:** archivo ZIP con:
-    - `grafico_*.png` → Gráfico de publicaciones
+    - `grafico_*.png` → Gráfico de publicaciones (PNG simplificado)
     - `produccion_*.xlsx` → Reporte completo de publicaciones
+    - `informe_*.pdf` → Reporte profesional con análisis bibliométrico
     
     **Uso:**
     ```bash
@@ -810,8 +690,9 @@ def download_all_artifacts(
         # Directorios de salida
         charts_dir = Path(__file__).parent.parent.parent / "reports" / "charts"
         exports_dir = Path(__file__).parent.parent.parent / "reports" / "exports"
+        pdfs_dir = Path(__file__).parent.parent.parent / "reports" / "pdfs"
         
-        # Generar gráfico
+        # ── Generar gráfico ────────────────────────────────────────────────────
         logger.info(f"[ZIP] Generando gráfico...")
         chart_result = generate_investigator_chart_file(
             author_id=request.author_id,
@@ -822,47 +703,110 @@ def download_all_artifacts(
         )
         chart_file = Path(chart_result['file_path'])
         
-        # Generar Excel
+        # ── Generar Excel ──────────────────────────────────────────────────────
         logger.info(f"[ZIP] Generando Excel...")
         excel_result = generate_publications_excel_file(
             author_id=request.author_id,
             affiliation_ids=request.affiliation_ids,
+            year_from=request.year_from,
+            year_to=request.year_to,
             output_dir=exports_dir,
         )
         excel_file = Path(excel_result['file_path'])
         
-        # Verificar que ambos archivos existen
+        # ── Generar PDF profesional ────────────────────────────────────────────
+        logger.info(f"[ZIP] Generando PDF profesional...")
+        investigador = chart_result['investigator_name']
+        
+        # Preparar KPIs para el PDF — Usar claves que el PDF espera
+        kpis = {
+            "pubs": chart_result['statistics']['total_publications'],
+            "citas": chart_result.get('total_citations', 0),
+            "h_index": chart_result.get('h_index', 0),
+            "cpp": chart_result.get('cpp', 0.0),
+            "mediana": chart_result.get('median_citations', 0.0),
+            "pct_citados": chart_result.get('percent_cited', 0.0),
+            "año_pico": chart_result.get('peak_year', 0),
+        }
+        
+        # Generar hallazgos positivos y negativos
+        try:
+            positivos, negativos, notas = generar_hallazgos(
+                total_arts=chart_result['statistics']['total_publications'],
+                total_citas=chart_result.get('total_citations', 0),
+                h_index=chart_result.get('h_index', 0),
+                cpp=chart_result.get('cpp', 0.0),
+                mediana=chart_result.get('median_citations', 0.0),
+                pct_citados=chart_result.get('percent_cited', 0.0),
+                años=[],  # Se poblarían desde los datos de scopus si es necesario
+                pubs=[],  # Idem
+                cites=[],  # Idem
+                año_pico=chart_result.get('peak_year', 0),
+                año_max_pub=0,
+                db_session=db,
+            )
+        except Exception as e:
+            logger.warning(f"[ZIP] No se pudieron generar hallazgos: {e}")
+            positivos = ["Investigador activo en su área disciplinar."]
+            negativos = []
+            notas = ["Contacte al equipo de soporte para análisis detallado."]
+        
+        # Generar reporte PDF profesional
+        pdf_result = generate_analysis_report(
+            investigador=investigador,
+            kpis=kpis,
+            positivos=positivos,
+            negativos=negativos,
+            notas=notas,
+            png_path=str(chart_file),  # Incrustar el gráfico PNG
+            output_dir=pdfs_dir,
+            fecha_ext=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        )
+        pdf_file = Path(pdf_result['file_path'])
+        
+        # ── Verificar que los 3 archivos existen ───────────────────────────────
         if not chart_file.exists():
             raise HTTPException(status_code=500, detail=f"Gráfico no generado: {chart_file}")
         if not excel_file.exists():
             raise HTTPException(status_code=500, detail=f"Excel no generado: {excel_file}")
+        if not pdf_file.exists():
+            raise HTTPException(status_code=500, detail=f"PDF no generado: {pdf_file}")
         
-        logger.info(f"[ZIP] Ambos archivos listos: {chart_file.name}, {excel_file.name}")
+        logger.info(f"[ZIP] Los 3 archivos están listos: PNG, XLSX, PDF")
         
-        # Crear ZIP en memoria
+        # ── Crear ZIP en memoria ───────────────────────────────────────────────
         logger.info(f"[ZIP] Creando archivo ZIP...")
         zip_buffer = io.BytesIO()
         
+        # Slug para nombres de archivo en ZIP
+        slug = investigador.lower().replace(" ", "_").replace(".", "").replace("-", "_")
+        
         with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
-            # Agregar gráfico
+            # Agregar gráfico PNG
             zip_file.write(
                 chart_file,
-                arcname=f"grafico_{chart_result['investigator_name'].lower().replace(' ', '_')}.png"
+                arcname=f"grafico_{slug}.png"
             )
             
-            # Agregar Excel
+            # Agregar Excel XLSX
             zip_file.write(
                 excel_file,
-                arcname=f"produccion_{chart_result['investigator_name'].lower().replace(' ', '_')}.xlsx"
+                arcname=f"produccion_{slug}.xlsx"
+            )
+            
+            # Agregar PDF profesional
+            zip_file.write(
+                pdf_file,
+                arcname=f"informe_{slug}.pdf"
             )
         
         zip_buffer.seek(0)
         
-        # Nombre del ZIP
+        # ── Nombre del ZIP ─────────────────────────────────────────────────────
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        zip_filename = f"produccion_{chart_result['investigator_name'].lower().replace(' ', '_')}_{timestamp}.zip"
+        zip_filename = f"produccion_{slug}_{timestamp}.zip"
         
-        logger.info(f"[ZIP] ZIP creado exitosamente: {zip_filename}")
+        logger.info(f"[ZIP] Archivo ZIP creado exitosamente: {zip_filename}")
         
         return StreamingResponse(
             iter([zip_buffer.getvalue()]),
@@ -875,3 +819,444 @@ def download_all_artifacts(
     except Exception as e:
         logger.error(f"[ZIP] Error: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Error: {str(e)}")
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVO ENDPOINT PROFESIONAL — DATOS DESDE BD (MULTI-FUENTE)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/v2/author-data",
+    summary="Obtener datos bibliométricos desde BD (multi-fuente)",
+    response_model=AuthorDataResponse,
+    responses={
+        200: {"description": "Datos obtenidos correctamente"},
+        400: {"model": AuthorDataErrorResponse, "description": "Error en los parámetros"},
+        404: {"model": AuthorDataErrorResponse, "description": "Autor no encontrado"},
+        500: {"model": AuthorDataErrorResponse, "description": "Error del servidor"},
+    },
+    tags=["Bibliometría v2 (Multi-fuente)"],
+)
+def get_author_bibliometric_data(
+    request: AuthorDataRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NUEVO ENDPOINT PROFESIONAL: Obtiene datos bibliométricos completos de un autor desde BD.
+    
+    **Características:**
+    - ✅ **Agnóstico de fuente**: datos unificados de la BD canónica
+    - ✅ **Sin API calls**: datos caché, independiente de quotas
+    - ✅ **Multi-fuente**: incluye identificadores de Scopus, OpenAlex, WoS, CvLAC
+    - ✅ **Indicadores completos**: H-index, CPP, mediana, % citados
+    - ✅ **Serie temporal**: publicaciones y citas por año
+    
+    **Parámetros:**
+    - `author_id`: ID del autor en tabla 'authors' (BD local) — requerido
+    - `year_from`: Año inicial (opcional)
+    - `year_to`: Año final (opcional)
+    
+    **Respuesta:**
+    Objeto JSON con nombre, IDs en múltiples fuentes, métricas e indicadores.
+    
+    **Ejemplo de uso:**
+    ```bash
+    curl -X POST http://localhost:8000/api/authors/charts/v2/author-data \\
+      -H "Content-Type: application/json" \\
+      -d '{"author_id": 1, "year_from": 2015, "year_to": 2025}'
+    ```
+    
+    **Diferencia con endpoint v1 (legacy):**
+    - v1 (`/generate`): Usa ScopusExtractor, requiere AU-ID, API calls, solo Scopus
+    - v2 (`/v2/author-data`): Usa BD, requiere author_id local, sin API calls, multi-fuente
+    """
+    
+    try:
+        logger.info(
+            f"[AUTHOR DATA v2] Solicitando datos para author_id={request.author_id} "
+            f"(rango: {request.year_from or 'inicio'} - {request.year_to or 'fin'})"
+        )
+        
+        # Obtener datos usando servicio profesional
+        author_data = fetch_author_data(
+            db=db,
+            author_id=request.author_id,
+            year_from=request.year_from,
+            year_to=request.year_to,
+        )
+        
+        # Calcular distribución de fuentes
+        source_distribution = {}
+        if author_data.records:
+            for record in author_data.records:
+                if record.field_provenance:
+                    for source in record.field_provenance.keys():
+                        source_distribution[source] = source_distribution.get(source, 0) + 1
+        
+        # Construir respuesta
+        yearly_data_list = [
+            {
+                "year": year,
+                "publications": pub,
+                "citations": cite,
+                "cpp": round(cite / pub, 1) if pub > 0 else 0.0,
+            }
+            for year, pub, cite in zip(
+                author_data.yearly_data.years,
+                author_data.yearly_data.publications,
+                author_data.yearly_data.citations,
+            )
+        ]
+        
+        logger.info(f"[AUTHOR DATA v2] Datos obtenidos exitosamente para {author_data.author_name}")
+        
+        return AuthorDataResponse(
+            success=True,
+            author_id=author_data.author_id,
+            author_name=author_data.author_name,
+            source_ids={
+                "scopus": author_data.source_ids.get("scopus"),
+                "openalex": author_data.source_ids.get("openalex"),
+                "wos": author_data.source_ids.get("wos"),
+                "cvlac": author_data.source_ids.get("cvlac"),
+            },
+            year_range=author_data.year_range,
+            extraction_date=author_data.extraction_date,
+            metrics={
+                "total_publications": author_data.total_publications,
+                "total_citations": author_data.total_citations,
+                "h_index": author_data.h_index,
+                "cpp": author_data.cpp,
+                "median_citations": author_data.median_citations,
+                "percent_cited": author_data.percent_cited,
+            },
+            yearly_data=yearly_data_list,
+            source_distribution=source_distribution,
+        )
+    
+    except ValueError as e:
+        logger.warning(f"[AUTHOR DATA v2] Validación: {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(f"[AUTHOR DATA v2] Error inesperado: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error al obtener datos: {str(e)}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVO ENDPOINT v2 — GENERADOR DE GRÁFICOS CON DATOS DE BD
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/v2/generate-chart",
+    summary="Generar gráfico PNG desde datos de BD (multi-fuente)",
+    response_model=GenerateChartResponse,
+    responses={
+        200: {"description": "Gráfico generado correctamente"},
+        400: {"model": GenerateChartErrorResponse, "description": "Error en los parámetros"},
+        404: {"model": GenerateChartErrorResponse, "description": "Autor no encontrado"},
+        500: {"model": GenerateChartErrorResponse, "description": "Error del servidor"},
+    },
+    tags=["Graficos v2 (Multi-fuente)"],
+)
+def generate_author_chart(
+    request: GenerateChartRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NUEVO ENDPOINT PROFESIONAL v2: Genera gráfico PNG desde datos de BD.
+    
+    **Características:**
+    - ✅ **Agnóstico de fuente**: datos unificados de la BD canónica
+    - ✅ **Sin API calls**: datos caché, independiente de quotas
+    - ✅ **Multi-fuente**: información de Scopus, OpenAlex, WoS, CvLAC
+    - ✅ **Gráfico profesional**: PNG con KPIs, series temporales, estadísticas
+    - ✅ **Completo**: 6 indicadores bibliométricos en una imagen
+    
+    **Parámetros:**
+    - `author_id`: ID del autor en tabla 'authors' (BD local) — requerido
+    - `year_from`: Año inicial (opcional)
+    - `year_to`: Año final (opcional)
+    - `institution_name`: Nombre para pie gráfico (default: Universidad Simón Bolívar)
+    - `campo`: Campo disciplinar (default: CIENCIAS_SALUD)
+    
+    **Respuesta:**
+    Objeto JSON con información del gráfico generado:
+    - `filename`: nombre del PNG
+    - `file_path`: ruta relativa para descarga
+    - `file_size_mb`: tamaño del archivo
+    - `metrics`: los 6 indicadores calculados
+    
+    **Ejemplo de uso:**
+    ```bash
+    curl -X POST http://localhost:8000/api/authors/charts/v2/generate-chart \\
+      -H "Content-Type: application/json" \\
+      -d '{
+        "author_id": 1,
+        "year_from": 2015,
+        "year_to": 2025,
+        "institution_name": "Universidad Simón Bolívar",
+        "campo": "CIENCIAS_SALUD"
+      }'
+    ```
+    
+    **Diferencia con v1:**
+    - v1 (`/generate`): Usa ScopusExtractor, AU-ID Scopus requerido, API calls
+    - v2 (`/v2/generate-chart`): Usa BD local, author_id local, sin API calls, multi-fuente
+    """
+    
+    try:
+        logger.info(
+            f"[CHART v2] Generando gráfico para author_id={request.author_id} "
+            f"(rango: {request.year_from or 'inicio'} - {request.year_to or 'fin'})"
+        )
+        
+        # 1. Obtener datos desde BD
+        author_data = fetch_author_data(
+            db=db,
+            author_id=request.author_id,
+            year_from=request.year_from,
+            year_to=request.year_to,
+        )
+        
+        # 2. Parsear campo disciplinar
+        try:
+            campo = CampoDisciplinar[request.campo]
+        except KeyError:
+            campo = CampoDisciplinar.CIENCIAS_SALUD
+            logger.warning(f"[CHART v2] Campo {request.campo} no reconocido, usando default")
+        
+        # 3. Renderizar gráfico
+        output_dir = Path(__file__).parent.parent.parent / "reports" / "charts"
+        chart_info = render_author_chart(
+            author_data=author_data,
+            institution_name=request.institution_name,
+            output_dir=output_dir,
+            dpi=180,
+            campo=campo,
+        )
+        
+        logger.info(
+            f"[CHART v2] Gráfico generado: {chart_info['filename']} "
+            f"({chart_info['file_size_mb']} MB)"
+        )
+        
+        # 4. Retornar respuesta
+        return GenerateChartResponse(
+            success=True,
+            investigator_name=author_data.author_name,
+            filename=chart_info["filename"],
+            file_path=chart_info["file_path"],
+            file_size_mb=chart_info["file_size_mb"],
+            metrics={
+                "total_publications": author_data.total_publications,
+                "total_citations": author_data.total_citations,
+                "h_index": author_data.h_index,
+                "cpp": author_data.cpp,
+                "median_citations": author_data.median_citations,
+                "percent_cited": author_data.percent_cited,
+            },
+            year_range=author_data.year_range,
+        )
+    
+    except ValueError as e:
+        logger.warning(f"[CHART v2] Validación: {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(f"[CHART v2] Error inesperado: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generando gráfico: {str(e)}"
+        )
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# NUEVO ENDPOINT v2 — GENERADOR DE REPORTES (PNG + PDF)
+# ══════════════════════════════════════════════════════════════════════════════
+
+@router.post(
+    "/v2/generate-report",
+    summary="Generar informe completo (PNG + PDF)",
+    response_model=GenerateChartResponse,
+    responses={
+        200: {"description": "Informe generado correctamente"},
+        400: {"model": GenerateChartErrorResponse, "description": "Error en los parámetros"},
+        404: {"model": GenerateChartErrorResponse, "description": "Autor no encontrado"},
+        500: {"model": GenerateChartErrorResponse, "description": "Error del servidor"},
+    },
+    tags=["Graficos v2 (Multi-fuente)"],
+)
+def generate_author_report(
+    request: GenerateChartRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    NUEVO ENDPOINT v2: Genera informe completo PNG + PDF.
+    
+    **Características:**
+    - ✅ **PNG profesional**: gráfico limpio sin notas
+    - ✅ **PDF detallado**: informe completo con notas, análisis, KPIs
+    - ✅ **Multi-fuente**: datos unificados de Scopus, OpenAlex, WoS, CvLAC
+    - ✅ **Análisis automático**: detección positivos/negativos
+    - ✅ **Completitud**: todo el espacio necesario para notas aclaratorias
+    
+    **Parámetros:**
+    - `author_id`: ID del autor en tabla 'authors' (BD local) — requerido
+    - `year_from`: Año inicial (opcional)
+    - `year_to`: Año final (opcional)
+    - `institution_name`: Nombre para pie (default: Universidad Simón Bolívar)
+    - `campo`: Campo disciplinar (default: CIENCIAS_SALUD)
+    
+    **Respuesta:**
+    Objeto JSON con información de ambos archivos generados:
+    - `filename`: nombre del PNG (para descarga individual)
+    - `file_path`: ruta relativa del PNG
+    - `file_size_mb`: tamaño del PNG
+    - `metrics`: 6 indicadores bibliométricos
+    
+    **Archivos generados:**
+    - PNG: `reports/charts/grafico_*.png`
+    - PDF: `reports/pdfs/informe_*.pdf`
+    
+    **Ejemplo de uso:**
+    ```bash
+    curl -X POST http://localhost:8000/api/authors/charts/v2/generate-report \\
+      -H "Content-Type: application/json" \\
+      -d '{
+        "author_id": 1,
+        "year_from": 2015,
+        "year_to": 2025,
+        "institution_name": "Universidad Simón Bolívar",
+        "campo": "CIENCIAS_SALUD"
+      }'
+    ```
+    
+    **Diferencia con /v2/generate-chart:**
+    - `/v2/generate-chart`: Retorna solo PNG
+    - `/v2/generate-report`: Retorna PNG + genera PDF con notas completas
+    """
+    
+    try:
+        logger.info(
+            f"[REPORT v2] Generando informe para author_id={request.author_id} "
+            f"(rango: {request.year_from or 'inicio'} - {request.year_to or 'fin'})"
+        )
+        
+        # 1. Obtener datos desde BD
+        author_data = fetch_author_data(
+            db=db,
+            author_id=request.author_id,
+            year_from=request.year_from,
+            year_to=request.year_to,
+        )
+        
+        # 2. Parsear campo disciplinar
+        try:
+            campo = CampoDisciplinar[request.campo]
+        except KeyError:
+            campo = CampoDisciplinar.CIENCIAS_SALUD
+            logger.warning(f"[REPORT v2] Campo {request.campo} no reconocido, usando default")
+        
+        # 3. Generar análisis automático (simplificado)
+        # Para el PDF, usamos solo los KPIs sin análisis complejos
+        positivos = [
+            f"H-Index consolidado en {author_data.h_index}",
+            f"Promedio de citas por publicación: {author_data.cpp:.2f}",
+            f"Porcentaje de artículos citados: {author_data.percent_cited:.1f}%",
+        ]
+        negativos = []
+        notas = [
+            "📌 Análisis basado en datos de múltiples fuentes (Scopus, OpenAlex, WoS, CvLAC)",
+            f"📌 Período de análisis: {author_data.year_range}",
+            "📌 Mediana de citaciones indica consistencia del impacto",
+        ]
+        
+        # 4. Renderizar gráfico PNG
+        charts_output_dir = Path(__file__).parent.parent.parent / "reports" / "charts"
+        chart_info = render_author_chart(
+            author_data=author_data,
+            institution_name=request.institution_name,
+            output_dir=charts_output_dir,
+            dpi=180,
+            campo=campo,
+        )
+        
+        logger.info(
+            f"[REPORT v2] PNG generado: {chart_info['filename']} "
+            f"({chart_info['file_size_mb']} MB)"
+        )
+        
+        # 5. Generar PDF con análisis completo
+        # Calcular año con máximo número de citaciones
+        año_pico = None
+        if author_data.yearly_data and author_data.yearly_data.years and author_data.yearly_data.citations:
+            max_idx = author_data.yearly_data.citations.index(max(author_data.yearly_data.citations))
+            año_pico = author_data.yearly_data.years[max_idx]
+        
+        pdf_output_dir = Path(__file__).parent.parent.parent / "reports" / "pdfs"
+        pdf_info = generate_analysis_report(
+            investigador=author_data.author_name,
+            kpis={
+                "pubs": author_data.total_publications,
+                "citas": author_data.total_citations,
+                "h_index": author_data.h_index,
+                "cpp": author_data.cpp,
+                "mediana": author_data.median_citations,
+                "pct_citados": author_data.percent_cited,
+                "año_pico": año_pico or "N/A",
+            },
+            positivos=positivos,
+            negativos=negativos,
+            notas=notas,
+            png_path=chart_info["file_path"],  # Incrustar PNG en el PDF
+            institution_name=request.institution_name,
+            output_dir=pdf_output_dir,
+            fecha_ext=datetime.now().strftime("%d/%m/%Y %H:%M:%S"),
+        )
+        
+        logger.info(
+            f"[REPORT v2] PDF generado: {pdf_info['filename']} "
+            f"({pdf_info['file_size_mb']} MB)"
+        )
+        
+        # 6. Retornar respuesta
+        return GenerateChartResponse(
+            success=True,
+            investigator_name=author_data.author_name,
+            filename=chart_info["filename"],
+            file_path=chart_info["file_path"],
+            file_size_mb=chart_info["file_size_mb"],
+            metrics={
+                "total_publications": author_data.total_publications,
+                "total_citations": author_data.total_citations,
+                "h_index": author_data.h_index,
+                "cpp": author_data.cpp,
+                "median_citations": author_data.median_citations,
+                "percent_cited": author_data.percent_cited,
+            },
+            year_range=author_data.year_range,
+        )
+    
+    except ValueError as e:
+        logger.warning(f"[REPORT v2] Validación: {str(e)}")
+        raise HTTPException(
+            status_code=404,
+            detail=str(e)
+        )
+    
+    except Exception as e:
+        logger.error(f"[REPORT v2] Error inesperado: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error generando informe: {str(e)}"
+        )

@@ -20,6 +20,7 @@ __pycache__/
 Thumbs.db
 
 # Reportes generados (no versionamos artefactos)
+reports/pdfs/
 reports/charts/
 reports/exports/
 reports/clean_data*.json

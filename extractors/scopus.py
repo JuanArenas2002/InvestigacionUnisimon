@@ -166,11 +166,50 @@ class ScopusExtractor(BaseExtractor):
                     pub_year = int(cover_date[:4]) if cover_date and len(cover_date) >= 4 else None
                     source_journal = entry.findtext('prism:publicationName', default=None, namespaces=ns)
                     issn = entry.findtext('prism:issn', default=None, namespaces=ns)
-                    subtype = entry.findtext('subtypeDescription', default=None, namespaces=ns)
+                    eissn = entry.findtext('prism:eIssn', default=None, namespaces=ns)  # E-ISSN
+                    
+                    # TIPO DE PUBLICACIÓN — intentar múltiples campos
+                    subtype = None
+                    # Opción 1: subtypeDescription (en namespace atom)
+                    subtype = entry.findtext('atom:subtypeDescription', default=None, namespaces=ns)
+                    # Opción 2: subtype (a secas, en namespace atom)
+                    if not subtype:
+                        subtype = entry.findtext('atom:subtype', default=None, namespaces=ns)
+                    # Opción 3: aggregationType (en namespace prism)
+                    if not subtype:
+                        subtype = entry.findtext('prism:aggregationType', default=None, namespaces=ns)
+                    
                     # citedby-count está en el namespace atom
                     citedby_count = int(entry.findtext('atom:citedby-count', default='0', namespaces=ns))
-                    oa_flag = entry.findtext('openaccessFlag', default=None, namespaces=ns)
-                    is_oa = oa_flag == "true" if oa_flag else None
+                    
+                    # ACCESO ABIERTO — intentar TODOS los campos posibles
+                    # El campo viene como string: "All Open Access; Bronze Open Access; Green Open Access"
+                    oa_status = None
+                    is_oa = None
+                    
+                    # Intentar openAccessStatus primero (con namespace prism)
+                    oa_status = entry.findtext('prism:openAccessStatus', default=None, namespaces=ns)
+                    
+                    # Intentar openaccessFlag (en namespace atom)
+                    if not oa_status:
+                        oa_status = entry.findtext('atom:openaccessFlag', default=None, namespaces=ns)
+                    
+                    # Intentar openaccess (en namespace atom) como número (1=sí, 0=no)
+                    if not oa_status:
+                        oa_text = entry.findtext('atom:openaccess', default=None, namespaces=ns)
+                        if oa_text:
+                            oa_status = oa_text
+                    
+                    # Intentar freetoreadLabel para extraer info descriptiva de OA
+                    if not oa_status:
+                        freetoread_label = entry.findtext('atom:freetoreadLabel', default=None, namespaces=ns)
+                        if freetoread_label:
+                            oa_status = freetoread_label
+                    
+                    # Normalizar: Si contiene "All Open Access" o similares, es OA
+                    if oa_status:
+                        oa_status_lower = str(oa_status).lower().strip()
+                        is_oa = any(x in oa_status_lower for x in ['all open access', 'gold', 'bronze', 'green', 'hybrid', 'open access', 'true', '1', 'yes'])
                     
                     # Obtener total de citaciones desde Scopus
                     # (No disponible años precisos de citación desde Scopus API)
@@ -201,11 +240,12 @@ class ScopusExtractor(BaseExtractor):
                         source_journal=source_journal,
                         issn=issn,
                         is_open_access=is_oa,
+                        oa_status=oa_status,  # Guardar el string original también
                         authors=authors,
                         citation_count=citedby_count,
                         citations_by_year={},  # No disponible desde Scopus API
                         url=None,
-                        raw_data=None,
+                        raw_data={"eissn": eissn} if eissn else None,  # Guardar E-ISSN en raw_data
                     )
                     record.compute_normalized_fields()
                     records.append(record)
@@ -254,9 +294,18 @@ class ScopusExtractor(BaseExtractor):
         cover_date = entry.get("prism:coverDate", "")
         pub_year = int(cover_date[:4]) if cover_date and len(cover_date) >= 4 else None
 
-        # Open Access
-        oa_flag = entry.get("openaccessFlag")
-        is_oa = oa_flag == "true" if oa_flag else None
+        # Tipo de publicación (intentar múltiples campos)
+        subtype = entry.get("subtypeDescription") or entry.get("aggregationType") or entry.get("subtype")
+
+        # Acceso abierto — puede venir como string descriptivo
+        oa_status = entry.get("openaccessFlag") or entry.get("openaccess") or entry.get("openAccessStatus")
+        is_oa = None
+        if oa_status:
+            oa_status_lower = str(oa_status).lower().strip()
+            is_oa = any(x in oa_status_lower for x in ['all open access', 'gold', 'bronze', 'green', 'hybrid', 'open access', 'true', '1', 'yes'])
+
+        # E-ISSN (para fallback si ISSN no disponible)
+        eissn = entry.get("prism:eIssn") or entry.get("prism:eissn")
 
         return StandardRecord(
             source_name=self.source_name,
@@ -265,14 +314,15 @@ class ScopusExtractor(BaseExtractor):
             title=entry.get("dc:title"),
             publication_year=pub_year,
             publication_date=cover_date,
-            publication_type=entry.get("subtypeDescription"),
+            publication_type=subtype,
             source_journal=entry.get("prism:publicationName"),
             issn=entry.get("prism:issn"),
             is_open_access=is_oa,
+            oa_status=oa_status,
             authors=authors,
             citation_count=int(entry.get("citedby-count", 0)),
             url=None,  # Se puede obtener del link
-            raw_data=entry,
+            raw_data={**entry, "eissn": eissn} if eissn else entry,  # Guardar E-ISSN en raw_data
         )
 
     # ---------------------------------------------------------

@@ -1,678 +1,705 @@
 """
-Servicio de generación de gráficos de publicaciones.
-Reutilizable desde FastAPI y scripts standalone.
+api/services/chart_generator.py
+================================
+Servicio de generación de gráficos bibliométricos.
+Produce un PNG con el mismo diseño que el reporte HTML institucional.
+
+Uso desde FastAPI (ver router charts.py):
+    from api.services.chart_generator import generate_investigator_chart_file
+
+    result = generate_investigator_chart_file(
+        author_id       = "57193767797",
+        affiliation_ids = ["60106970", "60112687"],
+        year_from       = 2015,
+        year_to         = 2025,
+        institution_name= "Universidad Simón Bolívar",
+        output_dir      = Path("reports/charts"),
+    )
 """
 
-import io
 import logging
 from collections import Counter
 from datetime import datetime
 from pathlib import Path
-from typing import List, Tuple, Optional, Dict
+from typing import Optional, List
 
-# Configurar backend de matplotlib ANTES de importar pyplot
-# (evita errores con tkinter en servidores sin GUI)
-import matplotlib
-matplotlib.use('Agg')
-
-import matplotlib.pyplot as plt
-import matplotlib.ticker as ticker
-import matplotlib.patches as mpatches
 import numpy as np
+import matplotlib
+matplotlib.use("Agg")                        # sin entorno gráfico (servidor)
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+import matplotlib.ticker as ticker
+from matplotlib.patches import FancyBboxPatch
 
 from extractors.scopus import ScopusExtractor
+from api.services.analysis import generar_hallazgos, dibujar_analisis, CampoDisciplinar
 
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════════════════════════════════════════
-# COLORES Y ESTILOS
-# ═══════════════════════════════════════════════════════════════════════════════
-
-CHART_COLORS = {
-    'bg': "#FFFFFF",
-    'panel': "#F6F9FC",
-    'border': "#D0D7DE",
-    'grid': "#E5EBF0",
-    'text': "#24292F",
-    'muted': "#57606A",
-    'blue': "#0969DA",
-    'red': "#D1242F",
-    'amber': "#9E6A03",
-    'green': "#2DA44E",
-}
-
-def configure_matplotlib_styles():
-    """Configura el tema de matplotlib"""
-    plt.rcParams.update({
-        'font.family': 'sans-serif',
-        'font.sans-serif': ['Segoe UI', 'Arial', 'DejaVu Sans'],
-        'figure.facecolor': CHART_COLORS['bg'],
-        'axes.facecolor': CHART_COLORS['panel'],
-        'axes.edgecolor': CHART_COLORS['border'],
-        'axes.labelcolor': CHART_COLORS['text'],
-        'axes.spines.left': True,
-        'axes.spines.bottom': True,
-        'axes.spines.top': False,
-        'axes.spines.right': False,
-        'xtick.color': CHART_COLORS['text'],
-        'ytick.color': CHART_COLORS['text'],
-        'grid.color': CHART_COLORS['grid'],
-        'grid.linestyle': '-',
-        'grid.linewidth': 0.5,
-    })
-
-
-# ═══════════════════════════════════════════════════════════════════════════════
-# FUNCIONES AUXILIARES
-# ═══════════════════════════════════════════════════════════════════════════════
-
-def get_peak(data: List[int], years: List[int]) -> Tuple[int, int]:
-    """
-    Obtiene el año y índice con más publicaciones.
-    Returns: (peak_year, peak_index)
-    """
-    if not data:
-        return years[0], 0
-    max_val = max(data)
-    max_idx = data.index(max_val)
-    return years[max_idx], max_idx
-
-
-def extract_publications_by_year(
-    query: str,
-    author_id: str,
-    year_from: Optional[int] = None,
-    year_to: Optional[int] = None,
-    verbose: bool = True
-) -> Tuple[List[int], List[int], List[int], Dict, str]:
-    """
-    Extrae publicaciones de Scopus agrupadas por año (con citaciones).
+# ── Paleta ────────────────────────────────────────────────────────────────────
+# Paleta corporativa SUAVE - Diseño minimalista profesional con colores soft
+_C = dict(
+    # Colores corporativos principales (SUAVES - no saturados)
+    AZUL_PRINCIPAL = "#3B82F6",  # Azul suave para títulos, barras normales
+    AZUL_KPI = "#60A5FA",        # Azul muy suave para KPI primario
+    ROJO = "#F87171",            # Rojo suave para citaciones
+    VERDE_EXITO = "#34D399",     # Verde menta suave para máximo, éxito
     
-    Args:
-        query: Query avanzada de Scopus
-        year_from: Filtrar desde este año (opcional)
-        year_to: Filtrar hasta este año (opcional)
-        verbose: Imprimir información de depuración
+    # Grises (neutros, espacios)
+    GRIS_800 = "#1F2937",
+    GRIS_600 = "#4B5563",
+    GRIS_500 = "#6B7280",
+    GRIS_400 = "#9CA3AF",
+    GRIS_200 = "#E5E7EB",
+    GRIS_100 = "#F3F4F6",
+    GRIS_50 = "#F9FAFB",
     
-    Returns:
-        (years_list, publications_list, citations_list, stats_dict, first_author_name)
+    # Aliases compatibles y borders
+    AZUL_BAR = "#3B82F6",
+    AZUL_BRD = "#1E40AF",     # Más oscuro para bordes
+    VERDE_BAR = "#34D399",
+    VERDE_BRD = "#10B981",    # Más oscuro para bordes
+    MORADO_CPP = "#A78BFA",   # Púrpura muy suave
+)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Función principal — interfaz pública
+# ══════════════════════════════════════════════════════════════════════════════
+
+def generate_investigator_chart_file(
+    author_id:        str,
+    affiliation_ids:  Optional[List[str]] = None,
+    year_from:        Optional[int]       = None,
+    year_to:          Optional[int]       = None,
+    institution_name: str                 = "Universidad Simón Bolívar",
+    output_dir:       Path                = Path("reports/charts"),
+    dpi:              int                 = 180,
+    campo:            CampoDisciplinar    = CampoDisciplinar.CIENCIAS_SALUD,
+) -> dict:
     """
+    Genera el gráfico PNG de publicaciones y citaciones de un investigador.
+
+    Parámetros
+    ----------
+    author_id        : AU-ID de Scopus (requerido)
+    affiliation_ids  : lista de AF-ID para filtrar por institución (opcional)
+    year_from        : año inicial del período (opcional)
+    year_to          : año final del período (opcional)
+    institution_name : pie de página institucional
+    output_dir       : carpeta donde se guarda el PNG
+    dpi              : resolución de salida (default 180)
+    campo            : campo disciplinar para aplicar umbrales específicos (default CIENCIAS_SALUD)
+
+    Retorna
+    -------
+    dict con claves:
+        investigator_name, scopus_id, filename, file_path,
+        statistics, query_used, generated_at
+    """
+
+    # ── 1. Obtener datos desde Scopus ─────────────────────────────────────────
+    data = _fetch_scopus_data(author_id, affiliation_ids, year_from, year_to)
+
+    investigador = data["investigador"]
+    scopus_id    = data["scopus_id"]
+    fecha_ext    = data["fecha_ext"]
+    rango        = data["rango"]
+    años         = data["años"]
+    pubs         = data["pubs"]
+    cites        = data["cites"]
+    df_pubs      = data["df_pubs"]
+
+    if not años:
+        raise ValueError(
+            f"No se encontraron publicaciones para AU-ID {author_id} "
+            f"con los filtros indicados."
+        )
+
+    # ── 2. Calcular indicadores ───────────────────────────────────────────────
+    import statistics
     
+    total_arts  = int(sum(pubs))
+    total_citas = int(sum(cites))
+    cpp         = round(total_citas / total_arts, 1) if total_arts else 0.0
+    citas_sorted = sorted(df_pubs["Citas"].tolist(), reverse=True)
+    h_index     = sum(1 for i, c in enumerate(citas_sorted, 1) if c >= i)
+    año_pico    = años[cites.index(max(cites))] if max(cites) > 0 else años[0]
+    año_max_pub = años[pubs.index(max(pubs))] if max(pubs) > 0 else años[0]
+    
+    # Nuevos indicadores
+    mediana_citas = round(statistics.median(citas_sorted), 1) if citas_sorted else 0.0
+    pct_citados = round((len(df_pubs[df_pubs["Citas"] >= 1]) / len(df_pubs)) * 100, 1) if len(df_pubs) > 0 else 0.0
+    
+    # Calcular CPP por año para tabla
+    cpp_por_año = []
+    for p, c in zip(pubs, cites):
+        cpp_anual = round(c / p, 1) if p > 0 else 0.0
+        cpp_por_año.append(cpp_anual)
+
+    statistics = {
+        "total_publications": total_arts,
+        "min_year": min(años) if años else 0,
+        "max_year": max(años) if años else 0,
+        "avg_per_year": round(total_arts / len(años), 1) if años else 0,
+        "peak_year": año_pico,
+        "peak_publications": max(pubs) if pubs else 0,
+        "active_years": len(años),
+        "publications_by_year": [
+            {"year": y, "count": p, "percentage": round((p / total_arts * 100), 1) if total_arts > 0 else 0}
+            for y, p in zip(años, pubs)
+        ],
+    }
+
+    # ── 3. Construir la figura ────────────────────────────────────────────────
+    fig = _build_figure(
+        investigador  = investigador,
+        scopus_id     = scopus_id,
+        fecha_ext     = fecha_ext,
+        rango         = rango,
+        años          = años,
+        pubs          = pubs,
+        cites         = cites,
+        total_arts    = total_arts,
+        total_citas   = total_citas,
+        h_index       = h_index,
+        cpp           = cpp,
+        mediana_citas = mediana_citas,
+        pct_citados   = pct_citados,
+        cpp_por_año   = cpp_por_año,
+        año_pico      = año_pico,
+        año_max_pub   = año_max_pub,
+        institution_name = institution_name,
+        campo         = campo,
+    )
+
+    # ── 4. Guardar PNG ────────────────────────────────────────────────────────
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    slug      = investigador.lower().replace(" ", "_").replace(".", "").replace("-", "_")
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename  = f"grafico_{slug}_{timestamp}.png"
+    filepath  = output_dir / filename
+
+    fig.savefig(filepath, dpi=dpi, bbox_inches="tight",
+                facecolor="white", edgecolor=_C["GRIS_200"])
+    plt.close(fig)
+
+    logger.info(f"Gráfico generado: {filepath}")
+
+    # ── 5. Construir query usada ──────────────────────────────────────────────
+    af_part = ""
+    if affiliation_ids:
+        af_parts = " OR ".join(f"AF-ID({a})" for a in affiliation_ids)
+        af_part  = f" AND ({af_parts})"
+    query_used = f"AU-ID({author_id}){af_part}"
+
+    return {
+        "investigator_name": investigador,
+        "scopus_id":         scopus_id,
+        "filename":          filename,
+        "file_path":         str(filepath),
+        "statistics":        statistics,
+        "query_used":        query_used,
+        "generated_at":      datetime.now().isoformat(),
+        # Campos adicionales para PDF
+        "total_citations": total_citas,
+        "h_index": h_index,
+        "cpp": cpp,
+        "median_citations": mediana_citas,
+        "percent_cited": pct_citados,
+        "peak_year": año_pico,
+    }
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Capa de datos  —  extrae desde Scopus usando ScopusExtractor
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _fetch_scopus_data(
+    author_id:       str,
+    affiliation_ids: Optional[List[str]],
+    year_from:       Optional[int],
+    year_to:         Optional[int],
+) -> dict:
+    """
+    Obtiene publicaciones de Scopus para el AU-ID indicado.
+    """
+    import pandas as pd
+    
+    # Construir query Scopus
+    if affiliation_ids:
+        aff_clause = " OR ".join([f"AF-ID ( {aff_id} )" for aff_id in affiliation_ids])
+        query = f"AU-ID ( {author_id} ) AND ({aff_clause})"
+    else:
+        query = f"AU-ID ( {author_id} )"
+    
+    logger.info(f"[CHART DATA] Extrayendo con query: {query}")
+    
+    # Extraer desde Scopus
     extractor = ScopusExtractor()
+    records = extractor.extract(query=query, max_results=None)
     
-    if verbose:
-        logger.info(f"Extrayendo datos con query: {query}")
+    if not records:
+        raise ValueError(f"No se encontraron publicaciones para AU-ID {author_id}")
     
-    try:
-        # Extraer registros de Scopus
-        records = extractor.extract(query=query, max_results=None)
-    except Exception as e:
-        logger.error(f"Error extrayendo de Scopus: {e}")
-        raise
+    logger.info(f"[CHART DATA] Registros encontrados: {len(records)}")
     
-    if verbose:
-        logger.info(f"Total de registros encontrados: {len(records)}")
-    
-    # Obtener nombre del autor buscando el AU-ID en los registros
-    author_name = "Investigador"
+    # Obtener datos del autor
+    investigador = "Investigador"
+    scopus_id = author_id
     for record in records:
         if record.authors:
             for author in record.authors:
-                # Comparar el scopus_id del autor con el AU-ID buscado
-                author_scopus_id = author.get('scopus_id', '')
-                # Limpiar formato: puede ser "SCOPUS_ID:57193767797" o "57193767797"
-                if author_scopus_id:
-                    author_scopus_id = author_scopus_id.replace('SCOPUS_ID:', '')
-                
+                author_scopus_id = author.get('scopus_id', '').replace('SCOPUS_ID:', '')
                 if author_scopus_id == author_id:
-                    author_name = author.get('name', 'Investigador')
-                    if author_name and author_name != 'Investigador':
+                    investigador = author.get('name', 'Investigador')
+                    if investigador and investigador != 'Investigador':
                         break
-        if author_name != "Investigador":
+        if investigador != "Investigador":
             break
     
-    if verbose:
-        logger.info(f"Autor encontrado: {author_name}")
-    
-    # Agrupar por año y sumar citaciones
+    # Agrupar por año con citaciones
     pub_by_year = Counter()
-    citations_by_year = Counter()  # Citaciones asociadas al año de publicación
+    citations_by_year = Counter()
     
     for record in records:
         if record.publication_year:
             year = record.publication_year
             
-            # Aplicar filtros de año
+            # Filtros de año
             if year_from and year < year_from:
                 continue
             if year_to and year > year_to:
                 continue
-                
-            pub_by_year[year] += 1
             
-            # Sumar citaciones por año de PUBLICACIÓN del artículo citado
-            # (Scopus no proporciona años precisos de cuándo fue citado)
+            pub_by_year[year] += 1
             if record.citation_count > 0:
                 citations_by_year[year] += record.citation_count
     
     # Crear series ordenada
-    if pub_by_year:
-        years = sorted(pub_by_year.keys())
-        publications = [pub_by_year[year] for year in years]
-        citations = [citations_by_year.get(year, 0) for year in years]
-    else:
-        logger.warning("No se encontraron publicaciones en el rango especificado")
-        return [], [], [], {}, author_name
+    if not pub_by_year:
+        raise ValueError("No se encontraron publicaciones en el rango especificado")
     
-    # Calcular estadísticas
-    total_pubs = sum(publications)
-    total_cites = sum(citations)
-    stats = {
-        'total_publications': total_pubs,
-        'total_citations': total_cites,
-        'avg_citations_per_pub': round(total_cites / total_pubs, 2) if total_pubs > 0 else 0,
-        'min_year': min(years),
-        'max_year': max(years),
-        'avg_per_year': total_pubs / len(years) if years else 0,
-        'peak_year': get_peak(publications, years)[0] if publications else (min(years) if years else 2020),
-        'peak_publications': max(publications) if publications else 0,
-        'peak_citations': max(citations) if citations else 0,
-        'active_years': len([p for p in publications if p > 0]),
-    }
+    años  = sorted(pub_by_year.keys())
+    pubs  = [pub_by_year[year] for year in años]
+    cites = [citations_by_year.get(year, 0) for year in años]
     
-    if verbose:
-        logger.info(f"Autor: {author_name}")
-        logger.info(f"Años (de citación): {years}")
-        logger.info(f"Publicaciones por año: {publications}")
-        logger.info(f"Citaciones por año: {citations}")
-        logger.info(f"Total: {total_pubs} publicaciones, {total_cites} citaciones (por año de citación)")
-    
-    return years, publications, citations, stats, author_name
-
-
-def make_investigator_chart(
-    fig,
-    ax1,
-    ax_table,
-    years_data: List[int],
-    publications_data: List[int],
-    citations_data: List[int] = None,
-    bar_peak_note: Optional[str] = None,
-    bar_peak_color: str = CHART_COLORS['green'],
-    num_years: int = None,
-):
-    """
-    Genera el gráfico de investigador con tabla de datos y citaciones.
-    
-    Args:
-        citations_data: Lista de citaciones por año (opcional)
-    """
-    
-    x = np.arange(len(years_data))
-    if num_years is None:
-        num_years = len(years_data)
-
-    # Detectar el pico y valor máximo
-    if sum(publications_data) == 0:
-        bar_peak_year, bar_peak_idx = years_data[0], 0
-        max_pub_val = 1
-    else:
-        bar_peak_year, bar_peak_idx = get_peak(publications_data, years_data)
-        max_pub_val = max(publications_data)
-
-    # ── Barras ─────────────────────────────────────────────────────────────────
-    norm_v = (
-        np.array(publications_data) / max_pub_val
-        if max_pub_val > 0
-        else np.zeros_like(publications_data, dtype=float)
-    )
-    bar_colors = [plt.cm.Blues(0.25 + 0.50 * v) for v in norm_v]
-    if max_pub_val > 0:
-        bar_colors[bar_peak_idx] = "#2DA44E"  # Verde para el pico
-
-    # Ancho "profesional" de barras basado en densidad de datos
-    # Pocas barras: más anchas (mejor proporción visual)
-    # Muchas barras: más estrechas (mejor espaciado)
-    if num_years == 1:
-        bar_width = 0.38  # Ultra compacta para 1 sola barra
-    elif num_years <= 3:
-        bar_width = 0.50  # Barras medias-amplias
-    elif num_years <= 8:
-        bar_width = 0.48  # Barras medias
-    elif num_years <= 15:
-        bar_width = 0.44  # Barras algo más estrechas
-    else:
-        bar_width = 0.38  # Barras estrechas para muchos datos
-
-    bars = ax1.bar(
-        x,
-        publications_data,
-        width=bar_width,
-        color=bar_colors,
-        alpha=0.75,
-        zorder=2,
-        linewidth=0,
-    )
-
-    # ══════════════════════════════════════════════════════════════════════════════
-    # MÁRGENES RESPONSIVOS - Elimina espacios en blanco sin necesidad
-    # ══════════════════════════════════════════════════════════════════════════════
-    # Left/right margins: más compactos con pocos años
-    if num_years == 1:
-        margin_pct = 0.02  # Mínimo absoluto para 1 año
-        y_margin_pct = 0.10  # Pero espacio Y para ver la barra
-    elif num_years <= 2:
-        margin_pct = 0.04
-        y_margin_pct = 0.09
-    elif num_years <= 4:
-        margin_pct = 0.06
-        y_margin_pct = 0.08
-    elif num_years <= 8:
-        margin_pct = 0.08
-        y_margin_pct = 0.08
-    else:
-        margin_pct = 0.10
-        y_margin_pct = 0.08
-    
-    ax1.margins(x=margin_pct, y=y_margin_pct)
-    ax1.set_xlim(-0.5 - margin_pct, len(years_data) - 0.5 + margin_pct)
-
-    # Etiquetas sobre las barras
-    for bar, val, yr in zip(bars, publications_data, years_data):
-        col = bar_peak_color if yr == bar_peak_year else CHART_COLORS['muted']
-        if val > 0:
-            text_y_pos = bar.get_height() + (max_pub_val * 0.05)
-            ax1.text(
-                bar.get_x() + bar.get_width() / 2,
-                text_y_pos,
-                str(val),
-                ha="center",
-                va="bottom",
-                fontsize=8,
-                color=col,
-                fontweight="bold",
-            )
-
-    # ══════════════════════════════════════════════════════════════════════════════
-    # CONFIGURACIÓN DE EJES RESPONSIVA
-    # ══════════════════════════════════════════════════════════════════════════════
-    # Y-axis label: tamaño responsivo
-    if num_years >= 15:
-        ylabel_size = 9.5
-    elif num_years >= 8:
-        ylabel_size = 10
-    else:
-        ylabel_size = 10.5
-    
-    ax1.set_ylabel("N.° de publicaciones", fontsize=ylabel_size, color=CHART_COLORS['muted'], labelpad=10)
-    
-    # X-axis ticks: tamaño responsivo
-    if num_years >= 15:
-        tick_size = 8
-    elif num_years >= 8:
-        tick_size = 8.5
-    else:
-        tick_size = 9.5
-    
-    ax1.set_xticks(x)
-    ax1.set_xticklabels(years_data, rotation=0, fontsize=tick_size)
-    
-    ax1.set_ylim(0, max_pub_val * 1.25 if max_pub_val > 0 else 5)
-    ax1.yaxis.set_major_locator(
-        ticker.MultipleLocator(
-            max(1, int(max_pub_val / 5)) if max_pub_val > 0 else 1
-        )
-    )
-    ax1.grid(axis="y", zorder=0)
-    ax1.spines["bottom"].set_color(CHART_COLORS['border'])
-    ax1.spines["left"].set_color(CHART_COLORS['border'])
-    ax1.tick_params(axis="x", which="both", length=0)
-
-    # Anotación del pico
-    if max_pub_val > 0:
-        note = bar_peak_note if bar_peak_note else f"  Pico: {bar_peak_year}"
-        # Offset dinámico: con pocos años, offset mínimo; con muchos, normal
-        if num_years == 1:
-            x_offset_ann = 0.4  # Muy cerca de la barra
-        elif num_years <= 3:
-            x_offset_ann = bar_peak_idx + 0.6 if bar_peak_idx < len(years_data) - 1 else bar_peak_idx - 0.8
-        else:
-            x_offset_ann = (
-                bar_peak_idx + 1.2 if bar_peak_idx < len(years_data) - 2 else bar_peak_idx - 1.5
-            )
-        y_text_ann = publications_data[bar_peak_idx] + (max_pub_val * 0.1)
-        ax1.annotate(
-            note,
-            xy=(bar_peak_idx, publications_data[bar_peak_idx]),
-            xytext=(x_offset_ann, y_text_ann),
-            fontsize=8.5,
-            color=bar_peak_color,
-            arrowprops=dict(arrowstyle="->", color=bar_peak_color, lw=1.2),
-            bbox=dict(
-                boxstyle="round,pad=0.35",
-                facecolor="#E6F4EA",
-                edgecolor=bar_peak_color,
-                linewidth=0.8,
-            ),
-        )
-
-    # Leyenda
-    leg = [
-        mpatches.Patch(facecolor="#388BFD", alpha=0.7, label="Publicaciones"),
-    ]
-    
-    # Eje secundario para citaciones
-    if citations_data and sum(citations_data) > 0:
-        ax2 = ax1.twinx()
-        max_cit_val = max(citations_data) if citations_data else 0
-        
-        if max_cit_val > 0:
-            # Dibujar línea de citaciones
-            line = ax2.plot(
-                x, citations_data,
-                color="#EA4335",
-                marker="o",
-                markersize=5,
-                linewidth=2.5,
-                label="Citaciones",
-                zorder=3,
-            )
-            
-            # Configurar eje Y secundario
-            ax2.set_ylabel("N.° de citaciones", fontsize=ylabel_size, color="#EA4335", labelpad=10)
-            ax2.tick_params(axis="y", labelcolor="#EA4335")
-            ax2.set_ylim(0, max_cit_val * 1.25 if max_cit_val > 0 else 5)
-            ax2.yaxis.set_major_locator(
-                ticker.MultipleLocator(
-                    max(1, int(max_cit_val / 5)) if max_cit_val > 0 else 1
-                )
-            )
-            
-            # Añadir a la leyenda
-            leg.append(mpatches.Patch(facecolor="#EA4335", label="Citaciones"))
-        else:
-            ax2 = None
-    else:
-        ax2 = None
-    
-    ax1.legend(
-        handles=leg,
-        loc="upper left",
-        fontsize=9,
-        framealpha=0.85,
-        facecolor=CHART_COLORS['panel'],
-        edgecolor=CHART_COLORS['border'],
-        labelcolor=CHART_COLORS['text'],
-        handlelength=2,
-        borderpad=0.8,
-    )
-
-    # ── Tabla ──────────────────────────────────────────────────────────────────
-    ax_table.axis("off")
-
-    col_labels = [str(y) for y in years_data]
-    cell_data = [
-        [str(v) if v > 0 else "—" for v in publications_data],
-    ]
-    row_labels = ["Publicaciones"]
-    
-    # Añadir fila de citaciones si existen
-    if citations_data and sum(citations_data) > 0:
-        cell_data.append([str(v) if v > 0 else "—" for v in citations_data])
-        row_labels.append("Citaciones")
-
-    cell_colors = []
-    
-    # Colores para fila de publicaciones
-    row_c = []
-    for col_i in range(len(years_data)):
-        if max_pub_val > 0:
-            intensity = publications_data[col_i] / max_pub_val
-            r, g, b, _ = plt.cm.Blues(0.10 + 0.40 * intensity)
-            row_c.append((r, g, b, 0.60))
-        else:
-            row_c.append((*[int(CHART_COLORS['grid'][i : i + 2], 16) / 255 for i in (1, 3, 5)], 1.0))
-    cell_colors.append(row_c)
-    
-    # Colores para fila de citaciones si existen
-    if citations_data and sum(citations_data) > 0:
-        max_cit_val = max(citations_data) if citations_data else 0
-        row_c_cit = []
-        for col_i in range(len(years_data)):
-            if max_cit_val > 0:
-                intensity = citations_data[col_i] / max_cit_val
-                # Usar colores rojos/naranjas para citaciones
-                r, g, b, _ = plt.cm.Oranges(0.10 + 0.40 * intensity)
-                row_c_cit.append((r, g, b, 0.60))
-            else:
-                row_c_cit.append((*[int(CHART_COLORS['grid'][i : i + 2], 16) / 255 for i in (1, 3, 5)], 1.0))
-        cell_colors.append(row_c_cit)
-
-    table = ax_table.table(
-        cellText=cell_data,
-        rowLabels=row_labels,
-        colLabels=col_labels,
-        cellColours=cell_colors,
-        rowColours=[CHART_COLORS['border']] * len(row_labels),  # Un color por cada fila de datos
-        colColours=[CHART_COLORS['border']] * len(col_labels),
-        loc="center",
-        cellLoc="center",
-    )
-    table.auto_set_font_size(False)
-    table.set_fontsize(8.5)
-    table.scale(1, 1.8)
-
-    for (row, col), cell in table.get_celld().items():
-        cell.set_edgecolor(CHART_COLORS['border'])
-        cell.set_linewidth(0.5)
-        if col == -1:  # Row labels
-            cell.set_text_props(color=CHART_COLORS['text'], fontweight="bold", fontsize=8.5)
-        elif row == 0:  # Column labels (years)
-            cell.set_text_props(color=CHART_COLORS['muted'], fontsize=8)
-        elif row == 2 and len(row_labels) > 1:  # Data cells de citaciones
-            val_text = cell.get_text().get_text()
-            if val_text != "—":
-                cell.set_text_props(color="#EA4335", fontweight="bold", fontsize=8.5)
-            else:
-                cell.set_text_props(color=CHART_COLORS['muted'], fontsize=8.5)
-        else:  # Data cells de publicaciones
-            val_text = cell.get_text().get_text()
-            if val_text != "—":
-                cell.set_text_props(color=CHART_COLORS['blue'], fontweight="bold", fontsize=8.5)
-            else:
-                cell.set_text_props(color=CHART_COLORS['muted'], fontsize=8.5)
-
-
-def generate_investigator_chart_file(
-    author_id: str,
-    affiliation_ids: Optional[List[str]] = None,
-    year_from: Optional[int] = None,
-    year_to: Optional[int] = None,
-    institution_name: str = "Universidad Simón Bolívar",
-    figsize: Tuple[float, float] = (16, 10),
-    dpi: int = 300,
-    output_dir: Path = Path("reports/charts"),
-) -> Dict:
-    """
-    Genera un gráfico y lo guarda en un archivo PNG.
-    
-    El nombre del investigador se obtiene automáticamente de los registros.
-    
-    Returns:
-        Dict con información del gráfico generado
-    """
-    
-    try:
-        logger.info(f"[CHART] ═══════════════════════════════════════════════════════")
-        logger.info(f"[CHART] Iniciando generación para AU-ID: {author_id}")
-        logger.info(f"[CHART] Parámetros: year_from={year_from}, year_to={year_to}, affiliation_ids={affiliation_ids}")
-        
-        # Crear directorio de salida
-        output_dir = Path(output_dir)
-        output_dir.mkdir(parents=True, exist_ok=True)
-        logger.info(f"[CHART] Directorio creado: {output_dir}")
-        
-        # Construir query
-        if affiliation_ids:
-            aff_clause = " OR ".join([f"AF-ID ( {aff_id} )" for aff_id in affiliation_ids])
-            query = f"AU-ID ( {author_id} ) AND ({aff_clause})"
-        else:
-            query = f"AU-ID ( {author_id} )"
-        
-        logger.info(f"[CHART] Query Scopus: {query}")
-        
-        # Extraer datos (ahora retorna también el nombre del autor y citaciones)
-        logger.info(f"[CHART] Extrayendo publicaciones...")
-        years, publications, citations, stats, investigator_name = extract_publications_by_year(
-            query=query,
-            author_id=author_id,
-            year_from=year_from,
-            year_to=year_to,
-            verbose=True
-        )
-        
-        logger.info(f"[CHART] Datos extraídos: {len(years)} años, {sum(publications)} publicaciones, {sum(citations)} citaciones")
-        logger.info(f"[CHART] Investigador: {investigator_name}")
-        
-        if not years:
-            logger.error(f"[CHART] No se encontraron publicaciones")
-            raise ValueError("No se encontraron publicaciones para la consulta especificada")
-        
-        # Calcular dimensiones
-        num_years = len(years)
-        logger.info(f"[CHART] Calculando dimensioning para {num_years} años...")
-        
-        if num_years == 1:
-            fig_width, fig_height = 6.5, 6.0
-        elif num_years <= 2:
-            fig_width, fig_height = 7.0, 6.0
-        elif num_years <= 4:
-            fig_width = 7.5 + (num_years - 3) * 0.3
-            fig_height = 6.3
-        elif num_years <= 7:
-            fig_width = 8.2 + (num_years - 5) * 0.35
-            fig_height = 6.8
-        elif num_years <= 12:
-            fig_width = 9.2 + (num_years - 7) * 0.4
-            fig_height = 7.3
-        elif num_years <= 18:
-            fig_width = 11.2 + (num_years - 12) * 0.3
-            fig_height = 7.8
-        elif num_years <= 25:
-            fig_width = 13.0 + (num_years - 18) * 0.2
-            fig_height = 8.3
-        else:
-            fig_width = min(16, 14.4 + (num_years - 25) * 0.05)
-            fig_height = min(10, 8.7 + (num_years - 25) * 0.01)
-        
-        figsize = (fig_width, fig_height)
-        logger.info(f"[CHART] Figura: {fig_width:.1f}\" x {fig_height:.1f}\"")
-        
-        # Height ratios
-        if num_years == 1:
-            height_ratio, hspace_val = 5.5, 0.12
-        elif num_years <= 2:
-            height_ratio, hspace_val = 4.5, 0.10
-        elif num_years <= 4:
-            height_ratio, hspace_val = 4.2, 0.08
-        elif num_years <= 7:
-            height_ratio, hspace_val = 3.9, 0.07
-        elif num_years <= 12:
-            height_ratio, hspace_val = 3.6, 0.06
-        elif num_years <= 18:
-            height_ratio, hspace_val = 3.3, 0.055
-        else:
-            height_ratio, hspace_val = 3.0, 0.05
-        
-        logger.info(f"[CHART] Configurando matplotlib...")
-        configure_matplotlib_styles()
-        
-        logger.info(f"[CHART] Creando figura...")
-        fig, (ax_chart, ax_table) = plt.subplots(
-            2, 1,
-            figsize=figsize,
-            gridspec_kw={"height_ratios": [height_ratio, 1], "hspace": hspace_val},
-            facecolor=CHART_COLORS['bg'],
-        )
-        
-        logger.info(f"[CHART] Renderizando gráfico...")
-        make_investigator_chart(
-            fig, ax_chart, ax_table,
-            years_data=years,
-            publications_data=publications,
-            citations_data=citations,
-            num_years=num_years,
-        )
-        
-        # Metadatos
-        total_pub = sum(publications)
-        total_cit = sum(citations) if citations else 0
-        min_year, max_year = years[0], years[-1]
-        
-        fig.text(
-            0.065, 0.97,
-            f"Publicaciones de {investigator_name}  |  {min_year}–{max_year}",
-            fontsize=14, fontweight="bold", color=CHART_COLORS['text'],
-            va="bottom",
-        )
-        
-        fig.text(
-            0.065, 0.956,
-            f"Total de publicaciones: {total_pub}  ·  Total de citaciones: {total_cit}  ·  Fuente: Scopus ID: {author_id}",
-            fontsize=9, color=CHART_COLORS['muted'],
-            va="bottom",
-        )
-        
-        fig.add_artist(plt.Line2D([0.065, 0.95], [0.951, 0.951], 
-                                   transform=fig.transFigure, 
-                                   color=CHART_COLORS['border'], linewidth=0.8))
-        fig.add_artist(plt.Line2D([0.065, 0.95], [0.015, 0.015], 
-                                   transform=fig.transFigure, 
-                                   color=CHART_COLORS['border'], linewidth=0.6))
-        
-        fig.text(0.065, 0.006, f"· {institution_name}", 
-                fontsize=8, color=CHART_COLORS['muted'], va="bottom")
-        
-        # Guardar archivo
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        name_slug = investigator_name.lower().replace(" ", "_").replace(",", "").replace(".", "")
-        filename = f"grafico_{name_slug}_{timestamp}.png"
-        filepath = output_dir / filename
-        
-        logger.info(f"[CHART] Guardando: {filepath}")
-        plt.savefig(str(filepath), dpi=dpi, bbox_inches="tight", facecolor=CHART_COLORS['bg'])
-        plt.close(fig)
-        logger.info(f"[CHART] Archivo guardado exitosamente")
-        
-        # Preparar respuesta
-        publications_by_year = []
-        for year, pub_count in zip(years, publications):
-            percentage = (pub_count / total_pub * 100) if total_pub > 0 else 0
-            publications_by_year.append({
-                'year': year,
-                'count': pub_count,
-                'percentage': round(percentage, 1)
-            })
-        
-        return {
-            'filename': filename,
-            'file_path': str(filepath.resolve()),
-            'full_path': str(filepath),
-            'investigator_name': investigator_name,
-            'statistics': {
-                'total_publications': total_pub,
-                'min_year': min_year,
-                'max_year': max_year,
-                'avg_per_year': round(stats['avg_per_year'], 2),
-                'peak_year': stats['peak_year'],
-                'peak_publications': stats['peak_publications'],
-                'active_years': stats['active_years'],
-                'publications_by_year': publications_by_year,
-            },
-            'query_used': query,
-            'generated_at': datetime.now().isoformat(),
+    # Crear DataFrame de publicaciones para cálculo de H-index
+    df_pubs = pd.DataFrame([
+        {
+            'Año': record.publication_year,
+            'Citas': record.citation_count or 0,
         }
+        for record in records
+        if record.publication_year and (not year_from or record.publication_year >= year_from)
+                                    and (not year_to or record.publication_year <= year_to)
+    ])
     
-    except Exception as e:
-        logger.error(f"[CHART] Error fatal: {str(e)}", exc_info=True)
-        raise
+    fecha_ext = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    y_min = min(años) if años else ""
+    y_max = max(años) if años else ""
+    rango = f"{y_min} - {y_max}"
+    
+    return {
+        "investigador": investigador,
+        "scopus_id":    scopus_id,
+        "fecha_ext":    fecha_ext,
+        "rango":        rango,
+        "años":         años,
+        "pubs":         pubs,
+        "cites":        cites,
+        "df_pubs":      df_pubs,
+    }
+
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Motor de renderizado  —  genera la figura Matplotlib
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _build_figure(
+    investigador, scopus_id, fecha_ext, rango,
+    años, pubs, cites,
+    total_arts, total_citas, h_index, cpp,
+    mediana_citas, pct_citados, cpp_por_año,
+    año_pico, año_max_pub,
+    institution_name,
+    campo: CampoDisciplinar = CampoDisciplinar.CIENCIAS_SALUD,
+) -> plt.Figure:
+
+    C = _C  # alias corto
+
+    # ── Canvas ────────────────────────────────────────────────────────────────
+    fig = plt.figure(figsize=(13, 11), facecolor="white")  # Más compacto
+    fig.patch.set_linewidth(0)  # Sin borde
+
+    gs = fig.add_gridspec(
+        5, 1,  # Simplificar: 5 secciones en lugar de 7
+        height_ratios=[0.8, 0.9, 5.0, 1.8, 0.4],  # Menos altura total
+        hspace=0.10,
+        left=0.08, right=0.92,
+        top=0.94, bottom=0.06,
+    )
+    ax_hdr   = fig.add_subplot(gs[0])  # Título simple
+    ax_kpi   = fig.add_subplot(gs[1])  # KPIs
+    ax_chart = fig.add_subplot(gs[2])  # Gráfico
+    ax_tbl   = fig.add_subplot(gs[3])  # Tabla
+    ax_ftr   = fig.add_subplot(gs[4])  # Footer
+
+    for ax in [ax_hdr, ax_kpi, ax_tbl, ax_ftr]:
+        ax.set_xlim(0, 1)
+        ax.set_ylim(0, 1)
+        ax.axis("off")
+
+    # ── Header LIMPIO ──────────────────────────────────────────────────────────
+    # Decidir si poner rango en misma línea o en línea separada
+    # Solo en misma línea si el nombre es muy corto (< 15 caracteres)
+    nombre_corto = len(investigador) < 15
+    
+    if nombre_corto:
+        # Nombre corto: mostrar rango en misma línea
+        ax_hdr.text(0.02, 0.80, f"Publicaciones de {investigador}",
+                    fontsize=15, fontweight="bold", color=C["AZUL_PRINCIPAL"],
+                    transform=ax_hdr.transAxes, va="top", ha="left")
+        # Rango al lado con separador
+        ax_hdr.text(0.98, 0.80, f"{rango}  ",
+                    fontsize=12, color=C["GRIS_400"], fontweight="300",
+                    transform=ax_hdr.transAxes, va="top", ha="right")
+    else:
+        # Nombre largo: rango en línea separada debajo
+        ax_hdr.text(0.02, 0.80, f"Publicaciones de {investigador}",
+                    fontsize=15, fontweight="bold", color=C["AZUL_PRINCIPAL"],
+                    transform=ax_hdr.transAxes, va="top", ha="left")
+        # Rango en línea 2
+        ax_hdr.text(0.02, 0.58, rango,
+                    fontsize=12, color=C["GRIS_400"], fontweight="300",
+                    transform=ax_hdr.transAxes, va="top", ha="left")
+
+    meta = (f"Publicaciones: {total_arts}   •   "
+            f"Citaciones: {total_citas:,}   •   "
+            f"Scopus ID: {scopus_id}")
+    ax_hdr.text(0.02, 0.40, meta,
+                fontsize=8, color=C["GRIS_600"],
+                transform=ax_hdr.transAxes, va="top")
+
+    ax_hdr.plot([0, 1], [0.05, 0.05], color=C["AZUL_PRINCIPAL"], lw=1.2,
+                transform=ax_hdr.transAxes, clip_on=False)
+
+    # ── KPIs LIMPIOS ───────────────────────────────────────────────────────────
+    # Sin fondo de box, solo texto limpio distribuido
+    
+    kpis = [
+        ("PUBLICACIONES", str(total_arts), C["AZUL_PRINCIPAL"]),
+        ("% CITADOS", f"{pct_citados}%", C["VERDE_EXITO"]),
+        ("H-INDEX", str(h_index), C["AZUL_KPI"]),
+        ("CPP", str(cpp), C["MORADO_CPP"]),
+        ("MEDIANA", str(mediana_citas), C["ROJO"]),
+        ("CITACIONES", f"{total_citas:,}", C["GRIS_600"]),
+    ]
+    
+    kpi_w = 1 / len(kpis)
+    for i, (lbl, val, color) in enumerate(kpis):
+        xc = i * kpi_w + kpi_w / 2
+        
+        # Etiqueta pequeña
+        ax_kpi.text(xc, 0.70, lbl, ha="center", va="top", fontsize=7.5,
+                    color=C["GRIS_600"], fontweight="bold",
+                    transform=ax_kpi.transAxes)
+        
+        # Valor grande
+        ax_kpi.text(xc, 0.35, val, ha="center", va="center", fontsize=18,
+                    color=color, fontweight="bold",
+                    transform=ax_kpi.transAxes)
+    
+    # Solo línea divisoria simple (sin box)
+    ax_kpi.plot([0, 1], [0.02, 0.02], color=C["GRIS_200"], lw=0.8,
+                transform=ax_kpi.transAxes, clip_on=False)
+
+    # ── Gráfico barras + línea + CPP/año ─────────────────────────────────────
+    ax_chart.margins(y=0.05)  # Margen vertical para no sobreposicionar tabla
+    ax2   = ax_chart.twinx()
+    ax3   = ax_chart.twinx()
+    ax3.spines["right"].set_position(("outward", 55))  # Desplazar eje CPP/año
+    
+    n     = len(años)
+    x     = np.arange(n)
+    
+    # Ancho de barra dinámico según cantidad de años
+    if n == 1:
+        w = 0.4      # Muy estrecho para 1 año
+        margin_x = 0.8
+    elif n <= 3:
+        w = 0.5
+        margin_x = 0.6
+    elif n <= 7:
+        w = 0.55
+        margin_x = 0.5
+    else:
+        w = 0.35     # Más estrecho para muchos años
+        margin_x = 0.3
+
+    bar_fc = [C["VERDE_BAR"] if a == año_max_pub else C["AZUL_BAR"]  for a in años]
+    bar_ec = [C["VERDE_BRD"] if a == año_max_pub else C["AZUL_BRD"]  for a in años]
+
+    bars = ax_chart.bar(x, pubs, width=w, color=bar_fc,
+                        edgecolor=bar_ec, linewidth=0.8, zorder=2)
+
+    # Fontsize dinámico para valores sobre barras
+    val_fontsize = 10 if n == 1 else 9 if n <= 5 else 8 if n <= 10 else 7
+    for bar, val in zip(bars, pubs):
+        ax_chart.text(
+            bar.get_x() + bar.get_width() / 2,
+            bar.get_height() + max(pubs) * 0.015,
+            str(val), ha="center", va="bottom",
+            fontsize=val_fontsize, color=C["GRIS_600"], fontweight="500")
+
+    # Tamaño dinámico para marcadores según cantidad de años
+    marker_size = 6 if n <= 5 else 5 if n <= 10 else 4
+    marker_size_cpp = 5 if n <= 5 else 4 if n <= 10 else 3
+    
+    ax2.plot(x, cites, color=C["ROJO"], linewidth=2,
+             marker="o", markersize=marker_size,
+             markerfacecolor=C["ROJO"], markeredgecolor="white",
+             markeredgewidth=1.5, zorder=3, label="Citaciones")
+    
+    # Graficar CPP/año
+    ax3.plot(x, cpp_por_año, color="#8B5CF6", linewidth=2.5, linestyle="--",
+             marker="s", markersize=marker_size_cpp,
+             markerfacecolor="#8B5CF6", markeredgecolor="white",
+             markeredgewidth=1.2, zorder=2, label="CPP/año")
+
+    # Anotación pico - dinámico según años
+    idx_pico = cites.index(max(cites)) if max(cites) > 0 else 0
+    if max(cites) > 0:
+        # Posicionar anotación dinámicamente
+        if n == 1:
+            # Un solo año: poner arriba
+            x_text = idx_pico
+            y_text = max(cites) * 1.1
+        elif idx_pico <= n // 3:
+            # Pico en la izquierda: anotar a la derecha
+            x_text = idx_pico + 1.5
+            y_text = max(cites) * 0.85
+        elif idx_pico >= 2 * n // 3:
+            # Pico en la derecha: anotar a la izquierda
+            x_text = idx_pico - 1.5
+            y_text = max(cites) * 0.75
+        else:
+            # Pico en el medio: anotar arriba
+            x_text = idx_pico
+            y_text = max(cites) * 1.05
+        
+        ax2.annotate(
+            f"Máx: {año_pico} ({max(cites)})",
+            xy=(idx_pico, max(cites)),
+            xytext=(x_text, y_text),
+            fontsize=8, color="#DC2626", fontweight="bold",
+            bbox=dict(boxstyle="round,pad=0.5", facecolor="#FEE2E2",
+                      edgecolor="#DC2626", linewidth=1),
+            arrowprops=dict(arrowstyle="-|>", color="#DC2626", lw=1.5),
+        )
+
+    # Escalas y ejes - dinámicas según cantidad de años
+    ax_chart.set_xlim(-margin_x, n - 1 + margin_x)
+    ax_chart.set_ylim(0, max(pubs)  * 1.35)
+    ax2.set_ylim     (0, max(cites) * 1.35)
+    ax3.set_ylim     (0, max(cpp_por_año) * 1.35 if max(cpp_por_año) > 0 else 1.0)
+
+    ax_chart.set_xticks(x)
+    # Fontsize de etiquetas X dinámico
+    xtick_fontsize = 11 if n == 1 else 10 if n <= 5 else 9 if n <= 10 else 8
+    ax_chart.set_xticklabels([str(a) for a in años], fontsize=xtick_fontsize, color=C["GRIS_400"])
+    
+    ax_chart.yaxis.set_major_locator(ticker.MultipleLocator(max(1, max(pubs) // 7)))
+    ax_chart.tick_params(axis="y", labelsize=9, labelcolor=C["GRIS_400"])
+    ax3.tick_params(axis="y", labelsize=9, labelcolor="#8B5CF6")
+
+    # Escala derecha: múltiplo limpio
+    cit_step = max(1, round(max(cites) / 6 / 10) * 10) if max(cites) >= 60 else max(1, max(cites) // 6)
+    ax2.yaxis.set_major_locator(ticker.MultipleLocator(cit_step))
+    ax2.tick_params(axis="y", labelsize=9, labelcolor="#DC2626")
+    
+    # Escala CPP/año: paso más fino
+    cpp_step = max(0.5, round(max(cpp_por_año) / 5 * 2) / 2) if max(cpp_por_año) > 0 else 0.5
+    ax3.yaxis.set_major_locator(ticker.MultipleLocator(cpp_step))
+
+    ax_chart.set_ylabel("N.° de publicaciones", fontsize=9, color=C["GRIS_600"], labelpad=8)
+    ax2.set_ylabel     ("N.° de citaciones",     fontsize=9, color="#DC2626",     labelpad=8)
+    ax3.set_ylabel     ("CPP/año",               fontsize=9, color="#8B5CF6",     labelpad=8)
+
+    ax_chart.spines[["top"]].set_visible(False)
+    ax2.spines[["top"]].set_visible(False)
+    ax3.spines[["top"]].set_visible(False)
+    for sp in ["left", "right", "bottom"]:
+        ax_chart.spines[sp].set_color(C["GRIS_200"])
+        ax2.spines[sp].set_color(C["GRIS_200"])
+        ax3.spines[sp].set_color("#8B5CF6")
+
+    ax_chart.grid(axis="y", color=C["GRIS_200"], lw=0.5, zorder=0)
+    ax_chart.set_axisbelow(True)
+    ax_chart.set_facecolor("white")
+
+    # Leyenda mejorada
+    p1 = mpatches.Patch(facecolor="#A8C8E0", edgecolor="#7AAAC8",
+                        linewidth=1, label="Publicaciones")
+    p2 = plt.Line2D([0], [0], color="#DC2626", linewidth=2.5,
+                    marker="o", markersize=6,
+                    markerfacecolor="#DC2626", markeredgecolor="white",
+                    markeredgewidth=1.5, label="Citaciones")
+    p3 = plt.Line2D([0], [0], color="#8B5CF6", linewidth=2.5, linestyle="--",
+                    marker="s", markersize=5,
+                    markerfacecolor="#8B5CF6", markeredgecolor="white",
+                    markeredgewidth=1.2, label="CPP/año")
+    ax_chart.legend(handles=[p1, p2, p3], loc="upper left",
+                    fontsize=9, frameon=True, framealpha=0.95,
+                    edgecolor=C["GRIS_200"], facecolor="white", borderpad=0.8,
+                    shadow=False)
+
+    # ── Tabla de datos ────────────────────────────────────────────────────────
+    # Tamaño dinámico basado en número de años
+    # CRÍTICO: row_h * 4 debe ser <= 0.90 (espacio disponible)
+    n_years = len(años)
+    col_w = 1 / (n_years + 1)
+    
+    # Máximo permitido por fila: 0.90 / 4 = 0.225
+    if n_years <= 4:
+        row_h = 0.18
+        font_size_table = 7
+        font_size_header = 6.5
+        row_label_fontsize = 6
+    elif n_years <= 6:
+        row_h = 0.16
+        font_size_table = 6.5
+        font_size_header = 6
+        row_label_fontsize = 5.5
+    elif n_years <= 9:
+        row_h = 0.14
+        font_size_table = 5.5
+        font_size_header = 5
+        row_label_fontsize = 5
+    elif n_years <= 12:
+        row_h = 0.13
+        font_size_table = 5
+        font_size_header = 4.5
+        row_label_fontsize = 4.5
+    else:
+        row_h = 0.12
+        font_size_table = 4.5
+        font_size_header = 4
+        row_label_fontsize = 4
+    
+    # Calcular header_y_start - mantener la tabla dentro de [0.05, 0.95]
+    total_height = 4 * row_h
+    # FÓRMULA: header_y_start debe ser >= 3*row_h (para que fila3 no vaya negativa)
+    # Y preferiblemente <= 0.95 - total_height para usar el espacio
+    min_header_y = 3 * row_h + 0.05  # Fila3 nunca por debajo de 0.05
+    max_header_y = 0.95 - total_height  # Ideal para ocupar espacio
+    header_y_start = max(min_header_y, max_header_y)
+    
+    # Si resulta muy bajo, aún hay espacio abajo pero es lo mejor posible
+    if header_y_start > 0.90:
+        header_y_start = 0.90
+    
+    for j, lbl in enumerate([""] + [str(a) for a in años]):
+        ax_tbl.add_patch(FancyBboxPatch(
+            (j * col_w, header_y_start), col_w, row_h,
+            boxstyle="square,pad=0",
+            facecolor=C["GRIS_100"], edgecolor=C["GRIS_200"], linewidth=0.5,
+            transform=ax_tbl.transAxes))
+        if lbl:  # No pintar la celda vacía
+            ax_tbl.text(j * col_w + col_w / 2, header_y_start + row_h / 2, lbl,
+                        ha="center", va="center", fontsize=font_size_header,
+                        color=C["GRIS_600"], fontweight="bold",
+                        transform=ax_tbl.transAxes)
+
+    # Filas de datos (Publicaciones, Citaciones y CPP/año)
+    rows = [
+        ("Publicaciones", pubs,       C["AZUL_KPI"], "int"),
+        ("Citaciones",    cites,      C["ROJO"],     "int"),
+        ("CPP/año",       cpp_por_año, "#8B5CF6",    "float"),
+    ]
+    
+    for ri, (lbl, vals, color, val_type) in enumerate(rows):
+        ypos = header_y_start - (ri + 1) * row_h
+        
+        # Etiqueta de fila (nombre de la métrica)
+        ax_tbl.add_patch(FancyBboxPatch(
+            (0, ypos), col_w, row_h,
+            boxstyle="square,pad=0",
+            facecolor=C["GRIS_50"], edgecolor=C["GRIS_200"], linewidth=0.5,
+            transform=ax_tbl.transAxes))
+        ax_tbl.text(col_w / 2, ypos + row_h / 2, lbl,
+                    ha="center", va="center", fontsize=row_label_fontsize,
+                    color=C["GRIS_600"], fontweight="bold",
+                    transform=ax_tbl.transAxes)
+        
+        # Celdas de datos (valores por año)
+        max_val = max(vals) if vals else 1
+        for j, v in enumerate(vals):
+            # Colorear el máximo con fondo  
+            is_peak = v == max_val and v > 0
+            if is_peak:
+                if lbl == "Citaciones":
+                    bg = "#FFE5CC"  # Naranja claro
+                    txc = "#D97706"  # Naranja oscuro
+                else:
+                    bg = "#DBEAFE"  # Azul claro
+                    txc = "#1E40AF"  # Azul oscuro
+            else:
+                bg = "white"
+                txc = color
+            
+            ax_tbl.add_patch(FancyBboxPatch(
+                ((j + 1) * col_w, ypos), col_w, row_h,
+                boxstyle="square,pad=0",
+                facecolor=bg, edgecolor=C["GRIS_200"], linewidth=0.5,
+                transform=ax_tbl.transAxes))
+            
+            # Formatear valores según tipo
+            if val_type == "float":
+                # CPP/año: exactamente 1 decimal
+                display_val = f"{v:.1f}"
+            else:
+                # Publicaciones y Citaciones: enteros
+                display_val = str(int(v))
+            
+            # Fontsize dinámico para valores largos
+            adjusted_fontsize = font_size_table
+            if len(display_val) > 3:
+                adjusted_fontsize = max(font_size_table - 1, 3)
+            
+            ax_tbl.text((j + 1) * col_w + col_w / 2, ypos + row_h / 2,
+                        display_val, ha="center", va="center",
+                        fontsize=adjusted_fontsize, color=txc, 
+                        fontweight="bold" if is_peak else "500",
+                        transform=ax_tbl.transAxes)
+
+
+    # ── Cuadro de análisis automático ─────────────────────────────────────────
+    positivos, negativos, notas = generar_hallazgos(
+        total_arts=total_arts, total_citas=total_citas,
+        h_index=h_index, cpp=cpp,
+        mediana=mediana_citas, pct_citados=pct_citados,
+        años=años, pubs=pubs, cites=cites,
+        año_pico=año_pico, año_max_pub=año_max_pub,
+        campo=campo,
+    )
+    # NOTA: Los análisis se renderizarán EN EL PDF, no en la imagen PNG
+    # dibujar_analisis(ax_ana, positivos, negativos, C, notas)
+
+
+    # ── Footer ────────────────────────────────────────────────────────────────
+    ax_ftr.plot([0, 1], [1, 1], color=C["GRIS_200"], lw=0.8,
+                transform=ax_ftr.transAxes, clip_on=False)
+    ax_ftr.text(0.01, 0.4, f"• {institution_name}",
+                fontsize=8, color=C["GRIS_500"],
+                transform=ax_ftr.transAxes, va="center")
+    ax_ftr.text(0.99, 0.4, f"Extracción: {fecha_ext}",
+                fontsize=7.5, color=C["GRIS_500"], ha="right",
+                fontfamily="monospace",
+                transform=ax_ftr.transAxes, va="center")
+
+    return fig
+

@@ -42,6 +42,7 @@ COLUMNS = [
     ("Journal", "source_journal", 35),
     ("DOI", "doi", 25),
     ("ISSN", "issn", 15),
+    ("E-ISSN", "eissn", 15),
     ("Tipo", "publication_type", 15),
     ("Citas", "citation_count", 8),
     ("Open Access", "is_open_access", 12),
@@ -53,6 +54,8 @@ def extract_publications_for_export(
     query: str,
     author_id: str,
     affiliation_ids: Optional[List[str]] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
     verbose: bool = False,
 ) -> Tuple[List[dict], str]:
     """
@@ -88,13 +91,26 @@ def extract_publications_for_export(
         # Convertir StandardRecord a dict y ordenar por año descendente
         publications = []
         for rec in records:
+            # Filtrar por año
+            if rec.publication_year:
+                if year_from and rec.publication_year < year_from:
+                    continue
+                if year_to and rec.publication_year > year_to:
+                    continue
+            
+            # Extraer E-ISSN desde raw_data
+            eissn_value = ""
+            if rec.raw_data and isinstance(rec.raw_data, dict):
+                eissn_value = rec.raw_data.get("eissn") or ""
+            
             pub_dict = {
                 'publication_year': rec.publication_year,
                 'title': rec.title,
                 'authors': ', '.join([a.get('name', '') for a in rec.authors]) if rec.authors else '',
                 'source_journal': rec.source_journal,
                 'doi': rec.doi,
-                'issn': rec.issn,
+                'issn': rec.issn or "",
+                'eissn': eissn_value,
                 'publication_type': rec.publication_type,
                 'citation_count': rec.citation_count or 0,
                 'is_open_access': 'Sí' if rec.is_open_access else 'No',
@@ -107,7 +123,7 @@ def extract_publications_for_export(
         publications.sort(key=lambda x: x['publication_year'] or 0, reverse=True)
         
         if verbose:
-            logger.info(f"✓ Extraídas {len(publications)} publicaciones para {investigator_name}")
+            logger.info(f"✓ Extraídas {len(publications)} publicaciones para {investigator_name} (filtradas por años {year_from}-{year_to})")
         
         return publications, investigator_name
     
@@ -210,29 +226,101 @@ def generate_publications_excel_bytes(
         ws_summary[f'A{row}'].alignment = Alignment(wrap_text=True)
         ws_summary.merge_cells(f'A{row}:B{row}')
     
-    # Publicaciones por año
+    # Publicaciones por año y tipo — con formato de tabla profesional
     row += 3
-    ws_summary[f'A{row}'] = "PUBLICACIONES POR AÑO"
-    ws_summary[f'A{row}'].font = Font(bold=True, size=12)
+    ws_summary[f'A{row}'] = "PUBLICACIONES POR AÑO Y TIPO"
+    ws_summary[f'A{row}'].font = Font(bold=True, size=12, color="FFFFFF")
+    ws_summary[f'A{row}'].fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+    ws_summary.merge_cells(f'A{row}:C{row}')
+    ws_summary[f'A{row}'].alignment = Alignment(horizontal='center', vertical='center')
     
+    # Bordes y altura
+    thin_border = Border(
+        left=Side(style='thin', color='1F4E78'),
+        right=Side(style='thin', color='1F4E78'),
+        top=Side(style='thin', color='1F4E78'),
+        bottom=Side(style='thin', color='1F4E78')
+    )
+    ws_summary[f'A{row}'].border = thin_border
+    ws_summary.row_dimensions[row].height = 20
+    
+    # Encabezados de tabla
     row += 1
-    ws_summary[f'A{row}'] = "Año"
-    ws_summary[f'B{row}'] = "Cantidad"
-    ws_summary[f'A{row}'].font = SUMMARY_FONT
-    ws_summary[f'B{row}'].font = SUMMARY_FONT
-    ws_summary[f'A{row}'].fill = SUMMARY_FILL
-    ws_summary[f'B{row}'].fill = SUMMARY_FILL
+    header_row = row
+    headers = ["Año", "Tipo de Publicación", "Cantidad"]
+    for col, header in enumerate(headers, 1):
+        cell = ws_summary.cell(row=row, column=col)
+        cell.value = header
+        cell.font = Font(bold=True, size=10, color="FFFFFF")
+        cell.fill = PatternFill(fill_type="solid", fgColor="4472C4")
+        cell.alignment = Alignment(horizontal='center', vertical='center', wrap_text=True)
+        cell.border = thin_border
     
-    pub_by_year = {}
+    ws_summary.row_dimensions[row].height = 18
+    
+    # Datos de tabla
+    pub_by_year_type = {}
     for pub in publications:
         year = pub['publication_year']
+        pub_type = pub['publication_type'] or 'Unknown'
+        
         if year:
-            pub_by_year[year] = pub_by_year.get(year, 0) + 1
+            if year not in pub_by_year_type:
+                pub_by_year_type[year] = {}
+            pub_by_year_type[year][pub_type] = pub_by_year_type[year].get(pub_type, 0) + 1
     
-    for year in sorted(pub_by_year.keys(), reverse=True):
-        row += 1
-        ws_summary[f'A{row}'] = year
-        ws_summary[f'B{row}'] = pub_by_year[year]
+    # Colores alternos para años
+    year_colors = ["E7E6F7", "F2F2F2"]
+    current_year_color_idx = 0
+    
+    # Mostrar años en orden descendente
+    for year in sorted(pub_by_year_type.keys(), reverse=True):
+        year_color = year_colors[current_year_color_idx % 2]
+        current_year_color_idx += 1
+        
+        pub_types = sorted(pub_by_year_type[year].keys())
+        num_types = len(pub_types)
+        
+        # Primera fila del año (con el año)
+        for idx_type, pub_type in enumerate(pub_types):
+            row += 1
+            count = pub_by_year_type[year][pub_type]
+            
+            # Columna A: Año (solo en la primera fila del grupo)
+            cell_year = ws_summary.cell(row=row, column=1)
+            if idx_type == 0:
+                cell_year.value = year
+                cell_year.font = Font(bold=True, size=11, color="FFFFFF")
+                cell_year.fill = PatternFill(fill_type="solid", fgColor="1F4E78")
+                cell_year.alignment = Alignment(horizontal='center', vertical='center')
+                if num_types > 1:
+                    # Merge celda de año si hay múltiples tipos
+                    ws_summary.merge_cells(f'A{row}:A{row + num_types - 1}')
+            
+            # Columna B: Tipo de publicación
+            cell_type = ws_summary.cell(row=row, column=2)
+            cell_type.value = pub_type
+            cell_type.font = Font(size=10)
+            cell_type.fill = PatternFill(fill_type="solid", fgColor=year_color)
+            cell_type.alignment = Alignment(horizontal='left', vertical='center', wrap_text=True)
+            
+            # Columna C: Cantidad
+            cell_count = ws_summary.cell(row=row, column=3)
+            cell_count.value = count
+            cell_count.font = Font(size=10, bold=True, color="1F4E78")
+            cell_count.fill = PatternFill(fill_type="solid", fgColor=year_color)
+            cell_count.alignment = Alignment(horizontal='center', vertical='center')
+            
+            # Bordes
+            for col in range(1, 4):
+                ws_summary.cell(row=row, column=col).border = thin_border
+            
+            ws_summary.row_dimensions[row].height = 16
+    
+    # Ajustar anchos de columna
+    ws_summary.column_dimensions['A'].width = 12
+    ws_summary.column_dimensions['B'].width = 35
+    ws_summary.column_dimensions['C'].width = 12
     
     # ────────────────────────────────────────────────────────────────────────────
     # HOJA 2: DETALLE
@@ -287,6 +375,8 @@ def generate_publications_excel_bytes(
 def generate_publications_excel_file(
     author_id: str,
     affiliation_ids: Optional[List[str]] = None,
+    year_from: Optional[int] = None,
+    year_to: Optional[int] = None,
     output_dir: Path = Path("reports/exports"),
 ) -> Dict:
     """
@@ -321,6 +411,8 @@ def generate_publications_excel_file(
             query=query,
             author_id=author_id,
             affiliation_ids=affiliation_ids,
+            year_from=year_from,
+            year_to=year_to,
             verbose=True,
         )
         

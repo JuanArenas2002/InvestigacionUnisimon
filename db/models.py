@@ -567,6 +567,115 @@ class ReconciliationLog(Base):
 
 
 # =============================================================
+# BIBLIOMETRIC ANALYSIS: DISCIPLINARY FIELDS & RESEARCH THRESHOLDS
+# =============================================================
+
+class DisciplinaryField(Base):
+    """
+    Campos disciplinares para evaluación bibliométrica.
+    Define 5 grandes áreas de investigación con criterios diferenciados.
+    
+    Basado en:
+    - Hirsch (2005): The h-index as a research performance indicator
+    - Bornmann & Daniel (2009): Does the h-index have predictive power?
+    - Minciencias (2022): Evaluación de investigadores
+    - SCImago (2023): Journal ranking by discipline
+    """
+    __tablename__ = "disciplinary_fields"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    field_code: Mapped[str] = mapped_column(
+        String(50), nullable=False, unique=True, index=True,
+        comment="CIENCIAS_SALUD, CIENCIAS_BASICAS, INGENIERIA, CIENCIAS_SOCIALES, ARTES_HUMANIDADES"
+    )
+    field_name_es: Mapped[str] = mapped_column(String(200), nullable=False)
+    field_name_en: Mapped[str] = mapped_column(String(200), nullable=False)
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    thresholds = relationship("FieldParameter", back_populates="field", cascade="all, delete-orphan")
+
+    def __repr__(self):
+        return f"<DisciplinaryField(id={self.id}, code='{self.field_code}', es='{self.field_name_es}')>"
+
+
+class FieldParameter(Base):
+    """
+    Parámetros genéricos por campo disciplinar.
+    
+    Reemplaza ResearchThreshold con una estructura más flexible que soporta
+    CUALQUIER parámetro (umbrales, pesos, coeficientes, configuraciones).
+    
+    Tipos de parámetros soportados:
+    - UMBRAL: h_alto, h_medio, cpp_alto, cpp_medio, pct_citados, pct_pico, etc.
+    - PESO: ponderación para cálculos de análisis (ej: weight_h_index)
+    - COEFICIENTE: factores de ajuste (ej: factor_concentracion)
+    - CONFIG: configuración general (ej: min_publications, max_years_window)
+    
+    Conversión automática de tipos (el valor se almacena como string pero se
+    convierte según parameter_type):
+    - float: número con decimales
+    - int: número entero
+    - bool: true/false
+    - json: objeto JSON complejo
+    
+    Fuentes:
+    - Hirsch (2005), Bornmann & Daniel (2009), Minciencias (2022), SCImago (2023)
+    """
+    __tablename__ = "field_parameters"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    field_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("disciplinary_fields.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    parameter_name: Mapped[str] = mapped_column(
+        String(100), nullable=False,
+        comment="Nombre único del parámetro (ej: h_alto, weight_h_index, min_publications)"
+    )
+    parameter_type: Mapped[str] = mapped_column(
+        String(15), nullable=False, default="float",
+        comment="Tipo: float, int, bool, json, string"
+    )
+    value: Mapped[str] = mapped_column(
+        Text, nullable=False,
+        comment="Valor almacenado como string (se convierte según parameter_type)"
+    )
+    description: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    field = relationship("DisciplinaryField", back_populates="thresholds")
+
+    __table_args__ = (
+        UniqueConstraint("field_id", "parameter_name", name="uq_field_parameter"),
+        Index("ix_field_param_name", "field_id", "parameter_name"),
+    )
+
+    def get_value(self):
+        """Convierte value según parameter_type."""
+        import json
+        if self.parameter_type == "int":
+            return int(self.value)
+        elif self.parameter_type == "float":
+            return float(self.value)
+        elif self.parameter_type == "bool":
+            return self.value.lower() in ("true", "1", "yes")
+        elif self.parameter_type == "json":
+            return json.loads(self.value)
+        else:  # string
+            return self.value
+
+    def __repr__(self):
+        return f"<FieldParameter(field_id={self.field_id}, param='{self.parameter_name}', value={self.value})>"
+
+
+# Alias para compatibilidad (FieldParameter reemplaza ResearchThreshold)
+ResearchThreshold = FieldParameter
+
+
+# =============================================================
 # HELPERS PARA CONSULTAS CROSS-SOURCE
 # =============================================================
 
@@ -647,3 +756,32 @@ def count_source_records_by_source(session) -> dict:
     for sname, model_cls in SOURCE_MODELS.items():
         counts[sname] = session.query(func.count(model_cls.id)).scalar() or 0
     return counts
+
+
+def get_thresholds_by_field(session, field_code: str) -> dict:
+    """
+    Obtiene todos los parámetros de una disciplina como diccionario.
+    
+    Automáticamente convierte tipos según parameter_type.
+    
+    Args:
+        session: SQLAlchemy Session
+        field_code: Código de campo (ej: 'CIENCIAS_SALUD')
+    
+    Returns:
+        dict con estructura {parameter_name: converted_value}
+        Ej: {"h_alto": 15.0, "h_medio": 8.0, ...}
+    
+    Raises:
+        ValueError: Si el campo no existe
+    """
+    field = session.query(DisciplinaryField).filter_by(field_code=field_code).first()
+    if not field:
+        raise ValueError(f"Campo disciplinar no encontrado: {field_code}")
+    
+    parameters = {}
+    for param in field.thresholds:
+        parameters[param.parameter_name] = param.get_value()
+    
+    return parameters
+
