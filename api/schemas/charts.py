@@ -57,18 +57,47 @@ class PublicationYearData(BaseModel):
     year: int
     count: int
     percentage: float = Field(description="Porcentaje del total")
+    citations: int = Field(default=0, description="Total de citaciones ese año")
+    avg_citations_per_publication: float = Field(default=0.0, description="Promedio de citas por publicación")
+
+
+class PublicationDetail(BaseModel):
+    """Detalle de una publicación individual"""
+    id: int
+    title: str
+    year: int
+    doi: Optional[str] = None
+    citations: int = Field(default=0, description="Número de citaciones")
+    publication_type: Optional[str] = None
+    source_journal: Optional[str] = None
+    url: Optional[str] = None
+    authors_count: int = Field(default=1, description="Número total de autores")
+    is_open_access: bool = Field(default=False)
+
+
+class CitationYearData(BaseModel):
+    """Datos de citaciones por año"""
+    year: int
+    citations: int
+    publications: int
 
 
 class ChartStatistics(BaseModel):
     """Estadísticas del gráfico"""
     total_publications: int
+    total_citations: int
     min_year: int
     max_year: int
     avg_per_year: float
     peak_year: int
     peak_publications: int
     active_years: int
+    h_index: Optional[int] = None
+    citation_per_publication: float = Field(default=0.0, description="Promedio de citaciones por publicación")
+    percent_cited: float = Field(default=0.0, description="Porcentaje de publicaciones citadas")
     publications_by_year: List[PublicationYearData]
+    publications_detail: Optional[List[PublicationDetail]] = Field(None, description="Lista completa de publicaciones")
+    citations_by_year: Optional[List[CitationYearData]] = Field(None, description="Citaciones agregadas por año")
 
 
 class InvestigatorChartResponse(BaseModel):
@@ -127,6 +156,103 @@ class ChartGenerationError(BaseModel):
                 "details": "La query no devolvió resultados. Verifique AU-ID y AF-ID."
             }
         }
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# SCHEMAS PARA ANÁLISIS SCOPUS (DATOS SOLO)
+# ════════════════════════════════════════════════════════════════════════════════
+
+class ScopusAnalysisRequest(BaseModel):
+    """Solicitud para analizar datos de Scopus sin generar gráficos ni Excel"""
+    
+    query: Optional[str] = Field(
+        None,
+        description="Query personalizada de Scopus (ej: 'TITLE-ABS-KEY(machine learning) AND YEAR > 2020')",
+        example="TITLE-ABS-KEY(machine learning) AND PUBYEAR > 2020"
+    )
+    author_id: Optional[str] = Field(
+        None,
+        description="AU-ID del autor en Scopus (alternativa a query)",
+        example="57193767797"
+    )
+    affiliation_ids: Optional[List[str]] = Field(
+        None,
+        description="AF-IDs para filtrar por institución (usado con author_id)",
+        example=["60106970", "60112687"]
+    )
+    year_from: Optional[int] = Field(
+        None,
+        description="Año inicial (filtro adicional)",
+        ge=1900,
+        le=2100
+    )
+    year_to: Optional[int] = Field(
+        None,
+        description="Año final (filtro adicional)",
+        ge=1900,
+        le=2100
+    )
+    max_results: Optional[int] = Field(
+        None,
+        description="Máximo de publicaciones a analizar (default: 5000)",
+        ge=1,
+        le=10000
+    )
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "query": "TITLE-ABS-KEY(machine learning) AND PUBYEAR > 2020"
+            }
+        }
+
+
+class ScopusAnalysisResponse(BaseModel):
+    """Respuesta con análisis completo de datos Scopus"""
+    
+    success: bool
+    message: str
+    query_used: str
+    total_publications: int
+    total_citations: int
+    
+    # Estadísticas
+    statistics: ChartStatistics
+    
+    # Datos para graficar (sin generar imágenes)
+    publications_by_year: List[PublicationYearData]
+    citations_by_year: List[CitationYearData]
+    publications_detail: List[PublicationDetail]
+    
+    # Análisis adicional
+    top_cited_publications: Optional[List[PublicationDetail]] = Field(
+        None,
+        description="Top 10 publicaciones más citadas"
+    )
+    publication_types_distribution: Optional[Dict[str, int]] = Field(
+        None,
+        description="Distribución de tipos de publicación"
+    )
+    journals_distribution: Optional[Dict[str, int]] = Field(
+        None,
+        description="Top 20 revistas/journals más frecuentes"
+    )
+    
+    # Análisis profesional completo
+    findings_positive: Optional[List[str]] = Field(
+        None,
+        description="Hallazgos positivos del perfil bibliométrico"
+    )
+    findings_negative: Optional[List[str]] = Field(
+        None,
+        description="Aspectos a mejorar identificados en el análisis"
+    )
+    findings_notes: Optional[List[str]] = Field(
+        None,
+        description="Notas aclaratorias sobre las métricas (ej: sobre recencia)"
+    )
+    
+    generated_at: str
 
 
 # ════════════════════════════════════════════════════════════════════════════════

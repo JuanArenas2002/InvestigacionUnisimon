@@ -475,7 +475,7 @@ def detect_duplicate_publications(
 @router.get("/{pub_id}", response_model=PublicationDetail, summary="Detalle de publicación")
 def get_publication(pub_id: int, db: Session = Depends(get_db)):
     """Detalle de una publicación con registros externos y autores."""
-    pub = db.query(CanonicalPublication).get(pub_id)
+    pub = db.get(CanonicalPublication, pub_id)
     if not pub:
         raise HTTPException(404, "Publicación no encontrada")
 

@@ -7,6 +7,7 @@ Se integra con Scopus y retorna archivos PNG.
 """
 
 import logging
+import statistics
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, List
@@ -31,19 +32,633 @@ from api.schemas.charts import (
     GenerateChartRequest,
     GenerateChartResponse,
     GenerateChartErrorResponse,
+    ChartStatistics,
+    PublicationYearData,
+    PublicationDetail,
+    CitationYearData,
+    ScopusAnalysisRequest,
+    ScopusAnalysisResponse,
 )
-from api.services.chart_generator import generate_investigator_chart_file, CampoDisciplinar
+from api.schemas.author_metrics import (
+    AuthorGeneralMetricsResponse,
+    AuthorMetricsErrorResponse,
+)
+from api.services.author_metrics_service import AuthorMetricsService
+from api.services.chart_generator import generate_investigator_chart_file
 from api.services.excel_exporter import generate_publications_excel_file
 from api.services.data_provider import fetch_author_data
 from api.services.graph_renderer import render_author_chart
 from api.services.pdf_reporter import generate_analysis_report
-from api.services.analysis import generar_hallazgos
+from api.services.analysis import generar_hallazgos, CampoDisciplinar
+from extractors.scopus import ScopusExtractor
+from db.models import Author
+from config import ScopusConfig
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/authors/charts", tags=["Gráficos de Investigadores"])
 
 # Ruta absoluta para almacenar gráficos
 CHARTS_OUTPUT_DIR = Path(__file__).parent.parent.parent / "reports" / "charts"
+
+
+# ── POST /authors/charts/analyze-scopus ──────────────────────────────────────
+
+@router.post(
+    "/analyze-default",
+    summary="Analizar Scopus de un autor por su ID local",
+    response_model=ScopusAnalysisResponse,
+    responses={
+        200: {"description": "Análisis completado exitosamente"},
+        404: {"model": ChartGenerationError, "description": "Autor no encontrado o sin ID Scopus"},
+        500: {"model": ChartGenerationError, "description": "Error en Scopus API"},
+    }
+)
+def analyze_scopus_default(
+    author_id: int = Query(..., description="ID del autor en la base de datos local"),
+    year_from: Optional[int] = Query(None, description="Año inicial para filtrar publicaciones", ge=1900, le=2100),
+    year_to: Optional[int] = Query(None, description="Año final para filtrar publicaciones", ge=1900, le=2100),
+    campo: str = Query("CIENCIAS_SALUD", description="Campo disciplinar para umbrales específicos", regex="^(CIENCIAS_SALUD|CIENCIAS_BASICAS|INGENIERIA|CIENCIAS_SOCIALES|ARTES_HUMANIDADES)$"),
+    db: Session = Depends(get_db),
+):
+    """
+    Analiza publicaciones de un autor en Scopus usando su ID local.
+    
+    **Proceso:**
+    1. Busca el autor en la base de datos local
+    2. Verifica si tiene `scopus_id` (AU-ID de Scopus)
+    3. Si no lo tiene, retorna alerta
+    4. Si lo tiene, busca sus publicaciones en Scopus con filtros opcionales
+    5. Devuelve datos analíticos listos para graficar con análisis profesional
+    
+    **Parámetros:**
+    - `author_id`: ID del autor en la BD (integer) - **requerido**
+    - `year_from`: Año inicial para filtrar (integer, opcional)
+    - `year_to`: Año final para filtrar (integer, opcional)
+    - `campo`: Campo disciplinar para aplicar umbrales específicos:
+      - `CIENCIAS_SALUD` (default)
+      - `CIENCIAS_BASICAS`
+      - `INGENIERIA`
+      - `CIENCIAS_SOCIALES`
+      - `ARTES_HUMANIDADES`
+    
+    **Retorna:**
+    - Estadísticas: total pubs, citas, H-index, CPP
+    - Datos por año (publicaciones y citas)
+    - Lista completa de publicaciones con detalles
+    - Top 10 más citadas
+    - Distribución de tipos y revistas
+    - **Análisis profesional:** hallazgos positivos, aspectos a mejorar, notas
+    
+    **Ejemplos:**
+    ```bash
+    # Solo autor (último 5 años)
+    curl -X POST "http://localhost:8000/api/authors/charts/analyze-default?author_id=123"
+    
+    # Con rango de años
+    curl -X POST "http://localhost:8000/api/authors/charts/analyze-default?author_id=123&year_from=2015&year_to=2025"
+    
+    # Con campo disciplinar
+    curl -X POST "http://localhost:8000/api/authors/charts/analyze-default?author_id=123&campo=INGENIERIA"
+    
+    # Completo
+    curl -X POST "http://localhost:8000/api/authors/charts/analyze-default?author_id=123&year_from=2020&year_to=2025&campo=CIENCIAS_BASICAS"
+    ```
+    """
+    
+    try:
+        # 0. Validar parámetros de años
+        if year_from and year_to and year_from > year_to:
+            raise ValueError(
+                f"El año inicial ({year_from}) no puede ser mayor que el año final ({year_to}). "
+                f"Por favor, proporcione un rango válido: year_from <= year_to"
+            )
+        
+        # 1. Buscar autor en BD
+        author = db.query(Author).filter(Author.id == author_id).first()
+        
+        if not author:
+            logger.warning(f"Autor ID {author_id} no encontrado en BD")
+            raise ValueError(f"Autor con ID {author_id} no existe en la base de datos")
+        
+        logger.info(f"Autor encontrado: {author.name}")
+        
+        # 2. Verificar si tiene scopus_id
+        if not author.scopus_id:
+            logger.warning(f"Autor {author.name} (ID {author_id}) no tiene scopus_id")
+            raise ValueError(
+                f"El autor '{author.name}' no tiene ID Scopus (AU-ID) registrado. "
+                f"Por favor, enriquezca el perfil del autor con su ID de Scopus."
+            )
+        
+        logger.info(f"Scopus ID encontrado: {author.scopus_id}")
+        
+        # 3. Construir query de Scopus con filtros opcionales
+        query_str = f"AU-ID({author.scopus_id})"
+        
+        # Agregar afiliaciones institucionales (si están configuradas)
+        scopus_config = ScopusConfig()
+        affiliation_ids = scopus_config.affiliation_ids
+        if affiliation_ids:
+            aff_part = " OR ".join([f"AF-ID({aid})" for aid in affiliation_ids])
+            query_str += f" AND ({aff_part})"
+            logger.info(f"Aplicando afiliaciones institucionales: {affiliation_ids}")
+        
+        # Agregar filtro de años si se proporcionan
+        # Scopus usa > y < en lugar de >= y <=
+        if year_from or year_to:
+            year_filters = []
+            if year_from:
+                year_filters.append(f"PUBYEAR > {year_from - 1}")  # > 2019 en lugar de >= 2020
+            if year_to:
+                year_filters.append(f"PUBYEAR < {year_to + 1}")    # < 2027 en lugar de <= 2026
+            if year_filters:
+                year_filter_str = " AND ".join(year_filters)
+                query_str += f" AND {year_filter_str}"
+        
+        # Log de la query construida
+        logger.info(f"Query Scopus: {query_str}")
+        
+        # 4. Extraer de Scopus
+        scopus = ScopusExtractor()
+        
+        try:
+            standard_records = scopus.extract(
+                query=query_str,
+                max_results=5000,
+            )
+        except Exception as e:
+            logger.error(f"Error extrayendo de Scopus para {author.name}: {e}")
+            raise ValueError(f"Error al consultar Scopus: {str(e)}")
+        
+        if not standard_records:
+            raise ValueError(
+                f"No se encontraron publicaciones en Scopus para el autor '{author.name}' "
+                f"con ID Scopus {author.scopus_id}"
+            )
+        
+        logger.info(f"Extraídos {len(standard_records)} registros de Scopus para {author.name}")
+        
+        # Convertir a diccionarios
+        publications = [r.to_dict() for r in standard_records]
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ANÁLISIS
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        total_pubs = len(publications)
+        total_citations = sum(int(p.get('citation_count') or 0) for p in publications)
+        
+        # 1. Datos por año
+        by_year = {}
+        for pub in publications:
+            year = int(pub.get('publication_year') or 0)
+            if year not in by_year:
+                by_year[year] = {'count': 0, 'citations': 0}
+            by_year[year]['count'] += 1
+            by_year[year]['citations'] += int(pub.get('citation_count') or 0)
+        
+        years = sorted(by_year.keys())
+        
+        publications_by_year = [
+            PublicationYearData(
+                year=year,
+                count=by_year[year]['count'],
+                percentage=round((by_year[year]['count'] / total_pubs) * 100, 2),
+                citations=by_year[year]['citations'],
+                avg_citations_per_publication=round(
+                    by_year[year]['citations'] / by_year[year]['count'], 2
+                ) if by_year[year]['count'] > 0 else 0,
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        citations_by_year = [
+            CitationYearData(
+                year=year,
+                citations=by_year[year]['citations'],
+                publications=by_year[year]['count'],
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        # 2. Detalles de publicaciones
+        publications_detail = [
+            PublicationDetail(
+                id=idx,
+                title=pub.get('title', 'Unknown'),
+                year=int(pub.get('publication_year') or 0),
+                doi=pub.get('doi'),
+                citations=int(pub.get('citation_count') or 0),
+                publication_type=pub.get('publication_type'),
+                source_journal=pub.get('source_journal'),
+                url=pub.get('url'),
+                authors_count=len(pub.get('authors', [])),
+                is_open_access=pub.get('is_open_access', False),
+            )
+            for idx, pub in enumerate(publications, 1)
+        ]
+        
+        # 3. Top 10 más citadas
+        top_cited = sorted(publications_detail, key=lambda x: x.citations, reverse=True)[:10]
+        
+        # 4. H-index
+        sorted_citations = sorted(
+            [p.get('citation_count', 0) or 0 for p in publications],
+            reverse=True
+        )
+        h_index = sum(1 for i, c in enumerate(sorted_citations, 1) if c >= i)
+        
+        # 5. Estadísticas
+        cpp = round(total_citations / total_pubs, 2) if total_pubs > 0 else 0
+        percent_cited = round(
+            (sum(1 for p in publications if int(p.get('citation_count', 0) or 0) > 0) / total_pubs) * 100, 2
+        )
+        
+        # 6. Distribución de tipos de publicación
+        pub_types = {}
+        for pub in publications:
+            ptype = pub.get('publication_type', 'Unknown')
+            pub_types[ptype] = pub_types.get(ptype, 0) + 1
+        
+        # 7. Distribución de revistas (top 20)
+        journals = {}
+        for pub in publications:
+            journal = pub.get('source_journal', 'Unknown')
+            journals[journal] = journals.get(journal, 0) + 1
+        
+        top_journals = dict(sorted(journals.items(), key=lambda x: x[1], reverse=True)[:20])
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ANÁLISIS PROFESIONAL COMPLETO
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Calcular mediana de citaciones
+        mediana_citas = sorted(
+            [int(p.get('citation_count', 0) or 0) for p in publications],
+            reverse=True
+        )
+        mediana = statistics.median(mediana_citas) if mediana_citas else 0.0
+        
+        # Preparar listas para generar hallazgos
+        years_list = sorted(by_year.keys())
+        pubs_list = [by_year[year]['count'] for year in years_list]
+        cites_list = [by_year[year]['citations'] for year in years_list]
+        
+        # Año de máximo impacto y máxima producción
+        año_pico = max(years_list, key=lambda k: by_year[k]['citations']) if years_list else 0
+        año_max_pub = max(years_list, key=lambda k: by_year[k]['count']) if years_list else 0
+        
+        # Generar hallazgos
+        positivos, negativos, notas = generar_hallazgos(
+            total_arts=total_pubs,
+            total_citas=total_citations,
+            h_index=h_index,
+            cpp=cpp,
+            mediana=mediana,
+            pct_citados=percent_cited,
+            años=years_list,
+            pubs=pubs_list,
+            cites=cites_list,
+            año_pico=año_pico,
+            año_max_pub=año_max_pub,
+            campo=CampoDisciplinar[campo],  # Usar el campo seleccionado
+            db_session=db
+        )
+        
+        # Construir respuesta
+        response = ScopusAnalysisResponse(
+            success=True,
+            message=f"Análisis de {author.name} completado: {total_pubs} publicaciones, {total_citations} citaciones",
+            query_used=query_str,
+            total_publications=total_pubs,
+            total_citations=total_citations,
+            statistics=ChartStatistics(
+                total_publications=total_pubs,
+                total_citations=total_citations,
+                min_year=min(years) if years else 0,
+                max_year=max(years) if years else 0,
+                avg_per_year=round(total_pubs / len(years), 2) if years else 0,
+                peak_year=max(by_year.keys(), key=lambda k: by_year[k]['count']),
+                peak_publications=max(by_year.values(), key=lambda v: v['count'])['count'],
+                active_years=len(years),
+                h_index=h_index,
+                citation_per_publication=cpp,
+                percent_cited=percent_cited,
+                publications_by_year=publications_by_year,
+                publications_detail=publications_detail,
+                citations_by_year=citations_by_year,
+            ),
+            publications_by_year=publications_by_year,
+            citations_by_year=citations_by_year,
+            publications_detail=publications_detail,
+            top_cited_publications=top_cited,
+            publication_types_distribution=pub_types,
+            journals_distribution=top_journals,
+            findings_positive=positivos,
+            findings_negative=negativos,
+            findings_notes=notas,
+            generated_at=datetime.now().isoformat(),
+        )
+        
+        logger.info(f"Análisis de {author.name} completado exitosamente")
+        return response
+        
+    except ValueError as e:
+        logger.warning(f"Validación: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"Error analizando Scopus: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en análisis: {str(e)}"
+        )
+
+
+# ── POST /authors/charts/analyze-scopus ──────────────────────────────────────
+
+@router.post(
+    "/analyze-scopus",
+    summary="Analizar datos de Scopus sin generar gráficos ni Excel",
+    response_model=ScopusAnalysisResponse,
+    responses={
+        200: {"description": "Análisis completado exitosamente"},
+        400: {"model": ChartGenerationError, "description": "Parámetros inválidos"},
+        404: {"model": ChartGenerationError, "description": "No se encontraron datos"},
+        500: {"model": ChartGenerationError, "description": "Error en Scopus API"},
+    }
+)
+def analyze_scopus(
+    request: ScopusAnalysisRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Analiza datos de Scopus y devuelve **todos los datos procesados en JSON**.
+    
+    **NO genera**: gráficos (PNG), reportes (PDF), ni Excel.
+    **SÍ devuelve**: datos tabulares listos para usarse en cualquier visualización.
+    
+    **Parámetros:**
+    
+    Opción 1 - Por query personalizada:
+    ```json
+    {
+        "query": "TITLE-ABS-KEY(machine learning) AND PUBYEAR > 2020"
+    }
+    ```
+    
+    Opción 2 - Por autor + institución:
+    ```json
+    {
+        "author_id": "57193767797",
+        "affiliation_ids": ["60106970", "60112687"],
+        "year_from": 2020,
+        "year_to": 2025
+    }
+    ```
+    
+    **Retorna:**
+    - Estadísticas: total pubs, citas, H-index, CPP, etc.
+    - Datos por año (publicaciones y citas)
+    - Lista completa de publicaciones con detalles
+    - Top 10 más citadas
+    - Distribución de tipos y revistas
+    
+    **Casos de uso:**
+    - Exportar a herramientas de BI (Power BI, Tableau)
+    - Integración con dashboards personalizados
+    - Análisis avanzado con datos crudos
+    - APIs de terceros
+    """
+    
+    try:
+        logger.info(f"Analizando Scopus: query={request.query}, author_id={request.author_id}")
+        
+        # Construir query según parámetros
+        if request.query:
+            query_str = request.query
+        elif request.author_id:
+            query_str = f"AU-ID({request.author_id})"
+            
+            # Usar afiliaciones proporcionadas o del config
+            affiliation_ids = request.affiliation_ids
+            if not affiliation_ids:
+                # Usar afiliaciones del config (.env)
+                scopus_config = ScopusConfig()
+                affiliation_ids = scopus_config.affiliation_ids
+                if affiliation_ids:
+                    logger.info(f"Usando afiliaciones institucionales del config: {affiliation_ids}")
+            
+            if affiliation_ids:
+                aff_part = " OR ".join([f"AF-ID({aid})" for aid in affiliation_ids])
+                query_str += f" AND ({aff_part})"
+        else:
+            raise ValueError("Debes proporcionar 'query' o 'author_id'")
+        
+        # Extraer de Scopus
+        scopus = ScopusExtractor()
+        max_results = request.max_results or 5000
+        
+        try:
+            standard_records = scopus.extract(
+                query=query_str,
+                max_results=max_results,
+            )
+        except Exception as e:
+            logger.error(f"Error extrayendo de Scopus: {e}")
+            raise ValueError(f"Error en Scopus API: {str(e)}")
+        
+        if not standard_records:
+            raise ValueError("No se encontraron publicaciones con los parámetros especificados")
+        
+        logger.info(f"Extraídos {len(standard_records)} registros de Scopus")
+        
+        # Convertir a diccionarios
+        publications = [r.to_dict() for r in standard_records]
+        
+        # Filtrar por años si se especifican
+        if request.year_from or request.year_to:
+            publications = [
+                p for p in publications
+                if (request.year_from is None or p.get('publication_year', 0) >= request.year_from)
+                and (request.year_to is None or p.get('publication_year', 0) <= request.year_to)
+            ]
+        
+        if not publications:
+            raise ValueError(f"No hay publicaciones en el rango {request.year_from}-{request.year_to}")
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ANÁLISIS
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        total_pubs = len(publications)
+        total_citations = sum(int(p.get('citation_count') or 0) for p in publications)
+        
+        # 1. Datos por año
+        by_year = {}
+        for pub in publications:
+            year = int(pub.get('publication_year') or 0)
+            if year not in by_year:
+                by_year[year] = {'count': 0, 'citations': 0}
+            by_year[year]['count'] += 1
+            by_year[year]['citations'] += int(pub.get('citation_count') or 0)
+        
+        years = sorted(by_year.keys())
+        
+        publications_by_year = [
+            PublicationYearData(
+                year=year,
+                count=by_year[year]['count'],
+                percentage=round((by_year[year]['count'] / total_pubs) * 100, 2),
+                citations=by_year[year]['citations'],
+                avg_citations_per_publication=round(
+                    by_year[year]['citations'] / by_year[year]['count'], 2
+                ) if by_year[year]['count'] > 0 else 0,
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        citations_by_year = [
+            CitationYearData(
+                year=year,
+                citations=by_year[year]['citations'],
+                publications=by_year[year]['count'],
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        # 2. Detalles de publicaciones
+        publications_detail = [
+            PublicationDetail(
+                id=idx,
+                title=pub.get('title', 'Unknown'),
+                year=int(pub.get('publication_year') or 0),
+                doi=pub.get('doi'),
+                citations=int(pub.get('citation_count') or 0),
+                publication_type=pub.get('publication_type'),
+                source_journal=pub.get('source_journal'),
+                url=pub.get('url'),
+                authors_count=len(pub.get('authors', [])),
+                is_open_access=pub.get('is_open_access', False),
+            )
+            for idx, pub in enumerate(publications, 1)
+        ]
+        
+        # 3. Top 10 más citadas
+        top_cited = sorted(publications_detail, key=lambda x: x.citations, reverse=True)[:10]
+        
+        # 4. H-index
+        sorted_citations = sorted(
+            [p.get('citation_count', 0) or 0 for p in publications],
+            reverse=True
+        )
+        h_index = sum(1 for i, c in enumerate(sorted_citations, 1) if c >= i)
+        
+        # 5. Estadísticas
+        cpp = round(total_citations / total_pubs, 2) if total_pubs > 0 else 0
+        percent_cited = round(
+            (sum(1 for p in publications if int(p.get('citation_count', 0) or 0) > 0) / total_pubs) * 100, 2
+        )
+        
+        # 6. Distribución de tipos de publicación
+        pub_types = {}
+        for pub in publications:
+            ptype = pub.get('publication_type', 'Unknown')
+            pub_types[ptype] = pub_types.get(ptype, 0) + 1
+        
+        # 7. Distribución de revistas (top 20)
+        journals = {}
+        for pub in publications:
+            journal = pub.get('source_journal', 'Unknown')
+            journals[journal] = journals.get(journal, 0) + 1
+        
+        top_journals = dict(sorted(journals.items(), key=lambda x: x[1], reverse=True)[:20])
+        
+        # ═══════════════════════════════════════════════════════════════════════
+        # ANÁLISIS PROFESIONAL COMPLETO
+        # ═══════════════════════════════════════════════════════════════════════
+        
+        # Calcular mediana de citaciones
+        mediana_citas = sorted(
+            [int(p.get('citation_count', 0) or 0) for p in publications],
+            reverse=True
+        )
+        mediana = statistics.median(mediana_citas) if mediana_citas else 0.0
+        
+        # Preparar listas para generar hallazgos
+        years_list = sorted(by_year.keys())
+        pubs_list = [by_year[year]['count'] for year in years_list]
+        cites_list = [by_year[year]['citations'] for year in years_list]
+        
+        # Año de máximo impacto y máxima producción
+        año_pico = max(years_list, key=lambda k: by_year[k]['citations']) if years_list else 0
+        año_max_pub = max(years_list, key=lambda k: by_year[k]['count']) if years_list else 0
+        
+        # Generar hallazgos
+        positivos, negativos, notas = generar_hallazgos(
+            total_arts=total_pubs,
+            total_citas=total_citations,
+            h_index=h_index,
+            cpp=cpp,
+            mediana=mediana,
+            pct_citados=percent_cited,
+            años=years_list,
+            pubs=pubs_list,
+            cites=cites_list,
+            año_pico=año_pico,
+            año_max_pub=año_max_pub,
+            campo=CampoDisciplinar.CIENCIAS_SALUD,
+            db_session=None  # En /analyze-scopus no tenemos sesión DB
+        )
+        
+        # Construir respuesta
+        response = ScopusAnalysisResponse(
+            success=True,
+            message=f"Análisis completado: {total_pubs} publicaciones, {total_citations} citaciones",
+            query_used=query_str,
+            total_publications=total_pubs,
+            total_citations=total_citations,
+            statistics=ChartStatistics(
+                total_publications=total_pubs,
+                total_citations=total_citations,
+                min_year=min(years) if years else 0,
+                max_year=max(years) if years else 0,
+                avg_per_year=round(total_pubs / len(years), 2) if years else 0,
+                peak_year=max(by_year.keys(), key=lambda k: by_year[k]['count']),
+                peak_publications=max(by_year.values(), key=lambda v: v['count'])['count'],
+                active_years=len(years),
+                h_index=h_index,
+                citation_per_publication=cpp,
+                percent_cited=percent_cited,
+                publications_by_year=publications_by_year,
+                publications_detail=publications_detail,
+                citations_by_year=citations_by_year,
+            ),
+            publications_by_year=publications_by_year,
+            citations_by_year=citations_by_year,
+            publications_detail=publications_detail,
+            top_cited_publications=top_cited,
+            publication_types_distribution=pub_types,
+            journals_distribution=top_journals,
+            findings_positive=positivos,
+            findings_negative=negativos,
+            findings_notes=notas,
+            generated_at=datetime.now().isoformat(),
+        )
+        
+        logger.info(f"Análisis completado exitosamente")
+        return response
+        
+    except ValueError as e:
+        logger.warning(f"Validación: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"Error analizando Scopus: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error en análisis: {str(e)}"
+        )
 
 
 # ── POST /authors/charts/generate ─────────────────────────────────────────────
@@ -290,7 +905,216 @@ def generate_investigator_report(
         )
 
 
-# ── GET /authors/charts/download/{filename} ──────────────────────────────────
+# ── POST /authors/charts/data ─────────────────────────────────────────────────
+
+@router.post(
+    "/data",
+    summary="Obtener datos para gráficos sin generar imagen",
+    response_model=InvestigatorChartResponse,
+    responses={
+        200: {"description": "Datos obtenidos exitosamente"},
+        404: {"model": ChartGenerationError, "description": "No se encontraron datos"},
+        500: {"model": ChartGenerationError, "description": "Error interno"},
+    }
+)
+def get_chart_data(
+    request: InvestigatorChartRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Obtiene todos los datos para graficar sin generar imagen PNG.
+    
+    **Retorna:**
+    - Estadísticas generales (total de pubs, años, etc.)
+    - **Lista completa de publicaciones** con detalles individuales (título, año, DOI, citas)
+    - **Datos de citas por año** para graficar tendencias
+    - **Datos por año** de publicaciones
+    
+    **Casos de uso:**
+    - Integración con herramientas de visualización personalizadas
+    - Exportación a otras plataformas
+    - Análisis adicionales con los datos crudos
+    - Generar gráficos interactivos con tecnologías como D3.js, Chart.js, Plotly
+    
+    **Parámetros:** Mismo que `/generate`
+    
+    **Ejemplo de uso:**
+    ```bash
+    curl -X POST "http://localhost:8000/api/authors/charts/data" \
+      -H "Content-Type: application/json" \
+      -d '{
+        "author_id": "57193767797",
+        "year_from": 2020,
+        "year_to": 2025
+      }'
+    ```
+    """
+    
+    try:
+        logger.info(
+            f"Obteniendo datos para AU-ID: {request.author_id} "
+            f"(AF-IDs: {request.affiliation_ids or 'todas'})"
+        )
+        
+        # Usar afiliaciones USB por defecto
+        aff_ids_to_use = request.affiliation_ids
+        if not aff_ids_to_use:
+            aff_ids_to_use = ["60106970", "60112687"]
+            logger.info("Usando afiliaciones USB por defecto")
+        
+        # Obtener datos sin generar imagen
+        from extractors.scopus import ScopusExtractor
+        from api.services.data_provider import fetch_author_data
+        
+        scopus = ScopusExtractor()
+        
+        # Construir query de búsqueda
+        query_params = f"AU-ID({request.author_id})"
+        if aff_ids_to_use:
+            aff_part = " OR ".join([f"AF-ID({aid})" for aid in aff_ids_to_use])
+            query_params += f" AND ({aff_part})"
+        
+        # Usar el método extract() de ScopusExtractor
+        try:
+            standard_records = scopus.extract(
+                query=query_params,
+                max_results=5000,
+            )
+        except Exception as e:
+            logger.warning(f"Error extrayendo de Scopus: {e}")
+            raise ValueError(f"No se pudieron obtener datos de Scopus: {str(e)}")
+        
+        if not standard_records:
+            raise ValueError("No se encontraron publicaciones para este autor con los parámetros especificados.")
+        
+        # Convertir StandardRecords a datos graficables
+        publications = [r.to_dict() for r in standard_records]
+        
+        # Filtrar por años
+        filtered_pubs = publications
+        if request.year_from or request.year_to:
+            filtered_pubs = [
+                p for p in publications
+                if (request.year_from is None or p.get('publication_year', 0) >= request.year_from)
+                and (request.year_to is None or p.get('publication_year', 0) <= request.year_to)
+            ]
+        
+        if not filtered_pubs:
+            raise ValueError(f"No se encontraron publicaciones en el rango {request.year_from}-{request.year_to}")
+        
+        # Obtener nombre del investigador (del primer registro)
+        investigator_name = filtered_pubs[0].get('authors', [{}])[0].get('name', 'Unknown') if filtered_pubs else 'Unknown'
+        
+        # Calcular estadísticas
+        total_pubs = len(filtered_pubs)
+        years = sorted(set(p.get('publication_year') for p in filtered_pubs if p.get('publication_year')))
+        total_citations = sum(int(p.get('citation_count') or 0) for p in filtered_pubs)
+        
+        # Datos por año
+        by_year = {}
+        for pub in filtered_pubs:
+            year = int(pub.get('publication_year') or 0)
+            if year not in by_year:
+                by_year[year] = {'count': 0, 'citations': 0}
+            by_year[year]['count'] += 1
+            by_year[year]['citations'] += int(pub.get('citation_count') or 0)
+        
+        publications_by_year = [
+            PublicationYearData(
+                year=year,
+                count=by_year[year]['count'],
+                percentage=round((by_year[year]['count'] / total_pubs) * 100, 2),
+                citations=by_year[year]['citations'],
+                avg_citations_per_publication=round(
+                    by_year[year]['citations'] / by_year[year]['count'], 2
+                ) if by_year[year]['count'] > 0 else 0,
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        # Datos de citas por año
+        citations_by_year = [
+            CitationYearData(
+                year=year,
+                citations=by_year[year]['citations'],
+                publications=by_year[year]['count'],
+            )
+            for year in sorted(by_year.keys(), reverse=True)
+        ]
+        
+        # Detalles de publicaciones
+        publications_detail = [
+            PublicationDetail(
+                id=idx,
+                title=pub.get('title', 'Unknown'),
+                year=int(pub.get('publication_year') or 0),
+                doi=pub.get('doi'),
+                citations=int(pub.get('citation_count') or 0),
+                publication_type=pub.get('publication_type'),
+                source_journal=pub.get('source_journal'),
+                url=pub.get('url'),
+                authors_count=len(pub.get('authors', [])),
+                is_open_access=pub.get('is_open_access', False),
+            )
+            for idx, pub in enumerate(filtered_pubs, 1)
+        ]
+        
+        # H-index (simplificado)
+        sorted_citations = sorted(
+            [int(p.get('citation_count', 0) or 0) for p in filtered_pubs],
+            reverse=True
+        )
+        h_index = sum(1 for i, c in enumerate(sorted_citations, 1) if c >= i)
+        
+        cpp = round(total_citations / total_pubs, 2) if total_pubs > 0 else 0
+        percent_cited = round(
+            (sum(1 for p in filtered_pubs if int(p.get('citation_count', 0) or 0) > 0) / total_pubs) * 100, 2
+        )
+        
+        # Construir respuesta
+        response = InvestigatorChartResponse(
+            success=True,
+            message="Datos obtenidos correctamente (sin generar imagen)",
+            investigator_name=investigator_name,
+            institution_name="Universidad Simón Bolívar",
+            filename="",  # No hay archivo PNG
+            file_path="",
+            statistics=ChartStatistics(
+                total_publications=total_pubs,
+                total_citations=total_citations,
+                min_year=min(years) if years else 0,
+                max_year=max(years) if years else 0,
+                avg_per_year=round(total_pubs / len(years), 2) if years else 0,
+                peak_year=max(by_year.keys(), key=lambda k: by_year[k]['count']),
+                peak_publications=max(by_year.values(), key=lambda v: v['count'])['count'],
+                active_years=len(years),
+                h_index=h_index,
+                citation_per_publication=cpp,
+                percent_cited=percent_cited,
+                publications_by_year=publications_by_year,
+                publications_detail=publications_detail,
+                citations_by_year=citations_by_year,
+            ),
+            query_used=query_params,
+            generated_at=datetime.now().isoformat(),
+        )
+        
+        logger.info(f"Datos obtenidos: {total_pubs} publicaciones, {total_citations} citaciones")
+        return response
+        
+    except ValueError as e:
+        logger.warning(f"Datos no encontrados: {e}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"Error obteniendo datos: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error obteniendo datos: {str(e)}"
+        )
+
+
+# ── GET /authors/charts/download/{filename} ─────────────────────────────────────────────────
 
 @router.get(
     "/download/{filename}",
@@ -1260,3 +2084,50 @@ def generate_author_report(
             status_code=500,
             detail=f"Error generando informe: {str(e)}"
         )
+
+# ── GET /authors/metrics/{author_id} ─────────────────────────────────────────
+
+@router.get(
+    "/metrics/{author_id}",
+    summary="Métricas generales completas de un autor desde el inventario",
+    response_model=AuthorGeneralMetricsResponse,
+    responses={
+        200: {"description": "Métricas obtenidas exitosamente"},
+        404: {"model": AuthorMetricsErrorResponse, "description": "Autor no encontrado"},
+        500: {"model": AuthorMetricsErrorResponse, "description": "Error en el servidor"},
+    }
+)
+def get_author_general_metrics(
+    author_id: int,
+    db: Session = Depends(get_db),
+):
+    """
+    Obtiene métricas generales **COMPLETAS** de un autor desde el inventario local.
+    
+    Devuelve todas las estadísticas bibliométricas sin conectarse a APIs externas.
+    
+    **Estadísticas:**
+    - Productividad: total de publicaciones, años activos, promedio por año
+    - Impacto: citas totales, H-index, Citations Per Publication (CPP)
+    - Distribución temporal: publicaciones y citas por año
+    - Distribución por tipo: artículos, reviews, conferencias, etc.
+    - Top revistas: 10 principales revistas
+    - Open Access: análisis detallado
+    - Afiliación: publicaciones institucionales
+    - Idiomas: distribución de publicación
+    
+    **Ejemplos:**
+    ```bash
+    curl "http://localhost:8000/api/authors/charts/metrics/315"
+    ```
+    """
+    try:
+        return AuthorMetricsService.get_author_metrics(author_id, db)
+    
+    except ValueError as e:
+        logger.warning(f"Métricas - Validación: {str(e)}")
+        raise HTTPException(status_code=404, detail=str(e))
+    
+    except Exception as e:
+        logger.error(f"Métricas - Error para autor {author_id}: {str(e)}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Error: {str(e)}")

@@ -15,7 +15,7 @@ Mejoras de rendimiento aplicadas:
 """
 
 import logging
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks, Query
 from sqlalchemy import func, or_, union_all, literal, select
@@ -24,6 +24,7 @@ from sqlalchemy.orm import Session
 from api.dependencies import get_db
 from api.utils import build_source_url
 from api.schemas.common import PaginatedResponse
+from api.services.unified_extractor_service import UnifiedExtractorService, UnifiedAuthorProfile
 from api.schemas.authors import (
     AuthorRead,
     AuthorDetail,
@@ -54,6 +55,49 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/authors", tags=["Autores"])
 
 KNOWN_SOURCES = ["openalex", "scopus", "wos", "cvlac", "datos_abiertos"]
+
+
+# ── GET /authors/search ──────────────────────────────────────
+
+@router.get("/search", response_model=List[AuthorRead], summary="Búsqueda rápida por nombre u ORCID")
+def search_authors(
+    q: str = Query(..., min_length=1, description="Búsqueda por nombre u ORCID"),
+    limit: int = Query(20, ge=1, le=100, description="Máximo de resultados (default: 20)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Búsqueda rápida de autores sin paginación.
+    
+    Parámetros:
+    - `q`: término de búsqueda (búsqueda flexible por nombre o ORCID exacto)
+    - `limit`: máximo número de resultados
+    
+    Optimización: Busca por ORCID exacto primero, luego por nombre con ILIKE.
+    Retorna máximo `limit` registros sin paginación.
+    """
+    search_term = q.strip()
+    
+    # Prioridad 1: Búsqueda exacta por ORCID
+    authors = db.query(Author).filter(Author.orcid == search_term).limit(limit).all()
+    
+    if len(authors) < limit:
+        # Prioridad 2: Búsqueda por nombre (flexible)
+        remaining_limit = limit - len(authors)
+        orcid_set = {a.orcid for a in authors if a.orcid}
+        
+        name_results = (
+            db.query(Author)
+            .filter(
+                Author.name.ilike(f"%{search_term}%"),
+                ~Author.orcid.in_(orcid_set) if orcid_set else True,
+            )
+            .order_by(Author.name)
+            .limit(remaining_limit)
+            .all()
+        )
+        authors.extend(name_results)
+    
+    return [AuthorRead.model_validate(a) for a in authors]
 
 
 # ── GET /authors/duplicates-orcid ─────────────────────────────
@@ -556,7 +600,7 @@ def merge_authors(body: MergeAuthorsRequest, db: Session = Depends(get_db)):
     from sqlalchemy import update, delete
     from db.models import AuthorInstitution
 
-    keep = db.query(Author).get(body.keep_id)
+    keep = db.get(Author, body.keep_id)
     if not keep:
         raise HTTPException(404, f"Autor principal {body.keep_id} no encontrado")
     if body.keep_id in body.merge_ids:
@@ -678,7 +722,7 @@ from api.schemas.common import MessageResponse
 @router.delete("/{author_id}", response_model=MessageResponse, summary="Eliminar un autor")
 def delete_author(author_id: int, db: Session = Depends(get_db)):
     """Elimina un autor. Las publicaciones canónicas NO se eliminan."""
-    author = db.query(Author).get(author_id)
+    author = db.get(Author, author_id)
     if not author:
         raise HTTPException(404, "Autor no encontrado")
     name = author.name
@@ -725,7 +769,7 @@ def get_author_inventory(
     # Resolver autor
     author = None
     if author_id:
-        author = db.query(Author).get(author_id)
+        author = db.get(Author, author_id)
     if not author and orcid:
         author = db.query(Author).filter(Author.orcid == orcid.strip()).first()
     if not author and scopus_id:
@@ -841,7 +885,7 @@ def get_author_inventory(
 
 @router.get("/{author_id}", response_model=AuthorRead, summary="Detalle de autor")
 def get_author(author_id: int, db: Session = Depends(get_db)):
-    author = db.query(Author).get(author_id)
+    author = db.get(Author, author_id)
     if not author:
         raise HTTPException(404, "Autor no encontrado")
     pc = (
@@ -873,7 +917,7 @@ def get_author_publications(
     """
     OPTIMIZACIÓN: JOIN directo + UNION ALL para fuentes externas.
     """
-    author = db.query(Author).get(author_id)
+    author = db.get(Author, author_id)
     if not author:
         raise HTTPException(404, "Autor no encontrado")
 
@@ -939,7 +983,7 @@ def get_coauthors(
     db: Session = Depends(get_db),
 ):
     """Coautores (top N por publicaciones compartidas)."""
-    author = db.query(Author).get(author_id)
+    author = db.get(Author, author_id)
     if not author:
         raise HTTPException(404, "Autor no encontrado")
 
@@ -1082,3 +1126,137 @@ def enrich_authors_by_orcid(
 
     # Ejecución síncrona (comportamiento original)
     return _do_enrich(authors, db)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /authors/{id}/unified-profile
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/unified-profile",
+    summary="Perfil unificado del autor (todas las plataformas)",
+    response_model=Dict[str, Any],
+)
+def get_unified_author_profile(
+    author_id: Optional[int] = Query(None, description="ID del autor en BD (mutuamente exclusivo con orcid)"),
+    orcid: Optional[str] = Query(None, description="ORCID del autor (si no existe, detecta si es institucional y lo crea)"),
+    platforms: Optional[str] = Query(
+        None,
+        description="Plataformas a incluir (csv): scopus,wos,openalex,cvlac,datos_abiertos. Si omite, usa todas disponibles"
+    ),
+    db: Session = Depends(get_db),
+):
+    """
+    Endpoint unificado que ejecuta TODOS los extractores disponibles para un autor.
+    
+    **Dos modos de operación:**
+    
+    1. **Por ID de autor (BD)**:
+    ```
+    GET /authors/unified-profile?author_id=123
+    ```
+    
+    2. **Por ORCID** (detecta si es institucional, crea autor si aplica):
+    ```
+    GET /authors/unified-profile?orcid=0000-0001-8757-3778
+    ```
+    Si el ORCID no existe en BD:
+    - Busca en Scopus y OpenAlex
+    - Verifica que tenga afiliaciones institucionales en AMBAS
+    - Si es institucional → crea el autor automáticamente
+    - Luego ejecuta el pipeline completo
+    
+    **Extrae información de:**
+    - Scopus (si scopus_id disponible)
+    - Web of Science (si wos_id disponible)
+    - OpenAlex (si openalex_id o ORCID disponible)
+    - CVLac (si cvlac_id disponible)
+    - Datos Abiertos Colombia (búsqueda por nombre)
+    
+    **Consolidación:**
+    - Total de publicaciones por plataforma
+    - Totalización de citas
+    - Estado de extracción por plataforma
+    - Referencias de registros originales
+    
+    **Ejemplos:**
+    ```
+    # Por ID existente
+    GET /authors/unified-profile?author_id=123
+    
+    # Por ORCID (crea si es institucional)
+    GET /authors/unified-profile?orcid=0000-0001-8757-3778
+    
+    # Con plataformas específicas
+    GET /authors/unified-profile?orcid=0000-0001-8757-3778&platforms=scopus,openalex
+    ```
+    """
+    
+    try:
+        # Validar que se proporcione ID o ORCID
+        if author_id is None and orcid is None:
+            raise HTTPException(
+                status_code=400,
+                detail="Debes proporcionar 'author_id' o 'orcid' en la URL"
+            )
+        
+        service = UnifiedExtractorService(db)
+        
+        # Determinar plataformas a incluir
+        include_platforms = None
+        if platforms:
+            include_platforms = [p.strip().lower() for p in platforms.split(",")]
+        
+        # Ejecutar extracción unificada
+        profile = service.extract_author_profile(
+            author_id=author_id,
+            orcid=orcid,
+            include_platforms=include_platforms,
+        )
+        
+        # Convertir dataclass a dict para serializar como JSON
+        return {
+            "author": {
+                "id": profile.author_id,
+                "name": profile.author_name,
+                "orcid": profile.orcid,
+                "is_institutional": profile.is_institutional,
+                "identifiers": profile.identifiers,
+            },
+            "author_data": {
+                "consolidated": profile.author_data.get('consolidated', {}),
+                "scopus_profile": profile.author_data.get('scopus_profile'),
+                "openalex_profile": profile.author_data.get('openalex_profile'),
+            },
+            "summary": {
+                "total_publications": profile.total_publications,
+                "total_citations": profile.total_citations,
+                "platforms_with_data": profile.platforms_with_data,
+                "extraction_summary": profile.extraction_summary,
+            },
+            "platforms": {
+                platform: {
+                    "success": result.success,
+                    "records_count": result.records_count,
+                    "error": result.error,
+                    "extracted_at": result.extracted_at,
+                    "sample_records": [
+                        r if isinstance(r, dict) else (
+                            r.to_dict() if hasattr(r, 'to_dict') else str(r)
+                        )
+                        for r in result.records[:3]  # Top 3 registros como muestra
+                    ]
+                }
+                for platform, result in profile.platform_results.items()
+            },
+            "extracted_at": profile.extracted_at,
+        }
+        
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error(f"Error en unified-profile: {e}", exc_info=True)
+        raise HTTPException(
+            status_code=500,
+            detail=f"Error extrayendo perfil unificado: {str(e)}"
+        )

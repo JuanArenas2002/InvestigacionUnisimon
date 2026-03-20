@@ -85,6 +85,13 @@ class ScopusConfig:
     timeout: int = 30
     max_retries: int = 3
     max_per_page: int = 25  # Scopus limita a 25 por página
+    
+    @property
+    def affiliation_ids(self):
+        """Obtiene los IDs de afiliaciones institucionales desde .env como lista"""
+        import os as os_module
+        ids_str = os_module.getenv("SCOPUS_AFFILIATION_IDS", "")
+        return [aid.strip() for aid in ids_str.split(",") if aid.strip()]
 
 
 @dataclass

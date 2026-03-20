@@ -56,7 +56,7 @@ def list_journals(
 @router.get("/journals/{journal_id}", response_model=JournalRead, summary="Detalle de revista")
 def get_journal(journal_id: int, db: Session = Depends(get_db)):
     """Obtiene una revista por su ID."""
-    j = db.query(Journal).get(journal_id)
+    j = db.get(Journal, journal_id)
     if not j:
         raise HTTPException(404, "Revista no encontrada")
     return JournalRead.model_validate(j)
@@ -108,7 +108,7 @@ def list_institutions(
 @router.get("/institutions/{institution_id}", response_model=InstitutionRead, summary="Detalle de institución")
 def get_institution(institution_id: int, db: Session = Depends(get_db)):
     """Obtiene una institución por su ID."""
-    i = db.query(Institution).get(institution_id)
+    i = db.get(Institution, institution_id)
     if not i:
         raise HTTPException(404, "Institución no encontrada")
     return InstitutionRead.model_validate(i)

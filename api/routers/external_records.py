@@ -90,7 +90,7 @@ def _find_record_by_source_and_id(db: Session, source_name: str, record_id: int)
     model_cls = SOURCE_MODELS.get(source_name)
     if not model_cls:
         return None
-    return db.query(model_cls).get(record_id)
+    return db.get(model_cls, record_id)
 
 
 def _find_record_across_sources(db: Session, record_id: int, source_name: str = None):
@@ -102,7 +102,7 @@ def _find_record_across_sources(db: Session, record_id: int, source_name: str = 
         return _find_record_by_source_and_id(db, source_name, record_id)
 
     for model_cls in SOURCE_MODELS.values():
-        record = db.query(model_cls).get(record_id)
+        record = db.get(model_cls, record_id)
         if record:
             return record
     return None
@@ -263,7 +263,7 @@ def manual_review_records(
         )
         if log and log.canonical_publication_id:
             candidate_id = log.canonical_publication_id
-            canon = db.query(CanonicalPublication).get(log.canonical_publication_id)
+            canon = db.get(CanonicalPublication, log.canonical_publication_id)
             if canon:
                 candidate_title = canon.title
 
@@ -342,7 +342,7 @@ def resolve_manual_review(
     if body.action == "link":
         if not body.canonical_id:
             raise HTTPException(400, "Se requiere canonical_id para la acción 'link'")
-        canon = db.query(CanonicalPublication).get(body.canonical_id)
+        canon = db.get(CanonicalPublication, body.canonical_id)
         if not canon:
             raise HTTPException(404, f"Publicación canónica {body.canonical_id} no encontrada")
 

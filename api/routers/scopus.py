@@ -179,7 +179,7 @@ def list_scopus_records(
 )
 def get_scopus_record(record_id: int, db: Session = Depends(get_db)):
     """Detalle completo de un registro Scopus (incluye raw_data)."""
-    er = db.query(ScopusRecord).get(record_id)
+    er = db.get(ScopusRecord, record_id)
     if not er:
         raise HTTPException(404, "Registro Scopus no encontrado")
     return _scopus_to_detail(er)
