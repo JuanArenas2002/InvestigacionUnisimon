@@ -66,11 +66,11 @@ def extract_openalex(body: ExtractionRequest):
     for r in records:
         if not r.source_id:
             continue
-        exists = session.query(OpenalexRecord).filter_by(openalex_id=r.source_id).first()
+        exists = session.query(OpenalexRecord).filter_by(openalex_work_id=r.source_id).first()
         if exists:
             continue
         rec = OpenalexRecord(
-            openalex_id=r.source_id,
+            openalex_work_id=r.source_id,
             doi=r.doi,
             title=r.title,
             publication_year=r.publication_year,

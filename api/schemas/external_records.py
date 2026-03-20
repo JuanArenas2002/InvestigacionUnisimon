@@ -97,6 +97,7 @@ class ExtractionRequest(BaseModel):
     year_from: Optional[int] = None
     year_to: Optional[int] = None
     max_results: Optional[int] = None
+    affiliation_id: Optional[str] = None
 
 
 class ScopusExtractionRequest(ExtractionRequest):

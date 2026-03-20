@@ -107,20 +107,34 @@ class OpenAlexExtractor(BaseExtractor):
         total_fetched = 0
 
         try:
-            for work in query.paginate(
+            for page in query.paginate(
                 per_page=self.config.max_per_page,
                 n_max=max_results,
             ):
-                try:
-                    record = self._parse_record(work)
-                    records.append(record)
-                    total_fetched += 1
-                except Exception as e:
-                    logger.warning(f"Error parseando work: {e}")
-                    continue
+                # PyAlex puede devolver objetos OpenAlexResponseList o works directos
+                # Intentar extraer works si es una página, sino usar directamente
+                works_to_process = page
+                if hasattr(page, 'results'):
+                    works_to_process = page.results
+                elif not hasattr(page, 'get'):
+                    # Si no soporta .get(), intentar iterar directamente
+                    try:
+                        works_to_process = list(page)
+                    except (TypeError, AttributeError):
+                        works_to_process = [page]
+                
+                # Procesar cada work
+                for work in (works_to_process if isinstance(works_to_process, list) else [works_to_process]):
+                    try:
+                        record = self._parse_record(work)
+                        records.append(record)
+                        total_fetched += 1
+                    except Exception as e:
+                        logger.warning(f"Error parseando work: {e}")
+                        continue
 
-                if total_fetched % 200 == 0:
-                    logger.info(f"  Extraídos: {total_fetched}")
+                    if total_fetched % 200 == 0:
+                        logger.info(f"  Extraídos: {total_fetched}")
 
         except Exception as e:
             raise OpenAlexAPIError(f"Error comunicándose con OpenAlex: {e}")
@@ -148,8 +162,23 @@ class OpenAlexExtractor(BaseExtractor):
             logger.debug(f"search_by_doi: DOI {doi_clean!r} → {e}")
             return None
 
-    def _parse_record(self, work: dict) -> StandardRecord:
+    def _parse_record(self, work) -> StandardRecord:
         """Convierte un work de OpenAlex a StandardRecord."""
+        # Intentar convertir a diccionario si no lo es
+        if not isinstance(work, dict):
+            try:
+                # Intentar conversión directa
+                work = dict(work)
+            except (TypeError, ValueError):
+                try:
+                    # Alternativa: serializar a JSON y deserializar
+                    import json as _json
+                    work = _json.loads(_json.dumps(work, default=str))
+                except Exception:
+                    logger.warning(f"No se pudo convertir work de tipo {type(work)}")
+                    return None
+        
+        # Ahora el work es un diccionario, procesar normalmente
         ids_data         = work.get("ids") or {}
         primary_location = work.get("primary_location") or {}
         source_data      = primary_location.get("source") or {}
