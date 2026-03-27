@@ -85,6 +85,88 @@ class ScopusExtractor(BaseExtractor):
 
 
     # ---------------------------------------------------------
+    # BÚSQUEDA DE AUTOR POR ORCID
+    # ---------------------------------------------------------
+    
+    def get_author_by_orcid(self, orcid: str) -> Optional[Dict[str, str]]:
+        """
+        Busca un autor en Scopus por su ORCID y retorna su AU-ID (scopus_id).
+        
+        Nota: Si el Author Search API no funciona, no devuelve error fatal,
+        solo retorna None para poder continuar con otras formas de detección.
+        
+        Args:
+            orcid: ORCID del autor (ej: "0000-0002-2096-7900")
+            
+        Returns:
+            Dict con {"scopus_id": "...", "name": "..."} o None si no se encuentra/falla el API
+        """
+        try:
+            url = "https://api.elsevier.com/content/search/author"
+            
+            # Nota: El Author Search API tiene restricciones y puede no estar disponible
+            # para todas las claves API. Intentamos sin parámetros extra primero.
+            params = {
+                "query": f"ORCID({orcid})"
+            }
+            
+            logger.info(f"Scopus Author Search: Buscando autor por ORCID {orcid}")
+            response = self.session.get(url, params=params, timeout=10)
+            
+            # Si falla con 400, es un error de sintaxis o permisos - registra pero no falla
+            if response.status_code == 400:
+                logger.warning(f"Scopus Author Search API retornó 400. Probablemente API Key no tiene acceso a Author Search.")
+                return None
+            
+            response.raise_for_status()
+            
+            # Parsear respuesta XML
+            import xml.etree.ElementTree as ET
+            root = ET.fromstring(response.content)
+            
+            # Namespaces
+            ns = {
+                'atom': 'http://www.w3.org/2005/Atom',
+                'dc': 'http://purl.org/dc/elements/1.1/',
+                'opensearch': 'http://a9.com/-/spec/opensearch/1.1/',
+            }
+            
+            # Buscar primer entry (autor)
+            entries = root.findall('atom:entry', ns)
+            
+            if not entries:
+                logger.warning(f"No se encontró autor con ORCID {orcid} en Scopus Author Search")
+                return None
+            
+            entry = entries[0]
+            
+            # Extraer AU-ID
+            au_id = entry.findtext('dc:identifier', default=None, namespaces=ns)
+            if au_id and au_id.startswith('AUTHOR_ID:'):
+                au_id = au_id.replace('AUTHOR_ID:', '').strip()
+            
+            # Extraer nombre
+            name = entry.findtext('dc:title', default=None, namespaces=ns)
+            
+            if au_id:
+                result = {
+                    'scopus_id': au_id,
+                    'name': name,
+                }
+                logger.info(f"✓ Autor encontrado en Scopus Author Search: {name} (AU-ID: {au_id})")
+                return result
+            else:
+                logger.warning(f"No se extrajo AU-ID para ORCID {orcid}")
+                return None
+            
+        except requests.exceptions.HTTPError as e:
+            logger.warning(f"Error HTTP en Scopus Author Search: {e}")
+            return None
+        except Exception as e:
+            logger.warning(f"Error inesperado en búsqueda Scopus Author Search: {e}")
+            return None
+
+    # ---------------------------------------------------------
     # INTERFAZ BaseExtractor
     # ---------------------------------------------------------
 
@@ -127,6 +209,7 @@ class ScopusExtractor(BaseExtractor):
                 ),
             }
 
+
             try:
                 resp = self.session.get(
                     self.SEARCH_URL,
@@ -141,8 +224,13 @@ class ScopusExtractor(BaseExtractor):
                 print(f"Error en Scopus API: {e}")
                 raise ScopusAPIError(f"Error en Scopus API: {e}")
 
-            # Parsear XML
-            root = ET.fromstring(xml_content)
+            # Manejo robusto de errores de parseo XML
+            try:
+                root = ET.fromstring(xml_content)
+            except ET.ParseError as e:
+                logger.warning(f"Respuesta de Scopus no es XML válido: {e}. Respuesta: {xml_content[:200]}")
+                break
+
             ns = {
                 'atom': 'http://www.w3.org/2005/Atom',
                 'opensearch': 'http://a9.com/-/spec/opensearch/1.1/',
@@ -157,11 +245,20 @@ class ScopusExtractor(BaseExtractor):
                 break
 
             for entry in entries:
+                # Saltar entradas de error (e.g. <entry><error>Result set was empty</error></entry>)
+                if entry.find('error') is not None or entry.findtext('error') is not None:
+                    break
+
                 try:
                     # Extraer campos principales del XML
                     doi = entry.findtext('prism:doi', default=None, namespaces=ns)
                     title = entry.findtext('dc:title', default=None, namespaces=ns)
                     scopus_id = entry.findtext('dc:identifier', default=None, namespaces=ns)
+                    
+                    # IMPORTANTE: Limpiar prefijo "SCOPUS_ID:" del ID
+                    if scopus_id and isinstance(scopus_id, str):
+                        scopus_id = scopus_id.replace('SCOPUS_ID:', '').strip()
+                    
                     cover_date = entry.findtext('prism:coverDate', default=None, namespaces=ns)
                     pub_year = int(cover_date[:4]) if cover_date and len(cover_date) >= 4 else None
                     source_journal = entry.findtext('prism:publicationName', default=None, namespaces=ns)

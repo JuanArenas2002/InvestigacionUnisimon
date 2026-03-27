@@ -1,3 +1,14 @@
+# ── Merge de publicaciones ─────────────────────────────
+from pydantic import BaseModel, Field, computed_field
+
+class MergePublicationsRequest(BaseModel):
+    keep_id: int = Field(..., description="ID de la publicación a conservar (keeper)")
+    merge_id: int = Field(..., description="ID de la publicación a fusionar/eliminar (removable)")
+
+class MergePublicationsResponse(BaseModel):
+    kept_publication_id: int
+    merged_publication_id: int
+    message: str = ""
 """
 Schemas Pydantic para publicaciones canónicas.
 """
@@ -5,6 +16,18 @@ Schemas Pydantic para publicaciones canónicas.
 from typing import Optional, List
 from datetime import datetime
 from pydantic import BaseModel, Field
+
+
+# ── Estado de publicación ────────────────────────────────
+class EstadoPublicacion(BaseModel):
+    """
+    Estado de una publicación canónica.
+    `id` es Optional porque en listados paginados se obtiene solo el nombre
+    almacenado en el campo `estado_publicacion` del modelo. Para obtener el
+    id completo, consultar GET /publications/estados.
+    """
+    id: Optional[int] = None
+    nombre: str
 
 
 # ── Lectura ─────────────────────────────────────────────────
@@ -37,6 +60,7 @@ class PublicationRead(PublicationBase):
     id: int
     created_at: datetime
     updated_at: datetime
+    estado: Optional[EstadoPublicacion] = None
 
     model_config = {"from_attributes": True}
 
@@ -47,12 +71,21 @@ class PublicationDetail(PublicationRead):
     authors: List["PublicationAuthorRead"] = []
     source_links: dict = Field(
         default_factory=dict,
-        description="Enlaces por fuente: {openalex: url, scopus: url, ...}",
+        description="ID por fuente: {openalex: id, scopus: id, ...}. El frontend construye la URL completa.",
     )
     field_provenance: Optional[dict] = Field(
         None,
-        description="Procedencia de cada campo: indica qué fuente (openalex, scopus, wos, cvlac, datos_abiertos) aportó cada dato al registro canónico.",
+        description="Procedencia de cada campo: indica qué fuente aportó cada dato al registro canónico.",
     )
+    field_conflicts: Optional[dict] = Field(
+        None,
+        description="Conflictos entre fuentes. Ej: {'is_open_access': {'openalex': 'true', 'scopus': 'false'}}",
+    )
+    citations_by_source: Optional[dict] = Field(
+        None,
+        description="Citas reportadas por cada fuente. Ej: {'openalex': 45, 'scopus': 52}.",
+    )
+    estado: Optional[EstadoPublicacion] = None
 
 
 class PublicationAuthorRead(BaseModel):
@@ -60,9 +93,50 @@ class PublicationAuthorRead(BaseModel):
     author_name: str
     is_institutional: bool
     author_position: Optional[int] = None
+    # Identificadores externos
     orcid: Optional[str] = None
-
+    openalex_id: Optional[str] = None
+    scopus_id: Optional[str] = None
+    wos_id: Optional[str] = None
+    cvlac_id: Optional[str] = None
     model_config = {"from_attributes": True}
+
+    @classmethod
+    def from_pa_author(cls, pa, author) -> "PublicationAuthorRead":
+        """Constructor conveniente desde un par (PublicationAuthor, Author)."""
+        return cls(
+            author_id=author.id,
+            author_name=author.name,
+            is_institutional=pa.is_institutional,
+            author_position=pa.author_position,
+            orcid=author.orcid,
+            openalex_id=author.openalex_id,
+            scopus_id=author.scopus_id,
+            wos_id=author.wos_id,
+            cvlac_id=author.cvlac_id,
+        )
+
+    @computed_field(
+        description="IDs del autor por plataforma (orcid, openalex, scopus, wos, cvlac). El frontend construye la URL completa."
+    )
+    @property
+    def profile_links(self) -> dict:
+        """Devuelve los IDs por plataforma para que el frontend construya las URLs."""
+        links = {}
+        if self.orcid:
+            links["orcid"] = self.orcid
+        if self.openalex_id:
+            oid = self.openalex_id
+            if oid.startswith("https://openalex.org/"):
+                oid = oid[len("https://openalex.org/"):]
+            links["openalex"] = oid
+        if self.scopus_id:
+            links["scopus"] = self.scopus_id
+        if self.wos_id:
+            links["wos"] = self.wos_id
+        if self.cvlac_id:
+            links["cvlac"] = self.cvlac_id
+        return links
 
 
 class ExternalRecordBrief(BaseModel):
@@ -73,7 +147,6 @@ class ExternalRecordBrief(BaseModel):
     status: str
     match_type: Optional[str] = None
     match_score: Optional[float] = None
-    source_url: str = ""
 
     model_config = {"from_attributes": True}
 
@@ -140,3 +213,7 @@ class DuplicatePublicationsSummary(BaseModel):
     low_confidence: int = Field(0, description="Pares con similitud 0.80-0.85")
     same_doi_different_id: int = Field(0, description="Pares con mismo DOI pero diferente ID canónico")
     pairs: List[DuplicatePublicationPair] = []
+
+
+# --- Rebuild modelos anidados para Pydantic v2 ---
+PublicationRead.model_rebuild()

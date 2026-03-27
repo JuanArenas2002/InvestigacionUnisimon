@@ -148,11 +148,32 @@ class CanonicalPublication(Base):
         comment="Dict campo→fuente. Ej: {'doi':'openalex','source_journal':'scopus'}",
     )
 
+    # --- Conflictos entre fuentes ---
+    field_conflicts: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True, default=dict,
+        comment="Conflictos detectados entre fuentes. Ej: {'is_open_access': {'openalex': 'true', 'scopus': 'false'}}",
+    )
+
+    # --- Citas por fuente ---
+    citations_by_source: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True, default=dict,
+        comment="Citas reportadas por cada fuente. Ej: {'openalex': 45, 'scopus': 52}. citation_count = max de este dict.",
+    )
+
     # --- Control ---
     sources_count: Mapped[int] = mapped_column(Integer, default=1)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
+    )
+
+    # --- Estado de publicación ---
+    estado_publicacion: Mapped[str] = mapped_column(
+        String(20),
+        nullable=False,
+        default="Avalado",
+        server_default="Avalado",
+        comment="Estado de la publicación: Avalado, Revisión, Rechazado"
     )
 
     # --- Relaciones ---
@@ -210,7 +231,7 @@ class Author(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    publications = relationship("PublicationAuthor", back_populates="author", lazy="dynamic")
+    publications = relationship("PublicationAuthor", back_populates="author", lazy="selectin")
     institutions = relationship("AuthorInstitution", back_populates="author", lazy="dynamic")
 
     def __repr__(self):
@@ -343,16 +364,76 @@ class SourceRecordMixin:
 # =============================================================
 
 class OpenalexRecord(SourceRecordMixin, Base):
-    """Registros completos de OpenAlex API."""
+    """
+    Registros completos de OpenAlex API.
+    Captura todos los campos disponibles en la API de OpenAlex (pyalex / REST).
+    Referencia: https://docs.openalex.org/api-entities/works
+    """
     __tablename__ = "openalex_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # ── Identificadores ──────────────────────────────────────
     openalex_work_id: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, unique=True, index=True,
-        comment="ID de OpenAlex, ej: https://openalex.org/W12345"
+        comment="ID de OpenAlex, ej: https://openalex.org/W12345",
     )
-    pmid: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    pmid:  Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
     pmcid: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # ── Contenido ────────────────────────────────────────────
+    abstract: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Resumen reconstruido desde abstract_inverted_index",
+    )
+    keywords: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Palabras clave separadas por coma (campo 'keywords' de OpenAlex 2024+)",
+    )
+
+    # ── Clasificación temática ───────────────────────────────
+    concepts: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{display_name, score, wikidata_id, level}] — clasificación OpenAlex Concepts",
+    )
+    topics: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{display_name, score, domain, field, subfield}] — clasificación OpenAlex Topics 2024+",
+    )
+    mesh_terms: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="Medical Subject Headings cuando viene de PubMed",
+    )
+
+    # ── Open Access detallado ────────────────────────────────
+    oa_url: Mapped[Optional[str]] = mapped_column(
+        String(1000), nullable=True,
+        comment="URL directa a versión open access (best_oa_location.url)",
+    )
+    pdf_url: Mapped[Optional[str]] = mapped_column(
+        String(1000), nullable=True,
+        comment="URL directa al PDF (best_oa_location.pdf_url)",
+    )
+    license: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Licencia: cc-by, cc-by-nc, publisher-specific-oa, etc.",
+    )
+
+    # ── Métricas ─────────────────────────────────────────────
+    referenced_works_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Cantidad de referencias bibliográficas de este trabajo",
+    )
+    apc_paid_usd: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Cargo por procesamiento de artículo (APC) en USD",
+    )
+
+    # ── Financiación ─────────────────────────────────────────
+    grants: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{funder, funder_display_name, award_id}]",
+    )
 
     __table_args__ = (
         Index("ix_oalex_year_title", "publication_year", "normalized_title"),
@@ -376,19 +457,61 @@ class OpenalexRecord(SourceRecordMixin, Base):
 # =============================================================
 
 class ScopusRecord(SourceRecordMixin, Base):
-    """Registros completos de Scopus API (Elsevier)."""
+    """
+    Registros completos de Scopus API (Elsevier).
+    Captura todos los campos disponibles en Scopus Search + Abstract Retrieval APIs.
+    Referencia: https://dev.elsevier.com/documentation/ScopusSearchAPI.wadl
+    """
     __tablename__ = "scopus_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # ── Identificadores ──────────────────────────────────────
     scopus_doc_id: Mapped[Optional[str]] = mapped_column(
         String(100), nullable=True, unique=True, index=True,
-        comment="Scopus document ID (dc:identifier sin prefijo)"
+        comment="Scopus document ID (dc:identifier sin prefijo SCOPUS_ID:)",
     )
-    volume: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
-    issue: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    eid: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Electronic ID de Scopus, formato 2-s2.0-XXXXXXXX",
+    )
+    pmid: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+    isbn: Mapped[Optional[str]] = mapped_column(
+        String(30), nullable=True,
+        comment="ISBN para libros y capítulos de libro",
+    )
+
+    # ── Ubicación en la publicación ──────────────────────────
+    volume:     Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    issue:      Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
     page_range: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
-    abstract: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
-    author_keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Contenido ────────────────────────────────────────────
+    abstract:        Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    author_keywords: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Palabras clave asignadas por el autor (authkeywords)",
+    )
+    index_keywords: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Vocabulario controlado de Scopus (idxterms)",
+    )
+
+    # ── Tipo y subtipo ───────────────────────────────────────
+    subtype_description: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Descripción legible del subtipo: Article, Review, Conference Paper, Book Chapter, etc.",
+    )
+
+    # ── Evento (conferencias) ────────────────────────────────
+    conference_name: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # ── Financiación ─────────────────────────────────────────
+    funding_agency: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    funding_number: Mapped[Optional[str]] = mapped_column(
+        String(200), nullable=True,
+        comment="Número o código del grant de financiación",
+    )
 
     __table_args__ = (
         Index("ix_scopus_year_title", "publication_year", "normalized_title"),
@@ -412,13 +535,71 @@ class ScopusRecord(SourceRecordMixin, Base):
 # =============================================================
 
 class WosRecord(SourceRecordMixin, Base):
-    """Registros completos de Web of Science API (Clarivate)."""
+    """
+    Registros completos de Web of Science API (Clarivate).
+    Captura todos los campos disponibles en WoS Starter + Expanded APIs.
+    Referencia: https://developer.clarivate.com/apis/wos
+    """
     __tablename__ = "wos_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # ── Identificadores ──────────────────────────────────────
     wos_uid: Mapped[Optional[str]] = mapped_column(
         String(100), nullable=True, unique=True, index=True,
-        comment="WoS UID, ej: WOS:000123456789"
+        comment="WoS UID, ej: WOS:000123456789",
+    )
+    accession_number: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Número de acceso interno WoS",
+    )
+    pmid: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
+
+    # ── Ubicación en la publicación ──────────────────────────
+    volume:     Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    issue:      Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    page_range: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    early_access_date: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="Fecha de publicación anticipada (Early Access)",
+    )
+    issn_electronic: Mapped[Optional[str]] = mapped_column(
+        String(20), nullable=True,
+        comment="ISSN de la versión electrónica",
+    )
+
+    # ── Contenido ────────────────────────────────────────────
+    abstract:        Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    author_keywords: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Clasificación WoS ───────────────────────────────────
+    wos_categories: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Categorías Web of Science separadas por '; '",
+    )
+    research_areas: Mapped[Optional[str]] = mapped_column(
+        Text, nullable=True,
+        comment="Áreas de investigación WoS separadas por '; '",
+    )
+
+    # ── Editorial / Evento ───────────────────────────────────
+    publisher:       Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    conference_title: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+
+    # ── Métricas de citas ────────────────────────────────────
+    times_cited_all_databases: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Citas contadas en todas las colecciones WoS",
+    )
+    citing_patents_count: Mapped[Optional[int]] = mapped_column(
+        Integer, nullable=True,
+        comment="Número de patentes que citan este artículo",
+    )
+
+    # ── Financiación ─────────────────────────────────────────
+    funding_orgs: Mapped[Optional[dict]] = mapped_column(
+        JSONB, nullable=True,
+        comment="[{organization, grant_numbers:[]}]",
     )
 
     __table_args__ = (
@@ -443,13 +624,56 @@ class WosRecord(SourceRecordMixin, Base):
 # =============================================================
 
 class CvlacRecord(SourceRecordMixin, Base):
-    """Registros extraídos de CvLAC (Minciencias Colombia) por scraping."""
+    """
+    Registros extraídos de CvLAC (Minciencias Colombia) por web scraping.
+    CvLAC es el Currículum Vitae de Latinoamérica y el Caribe.
+    Referencia: https://scienti.minciencias.gov.co/cvlac/
+    """
     __tablename__ = "cvlac_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
-    cvlac_code: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+
+    # ── Identificadores ──────────────────────────────────────
+    cvlac_code: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="Código CvLAC del investigador (cod_rh en la URL)",
+    )
     cvlac_product_id: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, unique=True, index=True,
+        comment="ID único del producto en CvLAC",
+    )
+    isbn: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    # ── Tipo de producto ─────────────────────────────────────
+    product_type: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Tipo de producto CvLAC: Artículo, Libro, Capítulo, Patente, Software, etc.",
+    )
+
+    # ── Contenido ────────────────────────────────────────────
+    abstract:  Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+    keywords:  Mapped[Optional[str]] = mapped_column(Text, nullable=True)
+
+    # ── Ubicación en la publicación ──────────────────────────
+    volume:    Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    issue:     Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    pages:     Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    editorial: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+
+    # ── Clasificación Minciencias ────────────────────────────
+    visibility: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="Visibilidad declarada: Nacional, Internacional, No Aplica",
+    )
+    category: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True,
+        comment="Categoría de la publicación según convocatoria Minciencias: A1, A2, B, C",
+    )
+
+    # ── Contexto institucional ───────────────────────────────
+    research_group: Mapped[Optional[str]] = mapped_column(
+        String(300), nullable=True,
+        comment="Nombre del grupo de investigación al que se asocia el producto",
     )
 
     __table_args__ = (
@@ -474,14 +698,57 @@ class CvlacRecord(SourceRecordMixin, Base):
 # =============================================================
 
 class DatosAbiertosRecord(SourceRecordMixin, Base):
-    """Registros de Datos Abiertos Colombia (datos.gov.co) vía SODA API."""
+    """
+    Registros de Datos Abiertos Colombia (datos.gov.co) vía SODA API.
+    Dataset de producción científica publicado por Minciencias.
+    Referencia: https://www.datos.gov.co/
+    """
     __tablename__ = "datos_abiertos_records"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+
+    # ── Identificadores ──────────────────────────────────────
     datos_source_id: Mapped[Optional[str]] = mapped_column(
         String(255), nullable=True, unique=True, index=True,
+        comment="ID del registro en el dataset de Datos Abiertos",
     )
-    dataset_id: Mapped[Optional[str]] = mapped_column(String(100), nullable=True, index=True)
+    dataset_id: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True, index=True,
+        comment="ID del dataset de origen en datos.gov.co",
+    )
+    isbn: Mapped[Optional[str]] = mapped_column(String(30), nullable=True)
+
+    # ── Tipo de producto ─────────────────────────────────────
+    product_type: Mapped[Optional[str]] = mapped_column(
+        String(100), nullable=True,
+        comment="Tipo de producto bibliográfico según Minciencias",
+    )
+
+    # ── Ubicación en la publicación ──────────────────────────
+    volume:    Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    issue:     Mapped[Optional[str]] = mapped_column(String(50),  nullable=True)
+    pages:     Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    editorial: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+
+    # ── Cobertura geográfica ─────────────────────────────────
+    country: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    city:    Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+
+    # ── Clasificación Minciencias ────────────────────────────
+    classification: Mapped[Optional[str]] = mapped_column(
+        String(10), nullable=True,
+        comment="Clasificación de la revista/producto: A1, A2, B, C, D",
+    )
+    visibility: Mapped[Optional[str]] = mapped_column(
+        String(50), nullable=True,
+        comment="Visibilidad: Nacional, Internacional, No Aplica",
+    )
+
+    # ── Contexto institucional ───────────────────────────────
+    research_group: Mapped[Optional[str]] = mapped_column(
+        String(300), nullable=True,
+        comment="Grupo de investigación que reporta el producto",
+    )
 
     __table_args__ = (
         Index("ix_datos_year_title", "publication_year", "normalized_title"),
@@ -501,17 +768,67 @@ class DatosAbiertosRecord(SourceRecordMixin, Base):
 
 
 # =============================================================
-# DICCIONARIO DE MODELOS POR FUENTE
+# REGISTRO DE FUENTES (auto-extensible)
+# =============================================================
+# Para agregar una nueva fuente:
+#   1. Define la clase modelo arriba (hereda de SourceRecordMixin + Base)
+#   2. Crea la función build_X_kwargs en db/source_builders.py
+#   3. Llama SOURCE_REGISTRY.register(SourceDefinition(...)) aquí abajo
+#
+# Todo lo demás (engine, routers, stats) lo detecta automáticamente.
 # =============================================================
 
-SOURCE_MODELS = {
-    "openalex": OpenalexRecord,
-    "scopus": ScopusRecord,
-    "wos": WosRecord,
-    "cvlac": CvlacRecord,
-    "datos_abiertos": DatosAbiertosRecord,
-}
+from db.source_registry import SOURCE_REGISTRY, SourceDefinition
+from db.source_builders import (
+    build_openalex_kwargs,
+    build_scopus_kwargs,
+    build_wos_kwargs,
+    build_cvlac_kwargs,
+    build_datos_abiertos_kwargs,
+)
 
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="openalex",
+    model_class=OpenalexRecord,
+    id_attr="openalex_work_id",
+    author_id_attr="openalex_id",
+    build_specific_kwargs=build_openalex_kwargs,
+))
+
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="scopus",
+    model_class=ScopusRecord,
+    id_attr="scopus_doc_id",
+    author_id_attr="scopus_id",
+    build_specific_kwargs=build_scopus_kwargs,
+))
+
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="wos",
+    model_class=WosRecord,
+    id_attr="wos_uid",
+    author_id_attr="wos_id",
+    build_specific_kwargs=build_wos_kwargs,
+))
+
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="cvlac",
+    model_class=CvlacRecord,
+    id_attr="cvlac_product_id",
+    author_id_attr="cvlac_id",
+    build_specific_kwargs=build_cvlac_kwargs,
+))
+
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="datos_abiertos",
+    model_class=DatosAbiertosRecord,
+    id_attr="datos_source_id",
+    author_id_attr=None,  # datos_abiertos no tiene columna de autor propia
+    build_specific_kwargs=build_datos_abiertos_kwargs,
+))
+
+# Compatibilidad con código existente que importa SOURCE_MODELS directamente
+SOURCE_MODELS = SOURCE_REGISTRY.models
 SOURCE_TABLE_NAMES = [m.__tablename__ for m in SOURCE_MODELS.values()]
 
 
@@ -785,3 +1102,24 @@ def get_thresholds_by_field(session, field_code: str) -> dict:
     
     return parameters
 
+
+from sqlalchemy.ext.hybrid import hybrid_property
+import bcrypt
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    username: Mapped[str] = mapped_column(String(150), unique=True, nullable=False, index=True)
+    password_hash: Mapped[str] = mapped_column(String(128), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    def verify_password(self, password: str) -> bool:
+        return bcrypt.checkpw(password.encode(), self.password_hash.encode())
+
+    @classmethod
+    def hash_password(cls, password: str) -> str:
+        return bcrypt.hashpw(password.encode(), bcrypt.gensalt()).decode()
+
+    def __repr__(self):
+        return f"<User(id={self.id}, username='{self.username}')>"

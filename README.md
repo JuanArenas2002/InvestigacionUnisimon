@@ -19,7 +19,7 @@ convocatoria/
 │   │   ├── admin.py               # Administración general
 │   │   ├── authors.py             # Gestión de autores
 │   │   ├── charts.py              # Generación de gráficos y análisis
-│   │   ├── publications.py        # Gestión de publicaciones
+│   │   ├── publications.py        # Gestión de publicaciones (filtro institucional_only disponible)
 │   │   ├── scopus.py              # Búsqueda en Scopus
 │   │   ├── search.py              # Búsqueda general
 │   │   └── stats.py               # Estadísticas

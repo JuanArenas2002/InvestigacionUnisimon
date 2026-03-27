@@ -6,7 +6,7 @@ Las implementaciones están en infrastructure/repositories/.
 """
 from abc import ABC, abstractmethod
 from typing import List, Optional, Dict, Any
-from .publication import Publication
+from ..entities.publication import Publication
 
 
 class PublicationRepository(ABC):

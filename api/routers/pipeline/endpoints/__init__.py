@@ -10,15 +10,9 @@ from .admin import router as admin_router
 router = APIRouter(prefix="/pipeline")
 
 # Scopus
-router.include_router(scopus_coverage_router, prefix="/scopus", tags=["Scopus Coverage"])
-
-# Extraction
-router.include_router(extraction_router, prefix="/extract", tags=["Extraction"])
-
-# Reconciliation
-router.include_router(reconciliation_router, prefix="/reconcile", tags=["Reconciliation"])
-
-# Admin
-router.include_router(admin_router, prefix="", tags=["Admin"])
+router.include_router(scopus_coverage_router, prefix="/scopus",    tags=["Scopus Dashboard"])
+router.include_router(extraction_router,      prefix="/extract",   tags=["Pipeline · Extracción"])
+router.include_router(reconciliation_router,  prefix="",           tags=["Pipeline · Reconciliación"])
+router.include_router(admin_router,           prefix="",           tags=["Administración"])
 
 __all__ = ["router"]

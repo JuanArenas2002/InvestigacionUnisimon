@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from datetime import datetime
 import logging
 
-from .publication import Publication, Journal, CoveragePeriod
+from ..entities.publication import Publication, Journal, CoveragePeriod
 
 
 logger = logging.getLogger("pipeline.domain")

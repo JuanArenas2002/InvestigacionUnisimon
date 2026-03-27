@@ -3,16 +3,18 @@ Router de Publicaciones Canónicas.
 CRUD + consultas especializadas para el inventario bibliográfico.
 """
 
-import math
 import logging
+import time
+from collections import defaultdict
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import func, or_
+from fastapi import APIRouter, Depends, Query, HTTPException, Path, Body
+from sqlalchemy import func, or_, text
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_db
-from api.utils import build_source_url
+from api.utils import get_clean_source_id
 from api.schemas.common import PaginatedResponse
 from api.schemas.publications import (
     PublicationRead,
@@ -24,6 +26,9 @@ from api.schemas.publications import (
     PublicationAuthorRead,
     DuplicatePublicationPair,
     DuplicatePublicationsSummary,
+    MergePublicationsRequest,
+    MergePublicationsResponse,
+    EstadoPublicacion,
 )
 from db.models import (
     CanonicalPublication,
@@ -34,14 +39,42 @@ from db.models import (
     find_record_by_doi_across_sources,
 )
 from extractors.base import normalize_text, normalize_doi
+from api.routers.publications_duplicates import find_possible_duplicates
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/publications", tags=["Publicaciones"])
 
 
+@router.get("/estados", summary="Listar estados posibles de publicación", tags=["Publicaciones"])
+def listar_estados_publicacion(db: Session = Depends(get_db)):
+    """Devuelve la lista de estados posibles para publicaciones canónicas."""
+    estados = db.execute(text("SELECT id, nombre, descripcion FROM publicacion_estados ORDER BY id")).fetchall()
+    return [
+        {"id": row[0], "nombre": row[1], "descripcion": row[2]} for row in estados
+    ]
+
+
+@router.patch("/{publicacion_id}/estado", summary="Cambiar estado de publicación", tags=["Publicaciones"])
+def cambiar_estado_publicacion(
+    publicacion_id: int = Path(..., description="ID de la publicación canónica"),
+    estado_id: int = Body(..., embed=True, description="ID del nuevo estado (ver /publications/estados)"),
+    db: Session = Depends(get_db)
+):
+    """Cambia el estado de una publicación canónica por su ID."""
+    publicacion = db.query(CanonicalPublication).filter(CanonicalPublication.id == publicacion_id).first()
+    if not publicacion:
+        raise HTTPException(status_code=404, detail="Publicación no encontrada")
+    estado_row = db.execute(text("SELECT id, nombre FROM publicacion_estados WHERE id = :id"), {"id": estado_id}).fetchone()
+    if not estado_row:
+        raise HTTPException(status_code=400, detail="Estado no válido")
+    publicacion.estado_publicacion = estado_row[1]
+    db.commit()
+    return {"ok": True, "publicacion_id": publicacion_id, "nuevo_estado_id": estado_id}
+
+
 # ── GET /publications ────────────────────────────────────────
 
-@router.get("", response_model=PaginatedResponse[PublicationRead], summary="Listar publicaciones")
+@router.get("", summary="Listar publicaciones canónicas con estado", tags=["Publicaciones"])
 def list_publications(
     search: Optional[str] = Query(None, description="Buscar en título o DOI"),
     year_from: Optional[int] = Query(None),
@@ -52,8 +85,9 @@ def list_publications(
     page: int = Query(1, ge=1),
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
+    institutional_only: Optional[bool] = Query(None, description="Si es True, solo publicaciones institucionales (institutional_authors_count > 0). Si es False, solo no institucionales. Si es None, todas."),
 ):
-    """Lista paginada de publicaciones canónicas con filtros."""
+    """Lista paginada de publicaciones canónicas con filtros y estado (id y nombre)."""
     q = db.query(CanonicalPublication)
 
     if search:
@@ -76,12 +110,20 @@ def list_publications(
     if source:
         model_cls = SOURCE_MODELS.get(source)
         if model_cls:
-            pub_ids_with_source = (
+            # EXISTS es más eficiente que IN (subquery) en PostgreSQL para sets grandes
+            exists_subq = (
                 db.query(model_cls.canonical_publication_id)
-                .filter(model_cls.canonical_publication_id.isnot(None))
-                .distinct()
+                .filter(model_cls.canonical_publication_id == CanonicalPublication.id)
+                .exists()
             )
-            q = q.filter(CanonicalPublication.id.in_(pub_ids_with_source))
+            q = q.filter(exists_subq)
+
+    # Filtro institucional
+    if institutional_only is not None:
+        if institutional_only:
+            q = q.filter(CanonicalPublication.institutional_authors_count > 1)
+        else:
+            q = q.filter(CanonicalPublication.institutional_authors_count <= 1)
 
     total = q.count()
     items = (
@@ -91,8 +133,16 @@ def list_publications(
         .all()
     )
 
+
+    result_items = []
+    for p in items:
+        estado_nombre = getattr(p, "estado_publicacion", None)
+        pub_dict = PublicationRead.model_validate(p).model_dump()
+        pub_dict["estado"] = EstadoPublicacion(nombre=estado_nombre).model_dump() if estado_nombre else None
+        result_items.append(pub_dict)
+
     return PaginatedResponse.create(
-        items=[PublicationRead.model_validate(p) for p in items],
+        items=result_items,
         total=total,
         page=page,
         page_size=page_size,
@@ -170,25 +220,30 @@ def publications_by_year(db: Session = Depends(get_db)):
 
 @router.get("/field-coverage", response_model=FieldCoverageResponse, summary="Cobertura de campos")
 def field_coverage(db: Session = Depends(get_db)):
-    """Cobertura de campos en publicaciones canónicas."""
-    total = db.query(func.count(CanonicalPublication.id)).scalar() or 0
+    """Cobertura de campos en publicaciones canónicas. Una sola query con COUNT FILTER."""
+    from sqlalchemy import case
 
-    def count_non_null(col):
-        return db.query(func.count(col)).filter(col.isnot(None), col != "").scalar() or 0
+    cp = CanonicalPublication
+    row = db.query(
+        func.count(cp.id),
+        func.count(case((cp.doi.isnot(None) & (cp.doi != ""), 1))),
+        func.count(case((cp.source_journal.isnot(None) & (cp.source_journal != ""), 1))),
+        func.count(case((cp.issn.isnot(None) & (cp.issn != ""), 1))),
+        func.count(case((cp.publication_year.isnot(None), 1))),
+        func.count(case((cp.publication_type.isnot(None) & (cp.publication_type != ""), 1))),
+        func.count(case((cp.language.isnot(None) & (cp.language != ""), 1))),
+        func.count(case((cp.is_open_access.isnot(None), 1))),
+    ).one()
 
     return FieldCoverageResponse(
-        total=total,
-        with_doi=count_non_null(CanonicalPublication.doi),
-        with_journal=count_non_null(CanonicalPublication.source_journal),
-        with_issn=count_non_null(CanonicalPublication.issn),
-        with_year=db.query(func.count(CanonicalPublication.id)).filter(
-            CanonicalPublication.publication_year.isnot(None)
-        ).scalar() or 0,
-        with_type=count_non_null(CanonicalPublication.publication_type),
-        with_language=count_non_null(CanonicalPublication.language),
-        with_oa_info=db.query(func.count(CanonicalPublication.id)).filter(
-            CanonicalPublication.is_open_access.isnot(None)
-        ).scalar() or 0,
+        total=row[0] or 0,
+        with_doi=row[1] or 0,
+        with_journal=row[2] or 0,
+        with_issn=row[3] or 0,
+        with_year=row[4] or 0,
+        with_type=row[5] or 0,
+        with_language=row[6] or 0,
+        with_oa_info=row[7] or 0,
     )
 
 
@@ -236,8 +291,6 @@ def detect_duplicate_publications(
     - **Media** (85-95 %): Recomendación = review
     - **Baja** (< 85 %): Recomendación = keep_both
     """
-    import time
-    from collections import defaultdict
     from rapidfuzz import fuzz as rfuzz, process as rprocess
 
     t0 = time.perf_counter()
@@ -270,30 +323,70 @@ def detect_duplicate_publications(
             low_confidence=0, same_doi_different_id=0, pairs=[],
         )
 
-    # Pre-construir lista de títulos normalizados (orden = all_pubs)
-    titles = [p.normalized_title for p in all_pubs]
-
-    # --- 2. Comparación fuzzy: cada pub vs todas las subsiguientes ---
+    # --- 2. Comparación fuzzy agrupada por año (F5 optimization) ---
+    # Sin filtro de año: comparamos solo dentro del mismo año ±1.
+    # Esto reduce comparaciones de O(n²) global a O(k²) × n_años
+    # donde k = publicaciones por año (~100-200 en este dataset).
+    # Publicaciones sin año se comparan entre sí en un grupo separado.
     seen_pairs: set = set()
     raw_pairs: list = []  # (pub1, pub2, score)
 
-    for i in range(n):
-        # extract compara contra toda la lista; filtramos j > i después
-        matches = rprocess.extract(
-            titles[i],
-            titles,
-            scorer=rfuzz.token_sort_ratio,
-            score_cutoff=min_score,
-            limit=50,  # máximo vecinos cercanos por pub
-        )
-        for _match_str, match_score, j in matches:
-            if j <= i:
-                continue  # evitar self-match y pares ya vistos (j < i)
-            pair_key = (all_pubs[i].id, all_pubs[j].id)
-            if pair_key in seen_pairs:
-                continue
-            seen_pairs.add(pair_key)
-            raw_pairs.append((all_pubs[i], all_pubs[j], match_score))
+    # Agrupar por año; None va a su propio grupo
+    year_buckets: dict = defaultdict(list)
+    for pub in all_pubs:
+        year_buckets[pub.publication_year].append(pub)
+
+    def _compare_bucket(bucket: list) -> None:
+        """Compara todos los títulos dentro de un bucket con rapidfuzz."""
+        titles = [p.normalized_title for p in bucket]
+        for i in range(len(bucket)):
+            matches = rprocess.extract(
+                titles[i],
+                titles,
+                scorer=rfuzz.token_sort_ratio,
+                score_cutoff=min_score,
+                limit=50,
+            )
+            for _, match_score, j in matches:
+                if j <= i:
+                    continue
+                pair_key = (bucket[i].id, bucket[j].id)
+                if pair_key in seen_pairs:
+                    continue
+                seen_pairs.add(pair_key)
+                raw_pairs.append((bucket[i], bucket[j], match_score))
+
+    if year:
+        # Ya filtrado en la query — comparar todo el conjunto
+        _compare_bucket(all_pubs)
+    else:
+        # Comparar dentro de cada año y también entre años adyacentes (±1)
+        distinct_years = sorted(y for y in year_buckets if y is not None)
+        for idx, yr in enumerate(distinct_years):
+            current = year_buckets[yr]
+            _compare_bucket(current)
+            # Cruzar con el año siguiente (cubre duplicados con año reportado diferente)
+            if idx + 1 < len(distinct_years) and distinct_years[idx + 1] == yr + 1:
+                adjacent = year_buckets[distinct_years[idx + 1]]
+                # Solo comparar current contra adjacent (no re-comparar current×current)
+                titles_adj = [p.normalized_title for p in adjacent]
+                for pub in current:
+                    matches = rprocess.extract(
+                        pub.normalized_title,
+                        titles_adj,
+                        scorer=rfuzz.token_sort_ratio,
+                        score_cutoff=min_score,
+                        limit=50,
+                    )
+                    for _, match_score, j in matches:
+                        pair_key = (min(pub.id, adjacent[j].id), max(pub.id, adjacent[j].id))
+                        if pair_key in seen_pairs:
+                            continue
+                        seen_pairs.add(pair_key)
+                        raw_pairs.append((pub, adjacent[j], match_score))
+        # Publicaciones sin año: comparar entre sí
+        if year_buckets[None]:
+            _compare_bucket(year_buckets[None])
 
     # --- 3. Añadir pares de DOI duplicado que no hayan sido capturados ---
     doi_map: dict = defaultdict(list)
@@ -349,7 +442,26 @@ def detect_duplicate_publications(
                 if source_name not in sources_map[cpid]:
                     sources_map[cpid].append(source_name)
 
-    # --- 6. Clasificar y construir respuesta ---
+    # --- 6. Cargar autores de TODAS las publicaciones involucradas en batch (evita N+1) ---
+    pub_ids_for_authors = set()
+    for p1, p2, _ in raw_pairs:
+        pub_ids_for_authors.add(p1.id)
+        pub_ids_for_authors.add(p2.id)
+
+    # Una sola query trae todos los autores necesarios
+    authors_batch = (
+        db.query(PublicationAuthor, Author)
+        .join(Author, PublicationAuthor.author_id == Author.id)
+        .filter(PublicationAuthor.publication_id.in_(pub_ids_for_authors))
+        .order_by(PublicationAuthor.publication_id, PublicationAuthor.author_position.asc().nullslast())
+        .all()
+    )
+    # Indexar por publication_id para lookup O(1)
+    authors_by_pub: dict = defaultdict(list)
+    for pa, a in authors_batch:
+        authors_by_pub[pa.publication_id].append((pa, a))
+
+    # --- 7. Clasificar y construir respuesta ---
     pairs = []
     high = 0
     medium = 0
@@ -380,15 +492,9 @@ def detect_duplicate_publications(
             recommendation = "keep_both"
             low += 1
 
-        # Calcular similitud de autores y diferencias
-        autores1 = set(a.id for pa, a in db.query(PublicationAuthor, Author)
-            .join(Author, PublicationAuthor.author_id == Author.id)
-            .filter(PublicationAuthor.publication_id == p1.id)
-            .all())
-        autores2 = set(a.id for pa, a in db.query(PublicationAuthor, Author)
-            .join(Author, PublicationAuthor.author_id == Author.id)
-            .filter(PublicationAuthor.publication_id == p2.id)
-            .all())
+        # Calcular similitud de autores usando datos ya cargados (sin queries adicionales)
+        autores1 = {a.id for pa, a in authors_by_pub.get(p1.id, [])}
+        autores2 = {a.id for pa, a in authors_by_pub.get(p2.id, [])}
         if autores1 or autores2:
             if autores1 and autores2:
                 inter = autores1 & autores2
@@ -404,6 +510,7 @@ def detect_duplicate_publications(
             author_similarity = None
             author_diff_1 = []
             author_diff_2 = []
+
         pairs.append(DuplicatePublicationPair(
             canonical_id_1=p1.id,
             canonical_id_2=p2.id,
@@ -425,32 +532,12 @@ def detect_duplicate_publications(
             author_diff_1=author_diff_1,
             author_diff_2=author_diff_2,
             authors_1=[
-                PublicationAuthorRead(
-                    author_id=a.id,
-                    author_name=a.name,
-                    is_institutional=pa.is_institutional,
-                    author_position=pa.author_position,
-                    orcid=a.orcid,
-                )
-                for pa, a in db.query(PublicationAuthor, Author)
-                    .join(Author, PublicationAuthor.author_id == Author.id)
-                    .filter(PublicationAuthor.publication_id == p1.id)
-                    .order_by(PublicationAuthor.author_position.asc().nullslast())
-                    .all()
+                PublicationAuthorRead.from_pa_author(pa, a)
+                for pa, a in authors_by_pub.get(p1.id, [])
             ],
             authors_2=[
-                PublicationAuthorRead(
-                    author_id=a.id,
-                    author_name=a.name,
-                    is_institutional=pa.is_institutional,
-                    author_position=pa.author_position,
-                    orcid=a.orcid,
-                )
-                for pa, a in db.query(PublicationAuthor, Author)
-                    .join(Author, PublicationAuthor.author_id == Author.id)
-                    .filter(PublicationAuthor.publication_id == p2.id)
-                    .order_by(PublicationAuthor.author_position.asc().nullslast())
-                    .all()
+                PublicationAuthorRead.from_pa_author(pa, a)
+                for pa, a in authors_by_pub.get(p2.id, [])
             ],
         ))
 
@@ -484,7 +571,6 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
     ext_briefs = []
     source_links = {}
     for er in ext_records:
-        url = build_source_url(er.source_name, er.source_id, er.doi)
         ext_briefs.append(ExternalRecordBrief(
             id=er.id,
             source_name=er.source_name,
@@ -493,10 +579,10 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
             status=er.status,
             match_type=er.match_type,
             match_score=er.match_score,
-            source_url=url,
         ))
-        if url:
-            source_links[er.source_name] = url
+        clean_id = get_clean_source_id(er.source_name, er.source_id)
+        if clean_id:
+            source_links[er.source_name] = clean_id
 
     # Autores
     pub_authors = (
@@ -506,16 +592,7 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
         .order_by(PublicationAuthor.author_position.asc().nullslast())
         .all()
     )
-    authors_out = [
-        PublicationAuthorRead(
-            author_id=a.id,
-            author_name=a.name,
-            is_institutional=pa.is_institutional,
-            author_position=pa.author_position,
-            orcid=a.orcid,
-        )
-        for pa, a in pub_authors
-    ]
+    authors_out = [PublicationAuthorRead.from_pa_author(pa, a) for pa, a in pub_authors]
 
     pub_data = PublicationRead.model_validate(pub)
     return PublicationDetail(
@@ -523,6 +600,8 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
         external_records=ext_briefs,
         authors=authors_out,
         source_links=source_links,
+        field_conflicts=pub.field_conflicts or {},
+        citations_by_source=pub.citations_by_source or {},
     )
 
 @router.get("/{pub_id}/authors", response_model=List[PublicationAuthorRead], summary="Listar autores de una publicación")
@@ -530,7 +609,6 @@ def list_publication_authors(pub_id: int, db: Session = Depends(get_db)):
     """
     Devuelve la lista de autores (con orden y metadatos) de una publicación específica.
     """
-    from db.models import PublicationAuthor, Author
     pub_authors = (
         db.query(PublicationAuthor, Author)
         .join(Author, PublicationAuthor.author_id == Author.id)
@@ -538,16 +616,7 @@ def list_publication_authors(pub_id: int, db: Session = Depends(get_db)):
         .order_by(PublicationAuthor.author_position.asc().nullslast())
         .all()
     )
-    return [
-        PublicationAuthorRead(
-            author_id=a.id,
-            author_name=a.name,
-            is_institutional=pa.is_institutional,
-            author_position=pa.author_position,
-            orcid=a.orcid,
-        )
-        for pa, a in pub_authors
-    ]
+    return [PublicationAuthorRead.from_pa_author(pa, a) for pa, a in pub_authors]
 
 
 @router.get("/author/{author_id}/possible-duplicates", response_model=DuplicatePublicationsSummary, 
@@ -583,8 +652,6 @@ def get_author_possible_duplicates(
     - `low_confidence`: Pares levemente similares (mantener separados)
     - `same_doi_different_id`: Pares con mismo DOI pero diferente ID canónico
     """
-    from api.routers.publications_duplicates import find_possible_duplicates
-    
     # Verificar que el autor existe
     author = db.query(Author).filter(Author.id == author_id).first()
     if not author:
@@ -599,4 +666,68 @@ def get_author_possible_duplicates(
     )
     
     return result
+
+
+@router.post("/merge", response_model=MergePublicationsResponse, summary="Fusionar dos publicaciones canónicas")
+def merge_publications(body: MergePublicationsRequest, db: Session = Depends(get_db)):
+    """
+    Fusiona dos publicaciones canónicas: conserva la de keep_id y absorbe la de merge_id.
+    Reasigna autores y registros fuente, y elimina la publicación merge_id.
+    """
+    if body.keep_id == body.merge_id:
+        raise HTTPException(400, "keep_id y merge_id deben ser diferentes")
+    keeper = db.get(CanonicalPublication, body.keep_id)
+    removable = db.get(CanonicalPublication, body.merge_id)
+    if not keeper or not removable:
+        raise HTTPException(404, "No se encontró alguna de las publicaciones")
+
+    # --- Reasignar autores ---
+    authors_to_update = db.query(PublicationAuthor).filter(
+        PublicationAuthor.publication_id == removable.id
+    ).all()
+    keeper_authors = db.query(PublicationAuthor.author_id).filter(
+        PublicationAuthor.publication_id == keeper.id
+    ).all()
+    keeper_author_ids = {row[0] for row in keeper_authors}
+    for author_link in authors_to_update:
+        if author_link.author_id in keeper_author_ids:
+            db.delete(author_link)
+        else:
+            author_link.publication_id = keeper.id
+            db.add(author_link)
+
+    # --- Reasignar registros fuente ---
+    for source_name, model_cls in SOURCE_MODELS.items():
+        records_to_update = db.query(model_cls).filter(
+            model_cls.canonical_publication_id == removable.id
+        ).all()
+        for record in records_to_update:
+            record.canonical_publication_id = keeper.id
+            db.add(record)
+
+    # --- Unir field_provenance ---
+    if removable.field_provenance:
+        if keeper.field_provenance is None:
+            keeper.field_provenance = {}
+        for field, source in removable.field_provenance.items():
+            if field not in keeper.field_provenance:
+                keeper.field_provenance[field] = source
+
+    # --- Actualizar sources_count ---
+    keeper.sources_count = (keeper.sources_count or 1) + (removable.sources_count or 1)
+
+    # --- Eliminar la publicación fusionada ---
+    db.delete(removable)
+
+    try:
+        db.commit()
+    except IntegrityError as e:
+        db.rollback()
+        raise HTTPException(500, f"Error en la fusión: {e}")
+
+    return MergePublicationsResponse(
+        kept_publication_id=keeper.id,
+        merged_publication_id=removable.id,
+        message=f"Publicación #{removable.id} fusionada en #{keeper.id} correctamente."
+    )
 

@@ -1,0 +1,10 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(venvScriptspython.exe -c \":*)",
+      "Bash(\"venv/Scripts/python.exe\" -c \":*)",
+      "Bash(find c:Usersjuan.arenas1DesktopCONVOCATORIA -not -path */venv/* -not -path */.git/* -type f)",
+      "Bash(grep -rn SourceName. /c/Users/juan.arenas1/Desktop/CONVOCATORIA --include=*.py)"
+    ]
+  }
+}

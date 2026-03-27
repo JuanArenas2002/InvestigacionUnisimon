@@ -8,7 +8,7 @@ import logging
 from typing import Optional, List
 
 from fastapi import APIRouter, Depends, Query, HTTPException
-from sqlalchemy import func, case, or_, and_, text
+from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_db
@@ -25,16 +25,14 @@ from api.schemas.scopus import (
 )
 from api.schemas.common import PaginatedResponse
 from api.schemas.external_records import ExternalRecordRead, ExternalRecordDetail
-from api.utils import build_source_url
 from db.models import (
     CanonicalPublication,
     ScopusRecord,
     Author,
-    PublicationAuthor,
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/scopus", tags=["Scopus"])
+router = APIRouter(prefix="/scopus", tags=["Scopus Dashboard"])
 
 
 def _scopus_to_read(er: ScopusRecord) -> ExternalRecordRead:
@@ -54,7 +52,6 @@ def _scopus_to_read(er: ScopusRecord) -> ExternalRecordRead:
         reconciled_at=er.reconciled_at,
         created_at=er.created_at,
         updated_at=er.updated_at,
-        source_url=build_source_url("scopus", er.scopus_doc_id, er.doi),
     )
 
 
@@ -75,7 +72,6 @@ def _scopus_to_detail(er: ScopusRecord) -> ExternalRecordDetail:
         reconciled_at=er.reconciled_at,
         created_at=er.created_at,
         updated_at=er.updated_at,
-        source_url=build_source_url("scopus", er.scopus_doc_id, er.doi),
         raw_data=er.raw_data,
         normalized_title=er.normalized_title,
         normalized_authors=er.normalized_authors,
@@ -114,75 +110,6 @@ def scopus_insights(db: Session = Depends(get_db)):
         year_distribution=year_dist,
         enrichment_samples=samples,
     )
-
-
-# ══════════════════════════════════════════════════════════════
-# GET /scopus/records — Registros Scopus paginados
-# ══════════════════════════════════════════════════════════════
-
-@router.get(
-    "/records",
-    response_model=PaginatedResponse[ExternalRecordRead],
-    summary="Listar registros de Scopus",
-)
-def list_scopus_records(
-    status: Optional[str] = Query(None, description="Filtrar por estado"),
-    search: Optional[str] = Query(None, description="Buscar en título o DOI"),
-    year: Optional[int] = Query(None, description="Filtrar por año"),
-    found_only: bool = Query(False, description="Excluir placeholders (no encontrados)"),
-    page: int = Query(1, ge=1),
-    page_size: int = Query(50, ge=1, le=500),
-    db: Session = Depends(get_db),
-):
-    """Lista paginada de registros de Scopus con filtros."""
-    q = db.query(ScopusRecord)
-
-    if status:
-        q = q.filter(ScopusRecord.status == status)
-    if search:
-        term = f"%{search}%"
-        q = q.filter(
-            or_(
-                ScopusRecord.title.ilike(term),
-                ScopusRecord.doi.ilike(term),
-            )
-        )
-    if year:
-        q = q.filter(ScopusRecord.publication_year == year)
-    if found_only:
-        q = q.filter(
-            ~ScopusRecord.scopus_doc_id.like("not-found-%")
-        )
-
-    total = q.count()
-    items = (
-        q.order_by(ScopusRecord.created_at.desc())
-        .offset((page - 1) * page_size)
-        .limit(page_size)
-        .all()
-    )
-
-    return PaginatedResponse.create(
-        items=[_scopus_to_read(er) for er in items],
-        total=total, page=page, page_size=page_size,
-    )
-
-
-# ══════════════════════════════════════════════════════════════
-# GET /scopus/records/{id} — Detalle de un registro Scopus
-# ══════════════════════════════════════════════════════════════
-
-@router.get(
-    "/records/{record_id}",
-    response_model=ExternalRecordDetail,
-    summary="Detalle de un registro Scopus",
-)
-def get_scopus_record(record_id: int, db: Session = Depends(get_db)):
-    """Detalle completo de un registro Scopus (incluye raw_data)."""
-    er = db.get(ScopusRecord, record_id)
-    if not er:
-        raise HTTPException(404, "Registro Scopus no encontrado")
-    return _scopus_to_detail(er)
 
 
 # ══════════════════════════════════════════════════════════════

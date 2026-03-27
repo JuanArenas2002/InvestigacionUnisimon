@@ -37,8 +37,17 @@ class DatabaseConfig:
     port: int = int(os.getenv("DB_PORT", "5432"))
     database: str = os.getenv("DB_NAME", "reconciliacion_bibliografica")
     user: str = os.getenv("DB_USER", "postgres")
-    password: str = os.getenv("DB_PASSWORD", "123456")
+    password: str = ""  # Se valida en __post_init__
     echo_sql: bool = False  # True para depuración SQL
+
+    def __post_init__(self):
+        raw = os.getenv("DB_PASSWORD", "")
+        if not raw:
+            raise ValueError(
+                "DB_PASSWORD no está configurado. "
+                "Defínelo en el archivo .env o como variable de entorno del sistema."
+            )
+        self.password = raw
 
     @property
     def url(self) -> str:
@@ -195,7 +204,7 @@ class ReconciliationConfig:
     title_threshold: float = 88.0       # Mínimo para considerar match de título
     title_high_confidence: float = 95.0  # Match casi seguro solo por título
     author_threshold: float = 80.0       # Mínimo para match de autores
-    combined_threshold: float = 85.0     # Umbral combinado ponderado
+    combined_threshold: float = 87.0     # Umbral combinado ponderado (subido de 85 → 87 para reducir falsos positivos)
 
     # Pesos para score combinado
     weight_title: float = 0.55
@@ -207,7 +216,11 @@ class ReconciliationConfig:
 
     # Año: ¿debe coincidir exactamente?
     year_must_match: bool = True
-    year_tolerance: int = 0  # +/- años de tolerancia (0 = exacto)
+    year_tolerance: int = 1  # +/- años de tolerancia (1 permite online-first vs versión impresa)
+
+    # Solapamiento mínimo de palabras significativas entre títulos
+    # Si dos títulos comparten menos de N palabras clave, no pueden ser el mismo paper
+    min_title_word_overlap: int = 2
 
     # Review manual
     manual_review_threshold: float = 70.0  # Por debajo de combined_threshold

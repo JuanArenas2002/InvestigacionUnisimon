@@ -162,6 +162,85 @@ class OpenAlexExtractor(BaseExtractor):
             logger.debug(f"search_by_doi: DOI {doi_clean!r} → {e}")
             return None
 
+    def extract_by_author(
+        self,
+        orcid: Optional[str] = None,
+        author_id: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to:   Optional[int] = None,
+        max_results: Optional[int] = None,
+    ) -> List[StandardRecord]:
+        """
+        Extrae publicaciones de OpenAlex para un autor específico.
+
+        Acepta:
+          - orcid: ORCID del autor (e.g. "0000-0002-9222-3257")
+          - author_id: OpenAlex Author ID (e.g. "A5023888391" o URL completa)
+        """
+        if not orcid and not author_id:
+            raise ValueError("Se requiere orcid o author_id.")
+
+        self._validate_year_range(year_from, year_to)
+
+        # Construir filtro de autor
+        if orcid:
+            orcid_clean = orcid.strip()
+            if not orcid_clean.startswith("https://orcid.org/"):
+                orcid_clean = f"https://orcid.org/{orcid_clean}"
+            query = Works().filter(authorships={"author": {"orcid": orcid_clean}})
+            label = f"ORCID={orcid_clean}"
+        else:
+            aid = author_id.strip()
+            if not aid.startswith("https://openalex.org/"):
+                aid = f"https://openalex.org/{aid}"
+            query = Works().filter(authorships={"author": {"id": aid}})
+            label = f"author_id={aid}"
+
+        if year_from and year_to:
+            query = query.filter(publication_year=f"{year_from}-{year_to}")
+        elif year_from:
+            query = query.filter(from_publication_date=f"{year_from}-01-01")
+        elif year_to:
+            query = query.filter(to_publication_date=f"{year_to}-12-31")
+
+        logger.info(f"OpenAlex · búsqueda por autor ({label}): {year_from or 'inicio'} – {year_to or 'presente'}")
+
+        records: List[StandardRecord] = []
+        total_fetched = 0
+
+        try:
+            for page in query.paginate(
+                per_page=self.config.max_per_page,
+                n_max=max_results,
+            ):
+                works_to_process = page
+                if hasattr(page, "results"):
+                    works_to_process = page.results
+                elif not hasattr(page, "get"):
+                    try:
+                        works_to_process = list(page)
+                    except (TypeError, AttributeError):
+                        works_to_process = [page]
+
+                for work in (works_to_process if isinstance(works_to_process, list) else [works_to_process]):
+                    try:
+                        record = self._parse_record(work)
+                        if record:
+                            records.append(record)
+                            total_fetched += 1
+                    except Exception as e:
+                        logger.warning(f"Error parseando work: {e}")
+                        continue
+
+                    if total_fetched % 200 == 0:
+                        logger.info(f"  Extraídos: {total_fetched}")
+
+        except Exception as e:
+            raise OpenAlexAPIError(f"Error comunicándose con OpenAlex: {e}")
+
+        logger.info(f"Extracción por autor completa: {total_fetched} registros ({label})")
+        return self._post_process(records)
+
     def _parse_record(self, work) -> StandardRecord:
         """Convierte un work de OpenAlex a StandardRecord."""
         # Intentar convertir a diccionario si no lo es

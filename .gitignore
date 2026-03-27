@@ -25,3 +25,10 @@ reports/charts/
 reports/exports/
 reports/clean_data*.json
 reports/clean_data*.csv
+reports/dedup_report*.csv
+
+# Datos extraídos crudos (regenerables)
+OpenAlexJson/
+
+# Cachés de runtime
+extractors/.journal_disk_cache.json

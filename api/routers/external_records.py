@@ -16,7 +16,6 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_db
-from api.utils import build_source_url
 from api.schemas.common import PaginatedResponse, MessageResponse
 from api.schemas.external_records import (
     ExternalRecordRead,
@@ -35,7 +34,7 @@ from db.models import (
 )
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/external-records", tags=["Registros de Fuentes"])
+router = APIRouter(prefix="/external-records", tags=["Registros Externos"])
 
 
 # ── helpers ──────────────────────────────────────────────────
@@ -57,7 +56,6 @@ def _record_to_read(record) -> ExternalRecordRead:
         reconciled_at=record.reconciled_at,
         created_at=record.created_at,
         updated_at=record.updated_at,
-        source_url=build_source_url(record.source_name, record.source_id, record.doi),
     )
 
 
@@ -78,7 +76,6 @@ def _record_to_detail(record) -> ExternalRecordDetail:
         reconciled_at=record.reconciled_at,
         created_at=record.created_at,
         updated_at=record.updated_at,
-        source_url=build_source_url(record.source_name, record.source_id, record.doi),
         raw_data=record.raw_data,
         normalized_title=record.normalized_title,
         normalized_authors=record.normalized_authors,

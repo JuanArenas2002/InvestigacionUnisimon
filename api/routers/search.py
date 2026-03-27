@@ -18,7 +18,7 @@ from config import openalex_config, institution
 from extractors.base import normalize_doi
 
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/search", tags=["Búsqueda"])
+router = APIRouter(prefix="/search", tags=["Búsqueda en Vivo"])
 
 
 # ─────────────────────────────────────────────────────────────────────────────

@@ -77,7 +77,7 @@ def analyze_scopus_default(
     author_id: int = Query(..., description="ID del autor en la base de datos local"),
     year_from: Optional[int] = Query(None, description="Año inicial para filtrar publicaciones", ge=1900, le=2100),
     year_to: Optional[int] = Query(None, description="Año final para filtrar publicaciones", ge=1900, le=2100),
-    campo: str = Query("CIENCIAS_SALUD", description="Campo disciplinar para umbrales específicos", regex="^(CIENCIAS_SALUD|CIENCIAS_BASICAS|INGENIERIA|CIENCIAS_SOCIALES|ARTES_HUMANIDADES)$"),
+    campo: str = Query("CIENCIAS_SALUD", description="Campo disciplinar para umbrales específicos", pattern="^(CIENCIAS_SALUD|CIENCIAS_BASICAS|INGENIERIA|CIENCIAS_SOCIALES|ARTES_HUMANIDADES)$"),
     db: Session = Depends(get_db),
 ):
     """

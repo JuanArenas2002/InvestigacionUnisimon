@@ -47,7 +47,7 @@ class AuthorPublicationRead(BaseModel):
     sources: List[str] = Field(default_factory=list, description="Nombres de las fuentes")
     source_links: dict = Field(
         default_factory=dict,
-        description="Enlaces por fuente: {openalex: url, scopus: url, ...}",
+        description="ID por fuente: {openalex: id, scopus: id, ...}. El frontend construye la URL completa.",
     )
 
     model_config = {"from_attributes": True}
@@ -148,7 +148,7 @@ class InventoryProductRead(BaseModel):
     sources: List[str] = Field(default_factory=list, description="Fuentes que contienen este producto")
     source_links: dict = Field(
         default_factory=dict,
-        description="URL por fuente: {openalex: url, scopus: url, ...}",
+        description="ID por fuente: {openalex: id, scopus: id, ...}. El frontend construye la URL completa.",
     )
 
     model_config = {"from_attributes": True}

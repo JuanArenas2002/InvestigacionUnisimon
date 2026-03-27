@@ -60,7 +60,7 @@ def normalize_for_comparison(text: str) -> str:
     - minúsculas
     - sin diacríticos
     - solo alfanuméricos y espacios
-    - sin stopwords comunes en títulos académicos
+    - espacios múltiples colapsados
     """
     if not text:
         return ""
@@ -69,6 +69,32 @@ def normalize_for_comparison(text: str) -> str:
     text = re.sub(r'[^a-z0-9\s]', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
+
+
+# Palabras vacías que no aportan información para distinguir títulos académicos
+_ACADEMIC_STOPWORDS = frozenset({
+    'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'with',
+    'and', 'or', 'but', 'by', 'from', 'as', 'into', 'about',
+    'is', 'are', 'was', 'were', 'be', 'been', 'being',
+    'have', 'has', 'had', 'do', 'does', 'did',
+    'not', 'no', 'nor', 'its', 'their', 'our',
+    'this', 'that', 'these', 'those', 'it',
+    'between', 'among', 'within', 'through', 'using', 'based', 'via',
+    'new', 'use', 'used', 'study', 'analysis', 'review', 'approach',
+})
+
+
+def _get_significant_words(text: str) -> frozenset:
+    """
+    Extrae palabras significativas de un título (sin stopwords, longitud >= 3).
+    Usado para verificar que dos títulos compartan suficiente vocabulario antes
+    de calcular el score fuzzy.
+    """
+    normalized = normalize_for_comparison(text)
+    return frozenset(
+        w for w in normalized.split()
+        if len(w) >= 3 and w not in _ACADEMIC_STOPWORDS
+    )
 
 
 def normalize_author_name(name: str) -> str:
@@ -116,6 +142,11 @@ def compare_titles(title_a: str, title_b: str) -> float:
     Compara dos títulos normalizados.
     Usa token_sort_ratio para manejar orden diferente de palabras.
 
+    Incluye un guard de solapamiento: si los títulos no comparten suficientes
+    palabras significativas, devuelve 0 sin calcular scores fuzzy. Esto evita
+    que títulos completamente distintos con alta similitud léxica superficial
+    sean considerados candidatos a merge.
+
     Returns:
         Score de 0 a 100
     """
@@ -126,6 +157,13 @@ def compare_titles(title_a: str, title_b: str) -> float:
     norm_b = normalize_for_comparison(title_b)
 
     if not norm_a or not norm_b:
+        return 0.0
+
+    # Guard: solapamiento mínimo de palabras significativas
+    words_a = _get_significant_words(title_a)
+    words_b = _get_significant_words(title_b)
+    min_overlap = rc_config.min_title_word_overlap
+    if words_a and words_b and len(words_a & words_b) < min_overlap:
         return 0.0
 
     # Usar múltiples métricas y tomar la mejor

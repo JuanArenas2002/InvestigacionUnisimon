@@ -37,6 +37,7 @@ Flujo en cascada:
 
 import hashlib
 import logging
+import re as _re
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any
 
@@ -45,6 +46,7 @@ from sqlalchemy.exc import IntegrityError
 
 from config import (
     reconciliation_config as rc_config,
+    criteria_config,
     MatchType,
     RecordStatus,
 )
@@ -54,14 +56,10 @@ from db.models import (
     PublicationAuthor,
     ReconciliationLog,
     SOURCE_MODELS,
-    OpenalexRecord,
-    ScopusRecord,
-    WosRecord,
-    CvlacRecord,
-    DatosAbiertosRecord,
     find_record_by_doi_across_sources,
     count_source_records_for_canonical,
 )
+from db.source_registry import SOURCE_REGISTRY
 from db.session import get_session
 from extractors.base import StandardRecord, normalize_text, normalize_doi, normalize_author_name
 from reconciliation.fuzzy_matcher import compare_records, FuzzyMatchResult
@@ -69,14 +67,8 @@ from reconciliation.fuzzy_matcher import compare_records, FuzzyMatchResult
 logger = logging.getLogger(__name__)
 
 
-# Mapeo: source_name → nombre del atributo que contiene el source_id
-_SOURCE_ID_ATTR = {
-    "openalex": "openalex_work_id",
-    "scopus": "scopus_doc_id",
-    "wos": "wos_uid",
-    "cvlac": "cvlac_product_id",
-    "datos_abiertos": "datos_source_id",
-}
+# Mapeo source_name → id_attr derivado del registry (no hardcodeado)
+_SOURCE_ID_ATTR = SOURCE_REGISTRY.id_attrs
 
 
 # =============================================================
@@ -199,68 +191,12 @@ class ReconciliationEngine:
             status=RecordStatus.PENDING,
         )
 
-        # --- Campos específicos por fuente ---
+        # --- Campos específicos por fuente (delegado al registry) ---
+        # Para agregar una nueva fuente: crear build_X_kwargs en db/source_builders.py
+        # y registrarla en db/models.py con SOURCE_REGISTRY.register().
         raw = record.raw_data or {}
-
-        if record.source_name == "openalex":
-            kwargs["openalex_work_id"] = record.source_id
-            kwargs["pmid"] = record.pmid
-            kwargs["pmcid"] = record.pmcid
-            # Fallbacks desde raw_data si StandardRecord no los tiene
-            if not kwargs["source_journal"]:
-                source_info = raw.get("source", {})
-                if isinstance(source_info, dict):
-                    kwargs["source_journal"] = (
-                        source_info.get("display_name") or source_info.get("name")
-                    )
-            if not kwargs["issn"]:
-                source_info = raw.get("source", {})
-                if isinstance(source_info, dict):
-                    kwargs["issn"] = source_info.get("issn_l")
-            if kwargs["is_open_access"] is None:
-                oa_info = raw.get("open_access", {})
-                if isinstance(oa_info, dict) and "is_oa" in oa_info:
-                    kwargs["is_open_access"] = oa_info.get("is_oa")
-            if not kwargs["citation_count"]:
-                kwargs["citation_count"] = int(raw.get("cited_by_count") or 0)
-
-        elif record.source_name == "scopus":
-            kwargs["scopus_doc_id"] = record.source_id
-            kwargs["volume"] = raw.get("prism:volume")
-            kwargs["issue"] = raw.get("prism:issueIdentifier")
-            kwargs["page_range"] = raw.get("prism:pageRange")
-            kwargs["abstract"] = raw.get("dc:description")
-            kwargs["author_keywords"] = raw.get("authkeywords")
-            # Fallbacks desde raw_data
-            if not kwargs["source_journal"]:
-                kwargs["source_journal"] = raw.get("prism:publicationName")
-            if not kwargs["publication_type"]:
-                kwargs["publication_type"] = raw.get("subtypeDescription")
-            if kwargs["is_open_access"] is None:
-                flag = raw.get("openaccessFlag")
-                if flag is not None:
-                    kwargs["is_open_access"] = flag if isinstance(flag, bool) else str(flag).lower() == "true"
-            if not kwargs["citation_count"]:
-                kwargs["citation_count"] = int(raw.get("citedby-count") or 0)
-            if not kwargs["publication_date"]:
-                kwargs["publication_date"] = raw.get("prism:coverDate")
-            if not kwargs["issn"]:
-                kwargs["issn"] = raw.get("prism:issn")
-
-        elif record.source_name == "wos":
-            kwargs["wos_uid"] = record.source_id
-            if not kwargs["source_journal"]:
-                kwargs["source_journal"] = raw.get("sourceTitle")
-            if not kwargs["publication_date"]:
-                kwargs["publication_date"] = raw.get("publishDate")
-
-        elif record.source_name == "cvlac":
-            kwargs["cvlac_product_id"] = record.source_id
-            kwargs["cvlac_code"] = raw.get("cvlac_code")
-
-        elif record.source_name == "datos_abiertos":
-            kwargs["datos_source_id"] = record.source_id
-            kwargs["dataset_id"] = raw.get("dataset_id")
+        source_def = SOURCE_REGISTRY.get(record.source_name)
+        source_def.build_specific_kwargs(record, raw, kwargs)
 
         return model_cls(**kwargs)
 
@@ -519,6 +455,26 @@ class ReconciliationEngine:
                     MatchType.FUZZY_HIGH,
                     MatchType.FUZZY_COMBINED,
                 ):
+                    # Guard: si ambos registros tienen DOIs distintos, degradar a revisión manual.
+                    # DOIs distintos casi siempre implican productos distintos.
+                    if ext.doi and best_match.doi:
+                        ndoi_ext = normalize_doi(ext.doi)
+                        if ndoi_ext and ndoi_ext != best_match.doi:
+                            details = {
+                                **best_result.to_dict(),
+                                "doi_conflict": {
+                                    "incoming": ndoi_ext,
+                                    "canonical": best_match.doi,
+                                },
+                            }
+                            self._flag_for_review(ext, best_match, best_result.combined_score, details, now)
+                            self.stats.manual_review += 1
+                            logger.info(
+                                f"  CONFLICTO DOI: fuzzy match degradado a revisión — "
+                                f"incoming={ndoi_ext} canonical={best_match.doi}"
+                            )
+                            return
+
                     self._link_to_canonical(
                         ext, best_match,
                         best_result.match_type,
@@ -652,12 +608,38 @@ class ReconciliationEngine:
             f"({match_type}, score={score:.1f})"
         )
 
+    def _reject_source_record(self, ext, reason: str):
+        """Marca un registro de fuente como rechazado sin crear canónica."""
+        ext.status = RecordStatus.REJECTED
+        ext.match_type = reason
+        ext.match_score = 0.0
+        ext.reconciled_at = datetime.now(timezone.utc)
+        logger.warning(
+            f"  RECHAZADO: {ext.source_name}:{ext.id} — {reason} "
+            f"(título: '{(ext.title or '')[:80]}')"
+        )
+
     def _create_new_canonical(self, ext, timestamp: datetime):
         """
         Crea una nueva publicación canónica a partir de un registro de fuente.
-        Incluye protección contra DOI duplicado.
+        Incluye:
+          - Protección contra DOI duplicado.
+          - Validación de título: rechaza registros sin título o con título
+            en la lista negra (blacklist_keywords de criteria_config).
         """
         ndoi = normalize_doi(ext.doi) if ext.doi else None
+
+        # --- Validación de título (Problema 5) ---
+        raw_title = (ext.title or "").strip()
+        if not raw_title or len(raw_title) < criteria_config.min_title_length:
+            self._reject_source_record(ext, "invalid_title_too_short")
+            return
+
+        title_lower = normalize_text(raw_title)
+        for kw in criteria_config.blacklist_keywords:
+            if kw in title_lower:
+                self._reject_source_record(ext, f"invalid_title_blacklisted")
+                return
 
         # --- Verificación final anti-duplicado por DOI ---
         if ndoi:
@@ -701,9 +683,10 @@ class ReconciliationEngine:
         if ext.issn:
             provenance["issn"] = src
 
+        initial_cites = ext.citation_count or 0
         canonical = CanonicalPublication(
             doi=ndoi,
-            title=ext.title or "Sin título",
+            title=raw_title,
             normalized_title=ext.normalized_title,
             publication_year=ext.publication_year,
             publication_date=ext.publication_date,
@@ -713,9 +696,11 @@ class ReconciliationEngine:
             language=ext.language,
             is_open_access=ext.is_open_access,
             oa_status=ext.oa_status,
-            citation_count=ext.citation_count or 0,
+            citation_count=initial_cites,
+            citations_by_source={src: initial_cites} if initial_cites else {},
             sources_count=1,
             field_provenance=provenance,
+            field_conflicts={},
         )
 
         try:
@@ -796,22 +781,61 @@ class ReconciliationEngine:
     # ENRIQUECIMIENTO
     # ---------------------------------------------------------
 
+    def _record_conflict(
+        self,
+        canonical: CanonicalPublication,
+        field: str,
+        existing_source: str,
+        existing_value,
+        new_source: str,
+        new_value,
+    ):
+        """
+        Registra en field_conflicts que dos fuentes discrepan en un campo.
+        No sobreescribe el valor canónico; solo documenta la discrepancia
+        para revisión posterior.
+        """
+        conflicts = dict(canonical.field_conflicts or {})
+        entry = conflicts.get(field, {})
+        entry[existing_source] = str(existing_value)
+        entry[new_source] = str(new_value)
+        conflicts[field] = entry
+        canonical.field_conflicts = conflicts
+        logger.info(
+            f"  CONFLICTO canon={canonical.id} campo='{field}': "
+            f"{existing_source}={existing_value!r} vs {new_source}={new_value!r}"
+        )
+
     def _enrich_canonical(self, canonical: CanonicalPublication, ext):
         """
         Completa campos vacíos de la publicación canónica
         usando las columnas tipadas del registro de fuente.
-        Solo escribe si el campo de la canónica está vacío/nulo.
-        Registra en field_provenance qué fuente aportó cada dato.
+
+        - Solo escribe si el campo de la canónica está vacío/nulo.
+        - Registra en field_provenance qué fuente aportó cada dato.
+        - Detecta y registra en field_conflicts cuando fuentes discrepan
+          en campos críticos (is_open_access, doi).
+        - Actualiza citations_by_source por fuente; citation_count = max.
         """
         enriched_fields = []
         src = ext.source_name
         prov = dict(canonical.field_provenance or {})
 
-        # DOI
-        if not canonical.doi and ext.doi:
-            canonical.doi = normalize_doi(ext.doi)
-            enriched_fields.append("doi")
-            prov["doi"] = src
+        # DOI — detectar conflicto si ambos tienen DOI distintos
+        if ext.doi:
+            ndoi = normalize_doi(ext.doi)
+            if ndoi:
+                if not canonical.doi:
+                    canonical.doi = ndoi
+                    enriched_fields.append("doi")
+                    prov["doi"] = src
+                elif canonical.doi != ndoi:
+                    # Ambas fuentes reportan DOIs diferentes → conflicto
+                    self._record_conflict(
+                        canonical, "doi",
+                        prov.get("doi", "original"), canonical.doi,
+                        src, ndoi,
+                    )
 
         # Revista / fuente
         if not canonical.source_journal and ext.source_journal:
@@ -825,11 +849,19 @@ class ReconciliationEngine:
             enriched_fields.append("publication_type")
             prov["publication_type"] = src
 
-        # Open Access
-        if canonical.is_open_access is None and ext.is_open_access is not None:
-            canonical.is_open_access = ext.is_open_access
-            enriched_fields.append("is_open_access")
-            prov["is_open_access"] = src
+        # Open Access — detectar conflicto si ambas fuentes tienen valores opuestos
+        if ext.is_open_access is not None:
+            if canonical.is_open_access is None:
+                canonical.is_open_access = ext.is_open_access
+                enriched_fields.append("is_open_access")
+                prov["is_open_access"] = src
+            elif canonical.is_open_access != ext.is_open_access:
+                # Fuentes en desacuerdo: registrar conflicto, no sobreescribir
+                self._record_conflict(
+                    canonical, "is_open_access",
+                    prov.get("is_open_access", "original"), canonical.is_open_access,
+                    src, ext.is_open_access,
+                )
 
         # OA Status
         if not canonical.oa_status and ext.oa_status:
@@ -843,12 +875,16 @@ class ReconciliationEngine:
             enriched_fields.append("issn")
             prov["issn"] = src
 
-        # Citas: tomar el máximo entre fuentes
+        # Citas: registrar por fuente y usar el máximo como valor canónico
         new_cites = ext.citation_count or 0
-        if new_cites > (canonical.citation_count or 0):
-            canonical.citation_count = new_cites
+        cbs = dict(canonical.citations_by_source or {})
+        cbs[src] = new_cites
+        canonical.citations_by_source = cbs
+        max_cites = max(cbs.values())
+        if max_cites != (canonical.citation_count or 0):
+            canonical.citation_count = max_cites
             enriched_fields.append("citation_count")
-            prov["citation_count"] = src
+            prov["citation_count"] = max(cbs, key=cbs.get)
 
         # Año de publicación
         if not canonical.publication_year and ext.publication_year:
@@ -951,6 +987,12 @@ class ReconciliationEngine:
             orcid = author_data.get("orcid") or ""
             if orcid:
                 orcid = orcid.replace("https://orcid.org/", "").replace("http://orcid.org/", "").strip()
+                # Validar formato ORCID: XXXX-XXXX-XXXX-XXXX (último dígito puede ser X)
+                if not _re.fullmatch(r'\d{4}-\d{4}-\d{4}-\d{3}[\dX]', orcid):
+                    logger.debug(
+                        f"  ORCID inválido descartado para '{name}': '{orcid}'"
+                    )
+                    orcid = ""
 
             # Determinar si es institucional
             is_inst = author_data.get("is_institutional", False)
@@ -1003,15 +1045,15 @@ class ReconciliationEngine:
                         if not surname_ok:
                             continue
 
-                        position_match = (cand_pos == idx)
+                        # Solo nombre completo normalizado — sin bonus de posición
+                        # El orden de autores varía entre fuentes y no es señal fiable
                         fuzzy_score = _fuzz.token_sort_ratio(new_norm, c_norm)
-                        combined = fuzzy_score + (20 if position_match else 0)
 
-                        if combined > best_score:
-                            best_score = combined
+                        if fuzzy_score > best_score:
+                            best_score = fuzzy_score
                             best_match = candidate
 
-                    if best_match and best_score >= 65:
+                    if best_match and best_score >= 80:
                         author = best_match
                         logger.debug(
                             f"  MATCH por posición+apellido: '{name}' → "

@@ -1,7 +1,16 @@
 """
-Endpoints: Extraction / Data Ingestion
+Endpoints: Utilidades de ingesta (Pipeline · Extracción)
 
-endpoints/extraction.py - Mantiene 278 líneas de extraction.py reducidas a ~150
+Contiene operaciones que no tienen equivalente en /sources/:
+  - load-json          : cargar un archivo JSON local y reconciliar
+  - search-doi-in-sources : buscar un DOI en todas las fuentes externas
+
+Para extraer publicaciones de una plataforma usa los endpoints de Fuentes:
+  POST /api/sources/openalex/search/by-institution
+  POST /api/sources/scopus/search/by-institution
+  POST /api/sources/wos/search/by-institution
+  POST /api/sources/cvlac/search/by-author
+  POST /api/sources/datos-abiertos/search/by-institution
 """
 import json
 import logging
@@ -10,8 +19,6 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, Body
 
 from api.schemas.external_records import (
-    ExtractionRequest,
-    ScopusExtractionRequest,
     JsonLoadRequest,
     ExtractionResponse,
     ReconciliationStatsResponse,
@@ -29,109 +36,10 @@ from .._json_loader import (
 
 
 logger = logging.getLogger("pipeline")
-router = APIRouter(tags=["Extraction"])
+router = APIRouter(tags=["Pipeline · Extracción"])
 
 
-# ── POST /pipeline/extract/openalex ────────────────────────────────────────
-
-@router.post(
-    "/openalex",
-    response_model=ExtractionResponse,
-    summary="Extraer de OpenAlex por ROR",
-)
-def extract_openalex(body: ExtractionRequest):
-    """
-    Extrae publicaciones de OpenAlex usando el ROR id de la institución
-    y reconcilia automáticamente.
-    """
-    from config import institution
-    from extractors.openalex import OpenAlexExtractor
-    from db.session import get_engine
-    from sqlalchemy.orm import sessionmaker
-    from db.models import OpenalexRecord
-
-    ror_id = body.affiliation_id or institution.ror_id
-    extractor = OpenAlexExtractor(ror_id=ror_id)
-    records = extractor.extract(
-        year_from=body.year_from,
-        year_to=body.year_to,
-        max_results=body.max_results,
-    )
-    
-    engine = get_engine()
-    Session = sessionmaker(bind=engine)
-    session = Session()
-    inserted = 0
-    
-    for r in records:
-        if not r.source_id:
-            continue
-        exists = session.query(OpenalexRecord).filter_by(openalex_work_id=r.source_id).first()
-        if exists:
-            continue
-        rec = OpenalexRecord(
-            openalex_work_id=r.source_id,
-            doi=r.doi,
-            title=r.title,
-            publication_year=r.publication_year,
-            publication_date=r.publication_date,
-            publication_type=r.publication_type,
-            source_journal=r.source_journal,
-            issn=r.issn,
-            is_open_access=r.is_open_access,
-            citation_count=r.citation_count,
-            status="pending",
-        )
-        session.add(rec)
-        inserted += 1
-    
-    session.commit()
-    session.close()
-
-    engine2 = ReconciliationEngine()
-    stats = engine2.reconcile_pending(batch_size=500)
-    
-    return ExtractionResponse(
-        extracted=len(records),
-        inserted=inserted,
-        message=f"Extraídos {len(records)}, insertados {inserted}",
-        reconciliation=ReconciliationStatsResponse(**stats.to_dict()),
-    )
-
-
-# ── POST /pipeline/extract/scopus ──────────────────────────────────────────
-
-@router.post(
-    "/scopus",
-    response_model=ExtractionResponse,
-    summary="Extraer de Scopus",
-)
-def extract_scopus(body: ScopusExtractionRequest):
-    """Extrae publicaciones de Scopus e ingesta."""
-    from config import institution
-    from extractors.scopus import ScopusExtractor
-
-    affiliation_id = body.affiliation_id or institution.scopus_affiliation_id
-    extractor = ScopusExtractor()
-    records = extractor.extract(
-        year_from=body.year_from,
-        year_to=body.year_to,
-        max_results=body.max_results,
-        affiliation_id=affiliation_id,
-    )
-    
-    rec_engine = ReconciliationEngine()
-    stats = rec_engine.reconcile_batch(records)
-    
-    return ExtractionResponse(
-        extracted=len(records),
-        inserted=stats.total_processed,
-        message=f"Extraídos {len(records)}, reconciliados {stats.total_processed}",
-        reconciliation=ReconciliationStatsResponse(**stats.to_dict()),
-    )
-
-
-# ── POST /pipeline/load-json ──────────────────────────────────────────────
+# ── POST /pipeline/extract/load-json ──────────────────────────────────────
 
 @router.post(
     "/load-json",

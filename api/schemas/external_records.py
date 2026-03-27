@@ -24,8 +24,6 @@ class ExternalRecordRead(BaseModel):
     reconciled_at: Optional[datetime] = None
     created_at: datetime
     updated_at: datetime
-    source_url: str = ""
-
     model_config = {"from_attributes": True}
 
 
