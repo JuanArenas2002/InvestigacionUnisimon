@@ -9,6 +9,7 @@ from sqlalchemy.orm import sessionmaker, Session
 
 from config import db_config
 from db.models import Base, SOURCE_MODELS, SOURCE_TABLE_NAMES
+from db.source_registry import SOURCE_REGISTRY
 
 logger = logging.getLogger(__name__)
 
@@ -81,29 +82,13 @@ def create_all_source_records_view(engine=None):
         "created_at", "updated_at",
     ]
 
-    # Mapeo de columna source_id por tabla
-    source_id_col = {
-        "openalex_records": "openalex_work_id",
-        "scopus_records": "scopus_doc_id",
-        "wos_records": "wos_uid",
-        "cvlac_records": "cvlac_product_id",
-        "datos_abiertos_records": "datos_source_id",
-    }
-    source_name_val = {
-        "openalex_records": "openalex",
-        "scopus_records": "scopus",
-        "wos_records": "wos",
-        "cvlac_records": "cvlac",
-        "datos_abiertos_records": "datos_abiertos",
-    }
-
+    # Derivado del registry — se actualiza automáticamente al registrar nuevas fuentes
     selects = []
-    for table_name in SOURCE_TABLE_NAMES:
+    for src_def in SOURCE_REGISTRY.all():
+        table_name = src_def.model_class.__tablename__
         cols_sql = ", ".join(common_cols)
-        sid_col = source_id_col[table_name]
-        sname = source_name_val[table_name]
         selects.append(
-            f"SELECT '{sname}' AS source_name, {sid_col} AS source_id, {cols_sql} "
+            f"SELECT '{src_def.name}' AS source_name, {src_def.id_attr} AS source_id, {cols_sql} "
             f"FROM {table_name}"
         )
 

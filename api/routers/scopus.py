@@ -251,14 +251,13 @@ def scopus_authors(
 ):
     """Lista autores que tienen Scopus Author ID."""
     q = db.query(Author).filter(
-        Author.scopus_id.isnot(None),
-        Author.scopus_id != "",
+        Author.external_ids.has_key("scopus"),
     )
 
     if only_scopus:
         q = q.filter(
             or_(Author.orcid.is_(None), Author.orcid == ""),
-            or_(Author.openalex_id.is_(None), Author.openalex_id == ""),
+            ~Author.external_ids.has_key("openalex"),
         )
 
     total = q.count()
@@ -391,13 +390,13 @@ def _build_author_stats(db: Session) -> ScopusAuthorStats:
     total = db.query(func.count(Author.id)).scalar() or 0
 
     with_sid = db.query(func.count(Author.id)).filter(
-        Author.scopus_id.isnot(None), Author.scopus_id != ""
+        Author.external_ids.has_key("scopus")
     ).scalar() or 0
 
     only_scopus = db.query(func.count(Author.id)).filter(
-        Author.scopus_id.isnot(None), Author.scopus_id != "",
+        Author.external_ids.has_key("scopus"),
         or_(Author.orcid.is_(None), Author.orcid == ""),
-        or_(Author.openalex_id.is_(None), Author.openalex_id == ""),
+        ~Author.external_ids.has_key("openalex"),
     ).scalar() or 0
 
     pct = round(with_sid / total * 100, 1) if total else 0.0

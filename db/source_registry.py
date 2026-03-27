@@ -5,33 +5,22 @@ ARQUITECTURA DE EXTENSIBILIDAD
 ================================
 Para agregar una nueva fuente (ej: "pubmed") sin tocar ningún archivo existente:
 
-  1. Crea el modelo SQLAlchemy en db/models.py (o un archivo aparte)
-     que herede de SourceRecordMixin + Base.
+  1. Crea el archivo  sources/pubmed.py  con:
+       - Clase SQLAlchemy que herede de SourceRecordMixin + Base
+       - Función constructora de kwargs específicos
+       - Una llamada  SOURCE_REGISTRY.register(...)  al final del módulo
 
-  2. Crea la función constructora de campos:
-         def _build_pubmed_kwargs(record: StandardRecord, raw: dict) -> dict:
-             return {
-                 "pubmed_uid": record.source_id,
-                 "abstract": raw.get("AbstractText"),
-                 ...
-             }
+  2. Ejecuta la migración SQL para crear la tabla y, si aplica,
+     agregar la clave "pubmed" a los registros JSONB de external_ids.
 
-  3. Registra la fuente — una sola línea:
-         SOURCE_REGISTRY.register(SourceDefinition(
-             name="pubmed",
-             model_class=PubmedRecord,
-             id_attr="pubmed_uid",            # columna PK de la fuente en su tabla
-             author_id_attr="pubmed_id",      # columna en la tabla authors (o None)
-             build_specific_kwargs=_build_pubmed_kwargs,
-         ))
-
-  Eso es todo. El motor de reconciliación, el API y los routers de autores
+  Eso es todo. El motor de reconciliación, el API y los routers
   lo detectan automáticamente sin ningún cambio adicional.
 
-NOTA sobre la base de datos:
-  Cada nueva fuente requiere una migración SQL para crear su tabla
-  y, si aplica, agregar la columna de autor (ej: authors.pubmed_id).
-  Esto no puede evitarse — es inherente a la estructura relacional.
+NOTA sobre author_id_key:
+  Antes cada fuente tenía una columna propia en la tabla authors
+  (openalex_id, scopus_id, …). Ahora authors.external_ids es un JSONB
+  con forma {"openalex": "A123", "scopus": "456", ...}.
+  author_id_key es la clave que usa esa fuente dentro del diccionario.
 """
 
 from dataclasses import dataclass
@@ -48,23 +37,21 @@ class SourceDefinition:
     Descriptor completo de una fuente de datos.
 
     Attributes:
-        name:                  Nombre canónico de la fuente ("openalex", "scopus", …)
+        name:                  Nombre canónico (\"openalex\", \"scopus\", …)
         model_class:           Clase SQLAlchemy del registro de esa fuente.
-        id_attr:               Nombre del atributo del modelo que contiene el ID propio
-                               de la fuente (ej: "openalex_work_id").
-        author_id_attr:        Nombre del atributo en el modelo Author que guarda el ID
-                               de esta fuente (ej: "openalex_id"). None si no aplica.
-        build_specific_kwargs: Función (record, raw) → dict con los kwargs específicos
-                               de la fuente para construir el SourceRecord.
-                               Recibe:
-                                 - record: StandardRecord del extractor
-                                 - raw:    dict con raw_data original
-                               Devuelve solo los campos que NO están en SourceRecordMixin.
+        id_attr:               Atributo del modelo que contiene el ID propio
+                               de la fuente (ej: \"openalex_work_id\").
+        author_id_key:         Clave en authors.external_ids para el ID de
+                               autor de esta fuente (ej: \"openalex\").
+                               None si la fuente no tiene ID de autor.
+        build_specific_kwargs: Función (record, raw, kwargs) → None que
+                               añade al dict kwargs los campos específicos
+                               de la fuente (modifica en-place).
     """
     name: str
     model_class: Type
     id_attr: str
-    author_id_attr: Optional[str]
+    author_id_key: Optional[str]
     build_specific_kwargs: Callable
 
 
@@ -76,8 +63,8 @@ class SourceRegistry:
     """
     Registro en memoria de todas las fuentes activas.
 
-    Se llena durante el arranque del módulo db/models.py mediante llamadas
-    a SOURCE_REGISTRY.register(). Ningún otro módulo necesita conocer las
+    Se llena durante el arranque mediante llamadas a register() desde
+    cada módulo sources/*.py. Ningún otro módulo necesita conocer las
     fuentes individualmente.
     """
 
@@ -112,33 +99,33 @@ class SourceRegistry:
 
     @property
     def names(self) -> List[str]:
-        """Lista de nombres registrados. Reemplaza KNOWN_SOURCES hardcodeado."""
+        """Lista de nombres registrados."""
         return list(self._sources.keys())
 
     @property
     def models(self) -> Dict[str, Type]:
-        """Dict {nombre: ModelClass}. Reemplaza SOURCE_MODELS hardcodeado."""
+        """Dict {nombre: ModelClass}."""
         return {s.name: s.model_class for s in self._sources.values()}
 
     @property
     def id_attrs(self) -> Dict[str, str]:
-        """Dict {nombre: id_attr}. Reemplaza _SOURCE_ID_ATTR hardcodeado."""
+        """Dict {nombre: id_attr}."""
         return {s.name: s.id_attr for s in self._sources.values()}
 
     @property
-    def author_id_attrs(self) -> Dict[str, str]:
-        """Dict {nombre: author_id_attr} para los que tienen columna en Author."""
+    def author_id_keys(self) -> Dict[str, str]:
+        """Dict {nombre: author_id_key} para fuentes que tienen ID de autor."""
         return {
-            s.name: s.author_id_attr
+            s.name: s.author_id_key
             for s in self._sources.values()
-            if s.author_id_attr
+            if s.author_id_key
         }
 
     @property
     def source_id_mapping(self) -> Dict[str, str]:
         """
         Dict {NombreClase: id_attr} compatible con el SOURCE_ID_MAPPING
-        que usaba authors.py. Permite migración gradual.
+        que usaba authors.py.
         """
         return {
             s.model_class.__name__: s.id_attr

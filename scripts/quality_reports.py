@@ -229,7 +229,7 @@ class QualityReporter:
         ).count()
         
         with_scopus = self.session.query(Author).filter(
-            Author.scopus_id.isnot(None)
+            Author.external_ids.has_key("scopus")
         ).count()
         
         self.metrics.pct_authors_with_orcid = with_orcid / total_authors

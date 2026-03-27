@@ -192,8 +192,7 @@ class ReconciliationEngine:
         )
 
         # --- Campos específicos por fuente (delegado al registry) ---
-        # Para agregar una nueva fuente: crear build_X_kwargs en db/source_builders.py
-        # y registrarla en db/models.py con SOURCE_REGISTRY.register().
+        # Para agregar una nueva fuente: crear sources/nueva_fuente.py y listo.
         raw = record.raw_data or {}
         source_def = SOURCE_REGISTRY.get(record.source_name)
         source_def.build_specific_kwargs(record, raw, kwargs)
@@ -904,6 +903,116 @@ class ReconciliationEngine:
             enriched_fields.append("language")
             prov["language"] = src
 
+        # ── Campos enriquecidos ───────────────────────────────────
+
+        # Abstract
+        if not canonical.abstract and hasattr(ext, "abstract") and ext.abstract:
+            canonical.abstract = ext.abstract
+            enriched_fields.append("abstract")
+            prov["abstract"] = src
+
+        # Keywords
+        if not canonical.keywords:
+            kw = (
+                getattr(ext, "keywords", None)
+                or getattr(ext, "author_keywords", None)
+            )
+            if kw:
+                canonical.keywords = kw
+                enriched_fields.append("keywords")
+                prov["keywords"] = src
+
+        # URL fuente
+        if not canonical.source_url and ext.url:
+            canonical.source_url = ext.url
+            enriched_fields.append("source_url")
+            prov["source_url"] = src
+
+        # Rango de páginas
+        if not canonical.page_range and hasattr(ext, "page_range") and ext.page_range:
+            canonical.page_range = ext.page_range
+            enriched_fields.append("page_range")
+            prov["page_range"] = src
+
+        # Editorial / publisher
+        if not canonical.publisher and hasattr(ext, "publisher") and ext.publisher:
+            canonical.publisher = ext.publisher
+            enriched_fields.append("publisher")
+            prov["publisher"] = src
+
+        # Cobertura de revista
+        if not canonical.journal_coverage:
+            jc = getattr(ext, "journal_coverage", None) or getattr(ext, "coverage", None)
+            if jc:
+                canonical.journal_coverage = jc
+                enriched_fields.append("journal_coverage")
+                prov["journal_coverage"] = src
+
+        # ── Campos que requieren raw_data ─────────────────────────
+        raw = ext.raw_data or {}
+        parsed_authors = raw.get("_parsed_authors") or []
+
+        # Primer autor
+        if not canonical.first_author and parsed_authors:
+            first = parsed_authors[0]
+            fa_name = first.get("name") if isinstance(first, dict) else str(first)
+            if fa_name:
+                canonical.first_author = fa_name[:300]
+                enriched_fields.append("first_author")
+                prov["first_author"] = src
+
+        # Número de co-autores
+        if not canonical.coauthorships_count and parsed_authors:
+            canonical.coauthorships_count = len(parsed_authors)
+            enriched_fields.append("coauthorships_count")
+            prov["coauthorships_count"] = src
+
+        # Autor de correspondencia (OpenAlex authorships)
+        if not canonical.corresponding_author:
+            for authorship in raw.get("authorships", []):
+                if authorship.get("is_corresponding"):
+                    ca = authorship.get("author", {}).get("display_name")
+                    if ca:
+                        canonical.corresponding_author = ca[:300]
+                        enriched_fields.append("corresponding_author")
+                        prov["corresponding_author"] = src
+                        break
+
+        # Área de conocimiento
+        if not canonical.knowledge_area:
+            # OpenAlex: usar el dominio del primer topic
+            topics = raw.get("topics") or []
+            if topics and isinstance(topics[0], dict):
+                domain = topics[0].get("domain", {})
+                area = (
+                    domain.get("display_name")
+                    if isinstance(domain, dict)
+                    else topics[0].get("field", {}).get("display_name")
+                )
+                if area:
+                    canonical.knowledge_area = str(area)[:300]
+                    enriched_fields.append("knowledge_area")
+                    prov["knowledge_area"] = src
+            # Scopus: subject_areas
+            if not canonical.knowledge_area:
+                subject_areas = raw.get("subject_areas") or raw.get("subjectAreas") or []
+                if subject_areas and isinstance(subject_areas[0], dict):
+                    area = subject_areas[0].get("@abbrev") or subject_areas[0].get("$")
+                    if area:
+                        canonical.knowledge_area = str(area)[:300]
+                        enriched_fields.append("knowledge_area")
+                        prov["knowledge_area"] = src
+
+        # Código CINE (Scopus subject area code → clasificación Minciencias)
+        if not canonical.cine_code:
+            subject_areas = raw.get("subject_areas") or raw.get("subjectAreas") or []
+            if subject_areas and isinstance(subject_areas[0], dict):
+                code = subject_areas[0].get("@code") or subject_areas[0].get("code")
+                if code:
+                    canonical.cine_code = str(code)[:50]
+                    enriched_fields.append("cine_code")
+                    prov["cine_code"] = src
+
         # Persistir provenance actualizado
         if enriched_fields:
             canonical.field_provenance = prov
@@ -1006,7 +1115,11 @@ class ReconciliationEngine:
 
             scopus_id = author_data.get("scopus_id")
             if not author and scopus_id:
-                author = self.session.query(Author).filter_by(scopus_id=str(scopus_id)).first()
+                author = (
+                    self.session.query(Author)
+                    .filter(Author.external_ids["scopus"].astext == str(scopus_id))
+                    .first()
+                )
 
             if not author:
                 norm_name = normalize_text(name)
@@ -1124,28 +1237,31 @@ class ReconciliationEngine:
                 if is_inst:
                     author_prov["is_institutional"] = src
 
+                eids = {}
+                openalex_id = author_data.get("openalex_id")
+                if openalex_id:
+                    eids["openalex"] = openalex_id
+                    author_prov["openalex"] = src
+                scopus_id = author_data.get("scopus_id")
+                if scopus_id:
+                    eids["scopus"] = str(scopus_id)
+                    author_prov["scopus"] = src
+                wos_id = author_data.get("wos_id")
+                if wos_id:
+                    eids["wos"] = str(wos_id)
+                    author_prov["wos"] = src
+                cvlac_id = author_data.get("cvlac_id")
+                if cvlac_id:
+                    eids["cvlac"] = str(cvlac_id)
+                    author_prov["cvlac"] = src
+
                 author = Author(
                     name=name,
                     normalized_name=normalize_text(name),
                     orcid=orcid if orcid else None,
                     is_institutional=is_inst,
+                    external_ids=eids if eids else None,
                 )
-                openalex_id = author_data.get("openalex_id")
-                if openalex_id:
-                    author.openalex_id = openalex_id
-                    author_prov["openalex_id"] = src
-                scopus_id = author_data.get("scopus_id")
-                if scopus_id:
-                    author.scopus_id = str(scopus_id)
-                    author_prov["scopus_id"] = src
-                wos_id = author_data.get("wos_id")
-                if wos_id:
-                    author.wos_id = str(wos_id)
-                    author_prov["wos_id"] = src
-                cvlac_id = author_data.get("cvlac_id")
-                if cvlac_id:
-                    author.cvlac_id = str(cvlac_id)
-                    author_prov["cvlac_id"] = src
 
                 author.field_provenance = author_prov
 
@@ -1173,27 +1289,29 @@ class ReconciliationEngine:
                     author.is_institutional = True
                     prov["is_institutional"] = src
                     changed = True
+                cur_eids = dict(author.external_ids or {})
                 openalex_id = author_data.get("openalex_id")
-                if openalex_id and not author.openalex_id:
-                    author.openalex_id = openalex_id
-                    prov["openalex_id"] = src
+                if openalex_id and not cur_eids.get("openalex"):
+                    cur_eids["openalex"] = openalex_id
+                    prov["openalex"] = src
                     changed = True
                 scopus_id = author_data.get("scopus_id")
-                if scopus_id and not author.scopus_id:
-                    author.scopus_id = str(scopus_id)
-                    prov["scopus_id"] = src
+                if scopus_id and not cur_eids.get("scopus"):
+                    cur_eids["scopus"] = str(scopus_id)
+                    prov["scopus"] = src
                     changed = True
                 wos_id = author_data.get("wos_id")
-                if wos_id and not author.wos_id:
-                    author.wos_id = str(wos_id)
-                    prov["wos_id"] = src
+                if wos_id and not cur_eids.get("wos"):
+                    cur_eids["wos"] = str(wos_id)
+                    prov["wos"] = src
                     changed = True
                 cvlac_id = author_data.get("cvlac_id")
-                if cvlac_id and not author.cvlac_id:
-                    author.cvlac_id = str(cvlac_id)
-                    prov["cvlac_id"] = src
+                if cvlac_id and not cur_eids.get("cvlac"):
+                    cur_eids["cvlac"] = str(cvlac_id)
+                    prov["cvlac"] = src
                     changed = True
                 if changed:
+                    author.external_ids = cur_eids
                     author.field_provenance = prov
 
             # Vincular a publicación (evitar duplicados)
@@ -1237,10 +1355,11 @@ class ReconciliationEngine:
 
         updated = 0
 
+        scopus_expr = Author.external_ids["scopus"].astext
         existing_sids = {
             r[0] for r in
-            self.session.query(Author.scopus_id)
-            .filter(Author.scopus_id.isnot(None), Author.scopus_id != "")
+            self.session.query(scopus_expr)
+            .filter(scopus_expr.isnot(None), scopus_expr != "")
             .all()
         }
 
@@ -1269,7 +1388,7 @@ class ReconciliationEngine:
                         authors_raw.append({
                             "name": author_info.get("display_name", ""),
                             "openalex_id": author_info.get("id"),
-                            "orcid": author_info.get("orcid"),
+                            "orcid":       author_info.get("orcid"),
                         })
 
                 for auth_data in authors_raw:
@@ -1293,9 +1412,17 @@ class ReconciliationEngine:
                     if orcid:
                         author = self.session.query(Author).filter_by(orcid=orcid).first()
                     if not author and scopus_id:
-                        author = self.session.query(Author).filter_by(scopus_id=str(scopus_id)).first()
+                        author = (
+                            self.session.query(Author)
+                            .filter(Author.external_ids["scopus"].astext == str(scopus_id))
+                            .first()
+                        )
                     if not author and openalex_id:
-                        author = self.session.query(Author).filter_by(openalex_id=openalex_id).first()
+                        author = (
+                            self.session.query(Author)
+                            .filter(Author.external_ids["openalex"].astext == openalex_id)
+                            .first()
+                        )
                     if not author:
                         name = auth_data.get("name") or auth_data.get("authname") or ""
                         norm = normalize_text(normalize_author_name(name))
@@ -1315,7 +1442,7 @@ class ReconciliationEngine:
                                 .join(PublicationAuthor, Author.id == PublicationAuthor.author_id)
                                 .filter(
                                     PublicationAuthor.publication_id == pub_id,
-                                    (Author.scopus_id.is_(None)) | (Author.scopus_id == ""),
+                                    ~Author.external_ids.has_key("scopus"),
                                 )
                                 .all()
                             )
@@ -1341,20 +1468,22 @@ class ReconciliationEngine:
                     changed = False
                     prov = dict(author.field_provenance or {})
                     backfill_src = source_name
-                    if scopus_id and not author.scopus_id:
-                        author.scopus_id = str(scopus_id)
+                    bf_eids = dict(author.external_ids or {})
+                    if scopus_id and not bf_eids.get("scopus"):
+                        bf_eids["scopus"] = str(scopus_id)
                         existing_sids.add(str(scopus_id))
-                        prov["scopus_id"] = backfill_src
+                        prov["scopus"] = backfill_src
                         changed = True
-                    if openalex_id and not author.openalex_id:
-                        author.openalex_id = openalex_id
-                        prov["openalex_id"] = backfill_src
+                    if openalex_id and not bf_eids.get("openalex"):
+                        bf_eids["openalex"] = openalex_id
+                        prov["openalex"] = backfill_src
                         changed = True
                     if orcid and not author.orcid:
                         author.orcid = orcid
                         prov["orcid"] = backfill_src
                         changed = True
                     if changed:
+                        author.external_ids = bf_eids
                         author.field_provenance = prov
                         updated += 1
 

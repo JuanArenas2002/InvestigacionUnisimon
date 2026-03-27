@@ -192,9 +192,9 @@ def enrich_authors_missing_orcid(
                                 author.orcid = ext_orcid
                                 changes["orcid"] = ext_orcid
                         ext_openalex_id = oa_auth.get("author", {}).get("id")
-                        if ext_openalex_id and not author.openalex_id:
-                            author.openalex_id = ext_openalex_id
-                            changes["openalex_id"] = ext_openalex_id
+                        if ext_openalex_id and not (author.external_ids or {}).get("openalex"):
+                            author.external_ids = {**(author.external_ids or {}), "openalex": ext_openalex_id}
+                            changes["openalex"] = ext_openalex_id
                         ext_name = oa_auth.get("author", {}).get("display_name")
                         if ext_name and not author.normalized_name:
                             author.normalized_name = ext_name.lower()
@@ -222,9 +222,9 @@ def enrich_authors_missing_orcid(
                         if scopus_id:
                             scopus_id = str(scopus_id).strip()
                             match = re.search(r"(\d+)$", scopus_id)
-                            if match and not author.scopus_id:
-                                author.scopus_id = match.group(1)
-                                changes["scopus_id"] = match.group(1)
+                            if match and not (author.external_ids or {}).get("scopus"):
+                                author.external_ids = {**(author.external_ids or {}), "scopus": match.group(1)}
+                                changes["scopus"] = match.group(1)
             except Exception:
                 pass
             # --- WoS y otras fuentes externas: aquí puedes agregar lógica similar si tienes acceso ---
@@ -425,16 +425,16 @@ def author_ids_coverage(db: Session = Depends(get_db)):
                 Author.orcid.isnot(None), Author.orcid != ""
             ).label("with_orcid"),
             func.count(Author.id).filter(
-                Author.openalex_id.isnot(None), Author.openalex_id != ""
+                Author.external_ids.has_key("openalex")
             ).label("with_openalex"),
             func.count(Author.id).filter(
-                Author.scopus_id.isnot(None), Author.scopus_id != ""
+                Author.external_ids.has_key("scopus")
             ).label("with_scopus"),
             func.count(Author.id).filter(
-                Author.wos_id.isnot(None), Author.wos_id != ""
+                Author.external_ids.has_key("wos")
             ).label("with_wos"),
             func.count(Author.id).filter(
-                Author.cvlac_id.isnot(None), Author.cvlac_id != ""
+                Author.external_ids.has_key("cvlac")
             ).label("with_cvlac"),
         )
     ).one()
@@ -778,11 +778,17 @@ def get_author_inventory(
     if not author and orcid:
         author = db.query(Author).filter(Author.orcid == orcid.strip()).first()
     if not author and scopus_id:
-        author = db.query(Author).filter(Author.scopus_id == scopus_id.strip()).first()
+        author = db.query(Author).filter(
+            Author.external_ids["scopus"].astext == scopus_id.strip()
+        ).first()
     if not author and openalex_id:
-        author = db.query(Author).filter(Author.openalex_id == openalex_id.strip()).first()
+        author = db.query(Author).filter(
+            Author.external_ids["openalex"].astext == openalex_id.strip()
+        ).first()
     if not author and cvlac_id:
-        author = db.query(Author).filter(Author.cvlac_id == cvlac_id.strip()).first()
+        author = db.query(Author).filter(
+            Author.external_ids["cvlac"].astext == cvlac_id.strip()
+        ).first()
     if not author and name:
         like = f"%{name.strip()}%"
         author = (
