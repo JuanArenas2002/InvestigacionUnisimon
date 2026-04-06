@@ -35,6 +35,305 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/scopus", tags=["Scopus Dashboard"])
 
 
+# ══════════════════════════════════════════════════════════════
+# GET /scopus/doc — Referencia de búsqueda avanzada
+# ══════════════════════════════════════════════════════════════
+
+_ADVANCED_QUERY_DOC = {
+    "title": "Referencia de Búsqueda Avanzada — Scopus API",
+    "description": (
+        "Documentación de los operadores de campo disponibles en build_advanced_query() "
+        "y extract_advanced(). Equivalente a la pestaña 'Advanced Search' de la web de Scopus."
+    ),
+    "reference_url": "https://dev.elsevier.com/sc_search_tips.html",
+    "parameters": [
+        {
+            "param": "title_abs_key",
+            "scopus_operator": "TITLE-ABS-KEY(...)",
+            "description": "Busca el término en título, resumen Y palabras clave a la vez. Es el operador más amplio y el recomendado para búsquedas temáticas generales.",
+            "example": 'title_abs_key="inteligencia artificial"  →  TITLE-ABS-KEY("inteligencia artificial")',
+        },
+        {
+            "param": "title",
+            "scopus_operator": "TITLE(...)",
+            "description": "Busca únicamente en el título del documento.",
+            "example": 'title="deep learning"  →  TITLE("deep learning")',
+        },
+        {
+            "param": "abstract",
+            "scopus_operator": "ABS(...)",
+            "description": "Busca únicamente en el resumen del documento.",
+            "example": 'abstract="climate change"  →  ABS("climate change")',
+        },
+        {
+            "param": "keywords",
+            "scopus_operator": "KEY(...)",
+            "description": "Busca únicamente en las palabras clave del documento.",
+            "example": 'keywords="machine learning"  →  KEY("machine learning")',
+        },
+        {
+            "param": "author",
+            "scopus_operator": "AUTH(...)",
+            "description": "Busca por nombre de autor. Formato recomendado: 'Apellido, Inicial' o solo el apellido.",
+            "example": 'author="García, J."  →  AUTH("García, J.")',
+        },
+        {
+            "param": "first_author",
+            "scopus_operator": "AUTHFIRST(...)",
+            "description": "Busca solo en el primer autor del documento.",
+            "example": 'first_author="Martínez"  →  AUTHFIRST("Martínez")',
+        },
+        {
+            "param": "author_id",
+            "scopus_operator": "AU-ID(...)",
+            "description": "Busca por Scopus Author ID numérico. Es el identificador más preciso para un autor.",
+            "example": 'author_id="57208979556"  →  AU-ID(57208979556)',
+        },
+        {
+            "param": "orcid",
+            "scopus_operator": "ORCID(...)",
+            "description": "Busca por ORCID del autor. Se acepta con o sin el prefijo https://orcid.org/.",
+            "example": 'orcid="0000-0002-2096-7900"  →  ORCID(0000-0002-2096-7900)',
+        },
+        {
+            "param": "affiliation_id",
+            "scopus_operator": "AF-ID(...)",
+            "description": "Busca documentos afiliados a una institución por su AF-ID de Scopus. Acepta múltiples IDs separados por coma, generando una cláusula OR entre ellos.",
+            "example": 'affiliation_id="60106970,60112687"  →  (AF-ID(60106970) OR AF-ID(60112687))',
+        },
+        {
+            "param": "affiliation_name",
+            "scopus_operator": "AFFIL(...)",
+            "description": "Busca por nombre textual de afiliación. Menos preciso que AF-ID; se recomienda como fallback.",
+            "example": 'affiliation_name="Universidad de Antioquia"  →  AFFIL("Universidad de Antioquia")',
+        },
+        {
+            "param": "source_title",
+            "scopus_operator": "SRCTITLE(...)",
+            "description": "Filtra por nombre de revista, libro o serie donde fue publicado el documento.",
+            "example": 'source_title="Biomédica"  →  SRCTITLE("Biomédica")',
+        },
+        {
+            "param": "issn",
+            "scopus_operator": "ISSN(...)",
+            "description": "Filtra por ISSN de la fuente. Los guiones se eliminan automáticamente.",
+            "example": 'issn="0120-4157"  →  ISSN(01204157)',
+        },
+        {
+            "param": "doi_filter",
+            "scopus_operator": "DOI(...)",
+            "description": "Busca un documento por DOI exacto. El prefijo https://doi.org/ se elimina automáticamente.",
+            "example": 'doi_filter="10.1016/j.jhydrol.2020.125741"  →  DOI(10.1016/j.jhydrol.2020.125741)',
+        },
+        {
+            "param": "publisher",
+            "scopus_operator": "PUBLISHER(...)",
+            "description": "Filtra por nombre de editorial.",
+            "example": 'publisher="Elsevier"  →  PUBLISHER("Elsevier")',
+        },
+        {
+            "param": "year_from",
+            "scopus_operator": "PUBYEAR > (year-1)",
+            "description": "Año mínimo de publicación (inclusive). Se convierte a PUBYEAR > año-1.",
+            "example": "year_from=2020  →  PUBYEAR > 2019",
+        },
+        {
+            "param": "year_to",
+            "scopus_operator": "PUBYEAR < (year+1)",
+            "description": "Año máximo de publicación (inclusive). Se convierte a PUBYEAR < año+1.",
+            "example": "year_to=2024  →  PUBYEAR < 2025",
+        },
+        {
+            "param": "year_exact",
+            "scopus_operator": "PUBYEAR = year",
+            "description": "Año exacto de publicación. Si se especifica, anula year_from y year_to.",
+            "example": "year_exact=2023  →  PUBYEAR = 2023",
+        },
+        {
+            "param": "document_type",
+            "scopus_operator": "DOCTYPE(código)",
+            "description": "Tipo de documento. Acepta tanto el nombre legible como el código corto de Scopus.",
+            "example": 'document_type="article"  →  DOCTYPE(ar)',
+            "accepted_values": {
+                "article": "ar",
+                "review": "re",
+                "conference paper": "cp",
+                "book": "bk",
+                "book chapter": "ch",
+                "editorial": "ed",
+                "letter": "le",
+                "note": "no",
+                "short survey": "sh",
+                "erratum": "er",
+                "report": "rp",
+                "abstract report": "ab",
+            },
+        },
+        {
+            "param": "subject_area",
+            "scopus_operator": "SUBJAREA(...)",
+            "description": "Área temática ASJC de Scopus. Usar el código de 4 letras mayúsculas.",
+            "example": 'subject_area="MEDI"  →  SUBJAREA(MEDI)',
+            "accepted_values": {
+                "AGRI": "Agricultura y Ciencias Biológicas",
+                "ARTS": "Artes y Humanidades",
+                "BIOC": "Bioquímica, Genética y Biología Molecular",
+                "BUSI": "Negocios, Gestión y Contabilidad",
+                "CENG": "Ingeniería Química",
+                "CHEM": "Química",
+                "COMP": "Ciencias de la Computación",
+                "DECI": "Ciencias de la Decisión",
+                "DENT": "Odontología",
+                "EART": "Ciencias de la Tierra y Planetarias",
+                "ECON": "Economía, Econometría y Finanzas",
+                "ENER": "Energía",
+                "ENGI": "Ingeniería",
+                "ENVI": "Ciencias Ambientales",
+                "IMMU": "Inmunología y Microbiología",
+                "MATE": "Ciencia de Materiales",
+                "MATH": "Matemáticas",
+                "MEDI": "Medicina",
+                "MULT": "Multidisciplinar",
+                "NEUR": "Neurociencia",
+                "NURS": "Enfermería",
+                "PHAR": "Farmacología y Farmacia",
+                "PHYS": "Física y Astronomía",
+                "PSYC": "Psicología",
+                "SOCI": "Ciencias Sociales",
+                "VETE": "Medicina Veterinaria",
+            },
+        },
+        {
+            "param": "language",
+            "scopus_operator": "LANGUAGE(...)",
+            "description": "Filtra por idioma de publicación.",
+            "example": 'language="Spanish"  →  LANGUAGE(Spanish)',
+            "accepted_values": ["English", "Spanish", "French", "German", "Portuguese", "Chinese", "Japanese"],
+        },
+        {
+            "param": "open_access",
+            "scopus_operator": "OPENACCESS(1)",
+            "description": "Si es True, filtra solo publicaciones en acceso abierto.",
+            "example": "open_access=True  →  OPENACCESS(1)",
+        },
+        {
+            "param": "funder",
+            "scopus_operator": "FUND-SPONSOR(...)",
+            "description": "Filtra documentos financiados por una entidad específica.",
+            "example": 'funder="Minciencias"  →  FUND-SPONSOR("Minciencias")',
+        },
+        {
+            "param": "grant_number",
+            "scopus_operator": "FUND-NO(...)",
+            "description": "Filtra por número de contrato o grant de financiación.",
+            "example": 'grant_number="2021-1001"  →  FUND-NO("2021-1001")',
+        },
+        {
+            "param": "extra",
+            "scopus_operator": "(libre)",
+            "description": "Cláusula Scopus adicional en formato libre. Se añade al final con el operador configurado.",
+            "example": 'extra="AND NOT DOCTYPE(ed)"',
+        },
+        {
+            "param": "operator",
+            "scopus_operator": "AND | OR",
+            "description": "Operador lógico entre todas las cláusulas generadas. Por defecto es AND.",
+            "example": 'operator="AND"  (por defecto)',
+        },
+    ],
+    "examples": [
+        {
+            "description": "Artículos de dos instituciones colombianas entre 2020 y 2024",
+            "python": (
+                "extract_advanced(\n"
+                "    affiliation_id='60106970,60112687',\n"
+                "    year_from=2020, year_to=2024,\n"
+                "    document_type='article',\n"
+                ")"
+            ),
+            "scopus_query": "(AF-ID(60106970) OR AF-ID(60112687)) AND PUBYEAR > 2019 AND PUBYEAR < 2025 AND DOCTYPE(ar)",
+        },
+        {
+            "description": "Publicaciones OA de un autor por ORCID sobre machine learning",
+            "python": (
+                "extract_advanced(\n"
+                "    orcid='0000-0002-2096-7900',\n"
+                "    title_abs_key='machine learning',\n"
+                "    open_access=True,\n"
+                ")"
+            ),
+            "scopus_query": 'TITLE-ABS-KEY("machine learning") AND ORCID(0000-0002-2096-7900) AND OPENACCESS(1)',
+        },
+        {
+            "description": "Publicaciones de Minciencias en una revista específica desde 2018",
+            "python": (
+                "extract_advanced(\n"
+                "    source_title='Biomédica',\n"
+                "    funder='Minciencias',\n"
+                "    year_from=2018,\n"
+                "    language='Spanish',\n"
+                ")"
+            ),
+            "scopus_query": 'SRCTITLE("Biomédica") AND PUBYEAR > 2017 AND LANGUAGE(Spanish) AND FUND-SPONSOR("Minciencias")',
+        },
+        {
+            "description": "Reviews de medicina publicadas en 2023 en acceso abierto",
+            "python": (
+                "extract_advanced(\n"
+                "    subject_area='MEDI',\n"
+                "    document_type='review',\n"
+                "    year_exact=2023,\n"
+                "    open_access=True,\n"
+                ")"
+            ),
+            "scopus_query": "SUBJAREA(MEDI) AND PUBYEAR = 2023 AND DOCTYPE(re) AND OPENACCESS(1)",
+        },
+        {
+            "description": "Producción de un autor específico por Scopus Author ID",
+            "python": (
+                "extract_advanced(\n"
+                "    author_id='57208979556',\n"
+                "    year_from=2015,\n"
+                ")"
+            ),
+            "scopus_query": "AU-ID(57208979556) AND PUBYEAR > 2014",
+        },
+    ],
+    "build_query_example": {
+        "description": "También puedes construir el string de query sin ejecutar la extracción",
+        "python": (
+            "from extractors.scopus import ScopusExtractor\n\n"
+            "query = ScopusExtractor.build_advanced_query(\n"
+            "    affiliation_id='60106970',\n"
+            "    title_abs_key='biodiversidad',\n"
+            "    year_from=2019,\n"
+            "    document_type='article',\n"
+            "    open_access=True,\n"
+            ")\n"
+            "# query == 'TITLE-ABS-KEY(\"biodiversidad\") AND AF-ID(60106970) AND PUBYEAR > 2018 AND DOCTYPE(ar) AND OPENACCESS(1)'"
+        ),
+    },
+}
+
+
+@router.get(
+    "/doc",
+    summary="Referencia de búsqueda avanzada Scopus",
+    tags=["Scopus Dashboard"],
+)
+def scopus_advanced_query_doc():
+    """
+    Referencia completa de parámetros para **búsqueda avanzada de Scopus**.
+
+    Documenta todos los operadores de campo disponibles en:
+    - `ScopusExtractor.build_advanced_query()` — construye el string de query
+    - `ScopusExtractor.extract_advanced()` — construye y ejecuta la extracción
+
+    Equivalente a la pestaña **Advanced Search** de [scopus.com](https://www.scopus.com/search/form.uri#advanced).
+    """
+    return _ADVANCED_QUERY_DOC
+
+
 def _scopus_to_read(er: ScopusRecord) -> ExternalRecordRead:
     """Convierte ScopusRecord a ExternalRecordRead."""
     return ExternalRecordRead(

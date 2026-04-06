@@ -514,6 +514,294 @@ class ScopusExtractor(BaseExtractor):
         return records
 
     # ---------------------------------------------------------
+    # CONSULTA AVANZADA — operadores de campo de Scopus
+    # ---------------------------------------------------------
+
+    # Códigos de tipo de documento que acepta DOCTYPE(...)
+    DOCTYPE_CODES: Dict[str, str] = {
+        "article":           "ar",
+        "review":            "re",
+        "conference paper":  "cp",
+        "book":              "bk",
+        "book chapter":      "ch",
+        "editorial":         "ed",
+        "letter":            "le",
+        "note":              "no",
+        "short survey":      "sh",
+        "erratum":           "er",
+        "report":            "rp",
+        "abstract report":   "ab",
+    }
+
+    @staticmethod
+    def build_advanced_query(
+        *,
+        # ── Contenido ──────────────────────────────────────────
+        title: Optional[str] = None,
+        abstract: Optional[str] = None,
+        keywords: Optional[str] = None,
+        title_abs_key: Optional[str] = None,
+        # ── Autoría ────────────────────────────────────────────
+        author: Optional[str] = None,
+        first_author: Optional[str] = None,
+        author_id: Optional[str] = None,
+        orcid: Optional[str] = None,
+        # ── Afiliación ─────────────────────────────────────────
+        affiliation_id: Optional[str] = None,
+        affiliation_name: Optional[str] = None,
+        # ── Fuente ─────────────────────────────────────────────
+        source_title: Optional[str] = None,
+        issn: Optional[str] = None,
+        doi: Optional[str] = None,
+        publisher: Optional[str] = None,
+        # ── Rango de años ──────────────────────────────────────
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        year_exact: Optional[int] = None,
+        # ── Clasificación ──────────────────────────────────────
+        document_type: Optional[str] = None,
+        subject_area: Optional[str] = None,
+        language: Optional[str] = None,
+        open_access: Optional[bool] = None,
+        # ── Financiación ───────────────────────────────────────
+        funder: Optional[str] = None,
+        grant_number: Optional[str] = None,
+        # ── Cláusula libre adicional ───────────────────────────
+        extra: Optional[str] = None,
+        operator: str = "AND",
+    ) -> str:
+        """
+        Construye una query para Scopus Search API usando los mismos
+        operadores de campo que la búsqueda avanzada de la web de Scopus.
+
+        Referencia de operadores:
+          https://dev.elsevier.com/sc_search_tips.html
+
+        Ejemplos equivalentes a la interfaz web:
+          TITLE-ABS-KEY(machine learning) AND AF-ID(60106970) AND PUBYEAR > 2018
+          AUTH(García) AND AFFIL(Universidad de Antioquia) AND DOCTYPE(ar)
+          SRCTITLE(Sustainability) AND OPENACCESS(1) AND PUBYEAR = 2023
+          FUND-SPONSOR(Minciencias) AND SUBJAREA(MEDI)
+
+        Tipos de documento (document_type):
+          'article', 'review', 'conference paper', 'book', 'book chapter',
+          'editorial', 'letter', 'note', 'short survey', 'erratum', 'report'
+
+        Áreas temáticas (subject_area):
+          AGRI, ARTS, BIOC, BUSI, CENG, CHEM, COMP, DECI, DENT, EART,
+          ECON, ENER, ENGI, ENVI, IMMU, MATE, MATH, MEDI, MULT, NEUR,
+          NURS, PHAR, PHYS, PSYC, SOCI, VETE
+
+        Args:
+            title:          Buscar en título únicamente   → TITLE(...)
+            abstract:       Buscar en resumen             → ABS(...)
+            keywords:       Buscar en palabras clave      → KEY(...)
+            title_abs_key:  Buscar en título+resumen+kw   → TITLE-ABS-KEY(...)
+            author:         Apellido o "Apellido, N."     → AUTH(...)
+            first_author:   Solo el primer autor          → AUTHFIRST(...)
+            author_id:      Scopus Author ID numérico     → AU-ID(...)
+            orcid:          ORCID del autor               → ORCID(...)
+            affiliation_id: AF-ID de institución          → AF-ID(...)
+            affiliation_name: Nombre de institución       → AFFIL(...)
+            source_title:   Nombre de la revista          → SRCTITLE(...)
+            issn:           ISSN de la revista            → ISSN(...)
+            doi:            DOI exacto                    → DOI(...)
+            publisher:      Editorial                     → PUBLISHER(...)
+            year_from:      Año mínimo (inclusive)        → PUBYEAR > year-1
+            year_to:        Año máximo (inclusive)        → PUBYEAR < year+1
+            year_exact:     Año exacto                    → PUBYEAR = year
+            document_type:  Tipo de documento             → DOCTYPE(código)
+            subject_area:   Código de área temática       → SUBJAREA(...)
+            language:       Idioma (English, Spanish...)  → LANGUAGE(...)
+            open_access:    True = solo OA               → OPENACCESS(1)
+            funder:         Organismo financiador         → FUND-SPONSOR(...)
+            grant_number:   Número de grant              → FUND-NO(...)
+            extra:          Cláusula libre adicional
+            operator:       Operador entre cláusulas ('AND' | 'OR')
+
+        Returns:
+            String de query lista para pasar al parámetro ?query=...
+        """
+        parts: List[str] = []
+
+        # ── Contenido ──────────────────────────────────────────
+        if title_abs_key:
+            parts.append(f'TITLE-ABS-KEY("{title_abs_key}")')
+        if title:
+            parts.append(f'TITLE("{title}")')
+        if abstract:
+            parts.append(f'ABS("{abstract}")')
+        if keywords:
+            parts.append(f'KEY("{keywords}")')
+
+        # ── Autoría ────────────────────────────────────────────
+        if author:
+            parts.append(f'AUTH("{author}")')
+        if first_author:
+            parts.append(f'AUTHFIRST("{first_author}")')
+        if author_id:
+            parts.append(f"AU-ID({author_id})")
+        if orcid:
+            cleaned = orcid.replace("https://orcid.org/", "").strip()
+            parts.append(f"ORCID({cleaned})")
+
+        # ── Afiliación ─────────────────────────────────────────
+        if affiliation_id:
+            # Soporta múltiples AF-IDs separados por coma: "60106970,60112687"
+            ids = [i.strip() for i in str(affiliation_id).split(",") if i.strip()]
+            if len(ids) == 1:
+                parts.append(f"AF-ID({ids[0]})")
+            else:
+                af_parts = " OR ".join(f"AF-ID({i})" for i in ids)
+                parts.append(f"({af_parts})")
+        if affiliation_name:
+            parts.append(f'AFFIL("{affiliation_name}")')
+
+        # ── Fuente ─────────────────────────────────────────────
+        if source_title:
+            parts.append(f'SRCTITLE("{source_title}")')
+        if issn:
+            clean_issn = issn.replace("-", "")
+            parts.append(f"ISSN({clean_issn})")
+        if doi:
+            clean_doi = doi.replace("https://doi.org/", "").replace("http://doi.org/", "").strip()
+            parts.append(f"DOI({clean_doi})")
+        if publisher:
+            parts.append(f'PUBLISHER("{publisher}")')
+
+        # ── Rango de años ──────────────────────────────────────
+        if year_exact is not None:
+            parts.append(f"PUBYEAR = {year_exact}")
+        else:
+            if year_from is not None:
+                parts.append(f"PUBYEAR > {year_from - 1}")
+            if year_to is not None:
+                parts.append(f"PUBYEAR < {year_to + 1}")
+
+        # ── Clasificación ──────────────────────────────────────
+        if document_type:
+            # Acepta tanto el nombre legible como el código corto
+            dt_lower = document_type.lower().strip()
+            code = ScopusExtractor.DOCTYPE_CODES.get(dt_lower, dt_lower)
+            parts.append(f"DOCTYPE({code})")
+        if subject_area:
+            parts.append(f"SUBJAREA({subject_area.upper()})")
+        if language:
+            parts.append(f"LANGUAGE({language})")
+        if open_access is True:
+            parts.append("OPENACCESS(1)")
+
+        # ── Financiación ───────────────────────────────────────
+        if funder:
+            parts.append(f'FUND-SPONSOR("{funder}")')
+        if grant_number:
+            parts.append(f'FUND-NO("{grant_number}")')
+
+        # ── Cláusula libre ─────────────────────────────────────
+        if extra:
+            parts.append(extra.strip())
+
+        if not parts:
+            raise ValueError(
+                "build_advanced_query: debes especificar al menos un criterio de búsqueda."
+            )
+
+        sep = f" {operator.upper()} "
+        return sep.join(parts)
+
+    def extract_advanced(
+        self,
+        *,
+        title: Optional[str] = None,
+        abstract: Optional[str] = None,
+        keywords: Optional[str] = None,
+        title_abs_key: Optional[str] = None,
+        author: Optional[str] = None,
+        first_author: Optional[str] = None,
+        author_id: Optional[str] = None,
+        orcid: Optional[str] = None,
+        affiliation_id: Optional[str] = None,
+        affiliation_name: Optional[str] = None,
+        source_title: Optional[str] = None,
+        issn: Optional[str] = None,
+        doi_filter: Optional[str] = None,
+        publisher: Optional[str] = None,
+        year_from: Optional[int] = None,
+        year_to: Optional[int] = None,
+        year_exact: Optional[int] = None,
+        document_type: Optional[str] = None,
+        subject_area: Optional[str] = None,
+        language: Optional[str] = None,
+        open_access: Optional[bool] = None,
+        funder: Optional[str] = None,
+        grant_number: Optional[str] = None,
+        extra: Optional[str] = None,
+        operator: str = "AND",
+        max_results: Optional[int] = None,
+    ) -> List[StandardRecord]:
+        """
+        Extrae registros usando la búsqueda avanzada de Scopus.
+
+        Equivale a la pestaña 'Advanced search' de la web de Scopus,
+        donde puedes combinar operadores de campo con AND/OR/AND NOT.
+
+        Ejemplos de uso::
+
+            # Artículos de dos instituciones colombianas entre 2020-2024
+            extractor.extract_advanced(
+                affiliation_id="60106970,60112687",
+                year_from=2020, year_to=2024,
+                document_type="article",
+            )
+
+            # Publicaciones OA de un autor por ORCID sobre machine learning
+            extractor.extract_advanced(
+                orcid="0000-0002-2096-7900",
+                title_abs_key="machine learning",
+                open_access=True,
+            )
+
+            # Publicaciones en una revista específica financiadas por Minciencias
+            extractor.extract_advanced(
+                source_title="Biomédica",
+                funder="Minciencias",
+                year_from=2018,
+            )
+
+        Returns:
+            Lista de StandardRecord normalizados.
+        """
+        query = self.build_advanced_query(
+            title=title,
+            abstract=abstract,
+            keywords=keywords,
+            title_abs_key=title_abs_key,
+            author=author,
+            first_author=first_author,
+            author_id=author_id,
+            orcid=orcid,
+            affiliation_id=affiliation_id,
+            affiliation_name=affiliation_name,
+            source_title=source_title,
+            issn=issn,
+            doi=doi_filter,
+            publisher=publisher,
+            year_from=year_from,
+            year_to=year_to,
+            year_exact=year_exact,
+            document_type=document_type,
+            subject_area=subject_area,
+            language=language,
+            open_access=open_access,
+            funder=funder,
+            grant_number=grant_number,
+            extra=extra,
+            operator=operator,
+        )
+        logger.info(f"Scopus advanced query: {query}")
+        return self.extract(query=query, max_results=max_results)
+
+    # ---------------------------------------------------------
     # LÓGICA INTERNA
     # ---------------------------------------------------------
 
@@ -524,20 +812,12 @@ class ScopusExtractor(BaseExtractor):
         affiliation_id: Optional[str],
     ) -> str:
         """
-        Construye query Scopus.
+        Construye query Scopus estándar para la extracción institucional.
         Ejemplo: AF-ID(60000000) AND PUBYEAR > 2019 AND PUBYEAR < 2026
         """
-        parts = []
-
-        if affiliation_id:
-            parts.append(f"AF-ID({affiliation_id})")
-        else:
-            # Buscar por nombre de institución como fallback
-            parts.append(f'AFFIL("{institution.name}")')
-
-        if year_from:
-            parts.append(f"PUBYEAR > {year_from - 1}")
-        if year_to:
-            parts.append(f"PUBYEAR < {year_to + 1}")
-
-        return " AND ".join(parts)
+        return self.build_advanced_query(
+            affiliation_id=affiliation_id,
+            affiliation_name=None if affiliation_id else institution.name,
+            year_from=year_from,
+            year_to=year_to,
+        )

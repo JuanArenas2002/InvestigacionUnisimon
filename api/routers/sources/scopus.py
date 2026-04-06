@@ -7,6 +7,7 @@ sin disparar la reconciliación.
 Rutas:
   POST /sources/scopus/search/by-institution
   POST /sources/scopus/search/by-author
+  POST /sources/scopus/search/query
   GET  /sources/scopus/records
   GET  /sources/scopus/records/{id}
 """
@@ -15,7 +16,7 @@ import logging
 from typing import Optional, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from sqlalchemy import or_
 from sqlalchemy.orm import Session
 
@@ -56,6 +57,8 @@ class ScopusRecordDetail(BaseModel):
     language:            Optional[str] = None
     source_journal:      Optional[str] = None
     issn:                Optional[str] = None
+    publisher:           Optional[str] = None
+    journal_coverage:    Optional[str] = None
     # ── Ubicación
     volume:              Optional[str] = None
     issue:               Optional[str] = None
@@ -229,6 +232,81 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
     if not record:
         raise HTTPException(404, "Registro Scopus no encontrado.")
     return record
+
+
+# ─────────────────────────────────────────────────────────────
+# POST /search/query  — query crudo Scopus
+# ─────────────────────────────────────────────────────────────
+
+class RawQueryRequest(BaseModel):
+    query: str = Field(
+        ...,
+        description=(
+            "Query Scopus en formato libre, igual que en la búsqueda avanzada de scopus.com.\n\n"
+            "Ejemplos:\n"
+            "  AF-ID(60106970) OR AF-ID(60112687)\n"
+            "  AF-ID(60106970) AND PUBYEAR > 2019 AND DOCTYPE(ar)\n"
+            "  AUTH(\"García\") AND SUBJAREA(MEDI) AND OPENACCESS(1)\n"
+            "  TITLE-ABS-KEY(\"machine learning\") AND AF-ID(60106970)"
+        ),
+        examples=["AF-ID(60106970) OR AF-ID(60112687)"],
+    )
+    max_results: int = Field(1000, ge=1, le=10000, description="Límite de registros a descargar")
+
+
+@router.post(
+    "/search/query",
+    response_model=SearchResult,
+    summary="Búsqueda por query Scopus directo",
+)
+def search_by_raw_query(
+    body: RawQueryRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Ejecuta una búsqueda en Scopus pasando el **query directamente**,
+    igual que escribirlo en la caja de búsqueda avanzada de [scopus.com](https://www.scopus.com/search/form.uri#advanced).
+
+    Los resultados se descargan y almacenan en `scopus_records` con `status=pending`.
+
+    **Operadores disponibles:**
+
+    | Operador | Descripción | Ejemplo |
+    |---|---|---|
+    | `AF-ID(id)` | Por AF-ID de institución | `AF-ID(60106970)` |
+    | `AFFIL("nombre")` | Por nombre de institución | `AFFIL("Universidad de Antioquia")` |
+    | `AUTH("apellido")` | Por autor | `AUTH("García, J.")` |
+    | `AU-ID(id)` | Por Scopus Author ID | `AU-ID(57208979556)` |
+    | `ORCID(id)` | Por ORCID | `ORCID(0000-0002-2096-7900)` |
+    | `TITLE-ABS-KEY("término")` | En título+resumen+keywords | `TITLE-ABS-KEY("deep learning")` |
+    | `SRCTITLE("revista")` | Por nombre de revista | `SRCTITLE("Biomédica")` |
+    | `PUBYEAR > yyyy` | Año mínimo | `PUBYEAR > 2019` |
+    | `PUBYEAR < yyyy` | Año máximo | `PUBYEAR < 2025` |
+    | `PUBYEAR = yyyy` | Año exacto | `PUBYEAR = 2023` |
+    | `DOCTYPE(ar)` | Tipo: ar/re/cp/bk/ch/ed/le | `DOCTYPE(ar)` |
+    | `SUBJAREA(MEDI)` | Área temática ASJC | `SUBJAREA(COMP)` |
+    | `OPENACCESS(1)` | Solo acceso abierto | `OPENACCESS(1)` |
+    | `FUND-SPONSOR("nombre")` | Por financiador | `FUND-SPONSOR("Minciencias")` |
+
+    Combinaciones con `AND`, `OR`, `AND NOT` y paréntesis.
+    """
+    from extractors.scopus import ScopusExtractor
+
+    query = body.query.strip()
+    if not query:
+        raise HTTPException(400, "El campo 'query' no puede estar vacío.")
+
+    logger.info(f"Scopus · query directo: {query!r}")
+    try:
+        extractor = ScopusExtractor()
+        records = extractor.extract(query=query, max_results=body.max_results)
+    except Exception as e:
+        logger.error(f"Error extrayendo Scopus (raw query): {e}")
+        raise HTTPException(502, f"Error al contactar Scopus API: {e}")
+
+    result = _ingest(records, db, "raw-query")
+    result.message = f"Query: {query} | {result.message}"
+    return result
 
 
 # ─────────────────────────────────────────────────────────────

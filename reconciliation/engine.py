@@ -1022,6 +1022,169 @@ class ReconciliationEngine:
             )
 
     # ---------------------------------------------------------
+    # ENRIQUECIMIENTO MASIVO DE CANÓNICOS EXISTENTES
+    # ---------------------------------------------------------
+
+    def enrich_all_canonicals(self, batch_size: int = 200) -> dict:
+        """
+        Recorre TODOS los canónicos existentes y los enriquece con los
+        registros de fuente ya vinculados (*_records con canonical_publication_id).
+
+        No importa el status del registro de fuente — si está vinculado
+        a un canónico, aporta sus campos.
+
+        Returns:
+            Resumen detallado de la ejecución: contadores globales,
+            desglose por campo y por fuente, y muestra de canónicos enriquecidos.
+        """
+        from db.source_registry import SOURCE_REGISTRY
+        from collections import defaultdict
+
+        _ENRICHABLE_FIELDS = [
+            "doi", "source_journal", "publication_type", "is_open_access",
+            "oa_status", "issn", "citation_count", "publication_year",
+            "publication_date", "language", "abstract", "keywords",
+            "source_url", "page_range", "publisher", "journal_coverage",
+            "first_author", "coauthorships_count", "corresponding_author",
+            "knowledge_area", "cine_code",
+        ]
+
+        def _is_empty(v):
+            return v is None or v == "" or v == 0
+
+        # ── Contadores ────────────────────────────────────────
+        total_processed = 0
+        total_with_changes = 0
+        total_errors = 0
+
+        # campo → cuántos canónicos lo recibieron por primera vez
+        filled_by_field: dict  = defaultdict(int)
+        # campo → cuántos canónicos lo actualizaron (ya tenía valor, cambió)
+        updated_by_field: dict = defaultdict(int)
+        # fuente → cuántos campos aportó en total
+        contrib_by_source: dict = defaultdict(int)
+        # muestra de canónicos que cambiaron
+        changed_sample: list = []
+
+        offset = 0
+        while True:
+            batch = (
+                self.session.query(CanonicalPublication)
+                .order_by(CanonicalPublication.id)
+                .offset(offset)
+                .limit(batch_size)
+                .all()
+            )
+            if not batch:
+                break
+
+            for canonical in batch:
+                try:
+                    # Snapshot antes
+                    before = {f: getattr(canonical, f, None) for f in _ENRICHABLE_FIELDS}
+                    prov_before = dict(canonical.field_provenance or {})
+
+                    # Enriquecer con todos los registros vinculados de todas las fuentes
+                    for src_def in SOURCE_REGISTRY.all():
+                        model = src_def.model_class
+                        linked = (
+                            self.session.query(model)
+                            .filter(model.canonical_publication_id == canonical.id)
+                            .all()
+                        )
+                        for ext in linked:
+                            self._enrich_canonical(canonical, ext)
+
+                    # Snapshot después
+                    after  = {f: getattr(canonical, f, None) for f in _ENRICHABLE_FIELDS}
+                    prov_after = dict(canonical.field_provenance or {})
+
+                    newly_filled = []   # vacío → valor
+                    updated      = []   # valor → valor distinto
+
+                    for f in _ENRICHABLE_FIELDS:
+                        bv, av = before[f], after[f]
+                        if bv == av:
+                            continue
+                        if _is_empty(bv) and not _is_empty(av):
+                            newly_filled.append(f)
+                            filled_by_field[f] += 1
+                            contrib_by_source[prov_after.get(f, "unknown")] += 1
+                        elif not _is_empty(bv) and not _is_empty(av) and bv != av:
+                            updated.append(f)
+                            updated_by_field[f] += 1
+                            contrib_by_source[prov_after.get(f, "unknown")] += 1
+
+                    total_processed += 1
+                    if newly_filled or updated:
+                        total_with_changes += 1
+                        if len(changed_sample) < 50:
+                            changed_sample.append({
+                                "canonical_id":    canonical.id,
+                                "doi":             canonical.doi,
+                                "title":           (canonical.title or "")[:120],
+                                "campos_nuevos":   newly_filled,
+                                "campos_actualizados": updated,
+                                "fuentes_usadas":  sorted({
+                                    prov_after.get(f, "unknown")
+                                    for f in newly_filled + updated
+                                }),
+                            })
+
+                except Exception as e:
+                    logger.warning(f"Error enriqueciendo canonical={canonical.id}: {e}")
+                    total_errors += 1
+
+            self.session.commit()
+            offset += batch_size
+            logger.info(
+                f"Enriquecimiento lote {offset}: "
+                f"{total_with_changes}/{total_processed} con cambios."
+            )
+
+        total_filled  = sum(filled_by_field.values())
+        total_updated = sum(updated_by_field.values())
+
+        return {
+            "resumen": {
+                "canonicals_procesados":      total_processed,
+                "canonicals_con_cambios":     total_with_changes,
+                "canonicals_sin_cambios":     total_processed - total_with_changes,
+                "campos_completados_total":   total_filled,
+                "campos_actualizados_total":  total_updated,
+                "errores":                    total_errors,
+                "promedio_cambios_por_canonico": (
+                    round((total_filled + total_updated) / total_with_changes, 1)
+                    if total_with_changes else 0
+                ),
+            },
+            "campos_completados": dict(
+                sorted(filled_by_field.items(), key=lambda x: x[1], reverse=True)
+            ),
+            "campos_actualizados": dict(
+                sorted(updated_by_field.items(), key=lambda x: x[1], reverse=True)
+            ),
+            "aporte_por_fuente": dict(
+                sorted(contrib_by_source.items(), key=lambda x: x[1], reverse=True)
+            ),
+            "muestra_cambios": changed_sample,
+        }
+
+
+def _count_filled(canonical: CanonicalPublication) -> int:
+    """Cuenta cuántos campos enriquecibles tienen valor."""
+    fields = [
+        "doi", "source_journal", "publication_type", "is_open_access",
+        "oa_status", "issn", "citation_count", "publication_year",
+        "publication_date", "language", "abstract", "keywords",
+        "source_url", "page_range", "publisher", "journal_coverage",
+        "first_author", "coauthorships_count", "corresponding_author",
+        "knowledge_area", "cine_code",
+    ]
+    return sum(1 for f in fields if getattr(canonical, f, None) not in (None, "", 0))
+
+
+    # ---------------------------------------------------------
     # INGESTA DE AUTORES
     # ---------------------------------------------------------
 

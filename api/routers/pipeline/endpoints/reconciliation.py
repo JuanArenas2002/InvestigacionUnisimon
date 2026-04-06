@@ -18,6 +18,46 @@ logger = logging.getLogger("pipeline")
 router = APIRouter(tags=["Reconciliation"])
 
 
+# ── POST /pipeline/enrich ─────────────────────────────────────────────────────
+
+@router.post(
+    "/enrich",
+    response_model=dict,
+    summary="Enriquecer canónicos con datos de todas las fuentes",
+)
+def enrich_canonicals(
+    batch_size: int = 200,
+    db: Session = Depends(get_db),
+):
+    """
+    Recorre **todos** los canónicos existentes y completa sus campos vacíos
+    usando los registros de fuente ya vinculados (`*_records` con
+    `canonical_publication_id` asignado).
+
+    No importa el `status` del registro de fuente — si está vinculado
+    a un canónico, aporta sus datos.
+
+    Útil cuando:
+    - Se descargó una fuente nueva y sus registros ya se reconciliaron,
+      pero los canónicos todavía no tienen los campos que esa fuente provee.
+    - Se agregaron columnas nuevas a las tablas de fuente (ej: `publisher`,
+      `journal_coverage`) y se quiere propagar esos valores a los canónicos.
+    - Un canónico se creó desde una sola fuente y ahora hay más fuentes vinculadas.
+
+    Respuesta:
+    - `canonicals_processed`: total de canónicos revisados
+    - `canonicals_enriched`: cuántos recibieron al menos un campo nuevo
+    - `fields_filled`: total de campos completados en toda la pasada
+    - `errors`: canónicos que fallaron (se omiten y se continúa)
+    """
+    engine = ReconciliationEngine(session=db)
+    try:
+        return engine.enrich_all_canonicals(batch_size=batch_size)
+    except Exception as e:
+        logger.error(f"Error en enriquecimiento masivo: {e}")
+        raise HTTPException(500, f"Error en enriquecimiento: {e}")
+
+
 # ── POST /pipeline/reconcile ──────────────────────────────────────────────
 
 @router.post(
