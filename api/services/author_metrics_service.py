@@ -5,7 +5,8 @@ Calcula todas las estadísticas bibliométricas sin conectarse a APIs externas.
 """
 
 import logging
-from typing import Dict, List, Optional
+import time
+from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from db.models import Author, CanonicalPublication, PublicationAuthor, Journal
@@ -20,10 +21,44 @@ from api.schemas.author_metrics import (
 
 logger = logging.getLogger(__name__)
 
+# ── Cache en memoria para métricas de autores ─────────────────────────────────
+# Estructura: {author_id: (resultado, timestamp_expiracion)}
+# TTL por defecto: 10 minutos. Se invalida automáticamente al vencer.
+_METRICS_CACHE: Dict[int, Tuple[AuthorGeneralMetricsResponse, float]] = {}
+_CACHE_TTL_SECONDS = 600  # 10 minutos
+
+
+def _cache_get(author_id: int) -> Optional[AuthorGeneralMetricsResponse]:
+    """Retorna el resultado cacheado si aún es válido, None si expiró o no existe."""
+    entry = _METRICS_CACHE.get(author_id)
+    if entry is None:
+        return None
+    result, expires_at = entry
+    if time.monotonic() > expires_at:
+        del _METRICS_CACHE[author_id]
+        return None
+    return result
+
+
+def _cache_set(author_id: int, result: AuthorGeneralMetricsResponse) -> None:
+    _METRICS_CACHE[author_id] = (result, time.monotonic() + _CACHE_TTL_SECONDS)
+
+
+def invalidate_author_metrics_cache(author_id: int) -> None:
+    """Invalida el cache para un autor específico (llamar tras merge o enrich)."""
+    _METRICS_CACHE.pop(author_id, None)
+
+
+def clear_metrics_cache() -> int:
+    """Limpia todo el cache. Retorna el número de entradas eliminadas."""
+    count = len(_METRICS_CACHE)
+    _METRICS_CACHE.clear()
+    return count
+
 
 class AuthorMetricsService:
     """Servicio para calcular métricas generales de autores"""
-    
+
     @staticmethod
     def get_author_metrics(author_id: int, db: Session) -> AuthorGeneralMetricsResponse:
         """
@@ -39,12 +74,17 @@ class AuthorMetricsService:
         Raises:
             ValueError: Si el autor no existe o no tiene publicaciones
         """
-        
+        # ── Cache hit ─────────────────────────────────────────────────────────
+        cached = _cache_get(author_id)
+        if cached is not None:
+            logger.debug("Cache hit para métricas del autor %s", author_id)
+            return cached
+
         # 1. Buscar autor
         author = db.query(Author).filter(Author.id == author_id).first()
         if not author:
             raise ValueError(f"Autor con ID {author_id} no existe")
-        
+
         logger.info(f"Analizando métricas del autor: {author.name}")
         
         # 2. Obtener publicaciones del autor
@@ -85,6 +125,9 @@ class AuthorMetricsService:
         )
         
         logger.info(f"Métricas de {author.name} calculadas exitosamente")
+
+        # ── Guardar en cache ──────────────────────────────────────────────────
+        _cache_set(author_id, response)
         return response
     
     @staticmethod

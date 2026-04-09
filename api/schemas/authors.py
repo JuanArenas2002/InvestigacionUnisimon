@@ -10,14 +10,20 @@ from pydantic import BaseModel, Field
 class AuthorBase(BaseModel):
     name: str
     normalized_name: Optional[str] = None
+    cedula: Optional[str] = None
     orcid: Optional[str] = None
     openalex_id: Optional[str] = None
     scopus_id: Optional[str] = None
     wos_id: Optional[str] = None
     cvlac_id: Optional[str] = None
+    google_scholar_id: Optional[str] = None
     is_institutional: bool = False
     field_provenance: Optional[dict] = Field(
         None, description="{campo: fuente} indica qué fuente aportó cada dato del autor"
+    )
+    verification_status: str = Field(
+        "auto_detected",
+        description="auto_detected | verified | needs_review | flagged",
     )
 
 
@@ -26,6 +32,7 @@ class AuthorRead(AuthorBase):
     created_at: datetime
     updated_at: datetime
     pub_count: int = 0
+    possible_duplicate_of: Optional[int] = None
 
     model_config = {"from_attributes": True}
 
@@ -78,6 +85,8 @@ class AuthorIdsCoverage(BaseModel):
     with_scopus: int
     with_wos: int
     with_cvlac: int
+    with_google_scholar: int
+    with_cedula: int
 
 
 # ── Duplicados ───────────────────────────────────────────────
@@ -190,3 +199,105 @@ class AuthorInventoryResponse(BaseModel):
     author: AuthorRead
     summary: InventorySummary
     products: List[InventoryProductRead] = []
+
+
+# ── Audit log ────────────────────────────────────────────────
+
+class AuthorAuditLogRead(BaseModel):
+    """Entrada del historial de cambios de un autor."""
+    id: int
+    author_id: Optional[int] = None
+    change_type: str
+    before_data: Optional[dict] = None
+    after_data: Optional[dict] = None
+    field_changes: Optional[dict] = None
+    source: Optional[str] = None
+    changed_by: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+# ── Conflictos ───────────────────────────────────────────────
+
+class AuthorConflictRead(BaseModel):
+    """Conflicto entre fuentes para un campo de autor."""
+    id: int
+    author_id: int
+    field_name: str
+    existing_value: Optional[str] = None
+    new_value: Optional[str] = None
+    existing_source: Optional[str] = None
+    new_source: Optional[str] = None
+    resolved: bool = False
+    resolution: Optional[str] = None
+    resolved_at: Optional[datetime] = None
+    resolved_by: Optional[str] = None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class ResolveConflictRequest(BaseModel):
+    """Solicitud para resolver un conflicto."""
+    resolution: str = Field(
+        ..., description="kept_existing | used_new | manual | ignored"
+    )
+    resolved_by: Optional[str] = None
+
+
+# ── Verificación ─────────────────────────────────────────────
+
+class VerifyAuthorRequest(BaseModel):
+    """Solicitud para cambiar el estado de verificación de un autor."""
+    verification_status: str = Field(
+        ..., description="verified | needs_review | flagged | auto_detected"
+    )
+    changed_by: Optional[str] = None
+
+
+# ── Importación masiva ───────────────────────────────────────
+
+class BatchAuthorItem(BaseModel):
+    """Un autor dentro de una importación masiva."""
+    name: str
+    orcid: Optional[str] = None
+    openalex_id: Optional[str] = None
+    scopus_id: Optional[str] = None
+    wos_id: Optional[str] = None
+    cvlac_id: Optional[str] = None
+    is_institutional: bool = False
+
+
+class BatchImportRequest(BaseModel):
+    """Cuerpo de una importación masiva de autores."""
+    authors: List[BatchAuthorItem] = Field(..., min_length=1, max_length=500)
+    source: str = Field("manual", description="Nombre de la fuente/importador")
+
+
+class BatchImportResponse(BaseModel):
+    """Resultado de la importación masiva."""
+    total_received: int
+    created: int
+    updated: int
+    skipped: int
+    conflicts: int
+    details: List[dict] = Field(default_factory=list)
+
+
+# ── Autores similares (posibles duplicados fuzzy) ────────────
+
+class SimilarAuthorRead(BaseModel):
+    """Autor con puntuación de similitud respecto al consultado."""
+    id: int
+    name: str
+    normalized_name: Optional[str] = None
+    orcid: Optional[str] = None
+    openalex_id: Optional[str] = None
+    scopus_id: Optional[str] = None
+    is_institutional: bool = False
+    verification_status: str = "auto_detected"
+    pub_count: int = 0
+    similarity_score: float = Field(..., description="Similitud pg_trgm 0-1")
+
+    model_config = {"from_attributes": True}

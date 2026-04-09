@@ -353,7 +353,7 @@ app.add_middleware(
 
 from api.routers import (
     publications, authors, external_records,
-    stats, search, pipeline, catalogs, scopus, admin, charts,
+    stats, search, pipeline, catalogs, scopus, admin, charts, auth,
 )
 from api.routers.sources import router as sources_router
 from project.app.routes.ingest import router as hex_ingest_router
@@ -361,6 +361,9 @@ from project.app.routes.publications import router as hex_publications_router
 
 # ── FASE 1: fuentes independientes ───────────────────────────
 app.include_router(sources_router, prefix="/api")
+
+# ── Autenticación ────────────────────────────────────────────
+app.include_router(auth.router, prefix="/api")
 
 # ── FASE 2: reconciliación y pipeline ────────────────────────
 app.include_router(pipeline.router,         prefix="/api")

@@ -49,10 +49,19 @@ from api.schemas.authors import (
     InventoryTypeSummary,
     InventorySourceSummary,
     InventoryYearSummary,
+    AuthorAuditLogRead,
+    AuthorConflictRead,
+    ResolveConflictRequest,
+    VerifyAuthorRequest,
+    BatchImportRequest,
+    BatchImportResponse,
+    SimilarAuthorRead,
 )
 from db.models import (
     CanonicalPublication,
     Author,
+    AuthorAuditLog,
+    AuthorConflict,
     PublicationAuthor,
     SOURCE_MODELS,
 )
@@ -436,6 +445,12 @@ def author_ids_coverage(db: Session = Depends(get_db)):
             func.count(Author.id).filter(
                 Author.external_ids.has_key("cvlac")
             ).label("with_cvlac"),
+            func.count(Author.id).filter(
+                Author.external_ids.has_key("google_scholar")
+            ).label("with_google_scholar"),
+            func.count(Author.id).filter(
+                Author.cedula.isnot(None), Author.cedula != ""
+            ).label("with_cedula"),
         )
     ).one()
 
@@ -447,6 +462,8 @@ def author_ids_coverage(db: Session = Depends(get_db)):
         with_scopus=row.with_scopus,
         with_wos=row.with_wos,
         with_cvlac=row.with_cvlac,
+        with_google_scholar=row.with_google_scholar,
+        with_cedula=row.with_cedula,
     )
 
 
@@ -736,6 +753,12 @@ def merge_authors(body: MergeAuthorsRequest, db: Session = Depends(get_db)):
         f"Merge: conservado={keep.id}, absorbidos={body.merge_ids}, "
         f"pubs_reasignadas={pubs_reassigned}, ids_heredados={ids_inherited}"
     )
+
+    # Invalidar cache de métricas para el autor resultante y los absorbidos
+    from api.services.author_metrics_service import invalidate_author_metrics_cache
+    invalidate_author_metrics_cache(keep_id)
+    for mid in body.merge_ids:
+        invalidate_author_metrics_cache(mid)
 
     return MergeAuthorsResponse(
         kept_author_id=keep.id,
@@ -1372,4 +1395,323 @@ def enrich_authors_by_orcid(
     return _do_enrich(authors, db)
 
 
+# =============================================================================
+# NUEVOS ENDPOINTS v11
+# =============================================================================
 
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /authors/{id}/similar — autores similares por nombre (fuzzy)
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/id/{author_id}/similar",
+    response_model=List[SimilarAuthorRead],
+    summary="Autores con nombre similar (posibles duplicados)",
+)
+def get_similar_authors(
+    author_id: int,
+    threshold: float = Query(0.6, ge=0.3, le=1.0, description="Umbral de similitud pg_trgm (default: 0.6)"),
+    limit: int = Query(10, ge=1, le=50),
+    db: Session = Depends(get_db),
+):
+    """
+    Devuelve autores cuyo normalized_name tiene similitud >= threshold
+    con el autor indicado. Útil para detectar posibles duplicados manualmente.
+    """
+    author = db.get(Author, author_id)
+    if not author:
+        raise HTTPException(404, "Autor no encontrado")
+    if not author.normalized_name:
+        return []
+
+    similarity_expr = func.similarity(Author.normalized_name, author.normalized_name)
+
+    pub_count_sq = (
+        db.query(
+            PublicationAuthor.author_id,
+            func.count(PublicationAuthor.id).label("cnt"),
+        )
+        .group_by(PublicationAuthor.author_id)
+        .subquery()
+    )
+
+    rows = (
+        db.query(Author, func.coalesce(pub_count_sq.c.cnt, 0).label("pc"), similarity_expr.label("score"))
+        .outerjoin(pub_count_sq, Author.id == pub_count_sq.c.author_id)
+        .filter(
+            Author.id != author_id,
+            Author.normalized_name.isnot(None),
+            similarity_expr >= threshold,
+        )
+        .order_by(similarity_expr.desc())
+        .limit(limit)
+        .all()
+    )
+
+    result = []
+    for a, pc, score in rows:
+        item = SimilarAuthorRead(
+            id=a.id,
+            name=a.name,
+            normalized_name=a.normalized_name,
+            orcid=a.orcid,
+            openalex_id=a.openalex_id,
+            scopus_id=a.scopus_id,
+            is_institutional=a.is_institutional,
+            verification_status=a.verification_status,
+            pub_count=pc or 0,
+            similarity_score=round(float(score), 4),
+        )
+        result.append(item)
+    return result
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /authors/{id}/audit-log
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/id/{author_id}/audit-log",
+    response_model=List[AuthorAuditLogRead],
+    summary="Historial de cambios de un autor",
+)
+def get_author_audit_log(
+    author_id: int,
+    limit: int = Query(50, ge=1, le=200),
+    db: Session = Depends(get_db),
+):
+    """Devuelve el historial de cambios (creación, actualizaciones, fusiones) de un autor."""
+    if not db.get(Author, author_id):
+        raise HTTPException(404, "Autor no encontrado")
+    entries = (
+        db.query(AuthorAuditLog)
+        .filter(AuthorAuditLog.author_id == author_id)
+        .order_by(AuthorAuditLog.created_at.desc())
+        .limit(limit)
+        .all()
+    )
+    return [AuthorAuditLogRead.model_validate(e) for e in entries]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /authors/conflicts — conflictos sin resolver
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/conflicts",
+    response_model=List[AuthorConflictRead],
+    summary="Conflictos entre fuentes sin resolver",
+)
+def get_author_conflicts(
+    author_id: Optional[int] = Query(None, description="Filtrar por autor"),
+    only_unresolved: bool = Query(True),
+    limit: int = Query(100, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Lista conflictos donde dos fuentes aportaron valores distintos para el mismo campo."""
+    q = db.query(AuthorConflict)
+    if author_id is not None:
+        q = q.filter(AuthorConflict.author_id == author_id)
+    if only_unresolved:
+        q = q.filter(AuthorConflict.resolved == False)  # noqa: E712
+    conflicts = q.order_by(AuthorConflict.created_at.desc()).limit(limit).all()
+    return [AuthorConflictRead.model_validate(c) for c in conflicts]
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /authors/conflicts/{id}/resolve
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/conflicts/{conflict_id}/resolve",
+    response_model=AuthorConflictRead,
+    summary="Resolver un conflicto entre fuentes",
+)
+def resolve_author_conflict(
+    conflict_id: int,
+    body: ResolveConflictRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Marca un conflicto como resuelto.
+
+    - `kept_existing`: se conserva el valor ya almacenado
+    - `used_new`: se aplica el valor de la nueva fuente al autor
+    - `manual`: resolución manual libre
+    - `ignored`: se ignora sin cambios
+    """
+    from datetime import datetime, timezone
+
+    conflict = db.get(AuthorConflict, conflict_id)
+    if not conflict:
+        raise HTTPException(404, "Conflicto no encontrado")
+    if conflict.resolved:
+        raise HTTPException(400, "El conflicto ya fue resuelto")
+
+    valid_resolutions = {"kept_existing", "used_new", "manual", "ignored"}
+    if body.resolution not in valid_resolutions:
+        raise HTTPException(400, f"Resolución inválida. Opciones: {valid_resolutions}")
+
+    # Si se eligió usar el nuevo valor, aplicarlo al autor
+    if body.resolution == "used_new":
+        author = db.get(Author, conflict.author_id)
+        if author and conflict.new_value is not None:
+            field = conflict.field_name
+            if field == "orcid":
+                author.orcid = conflict.new_value
+            elif field.startswith("external_ids."):
+                key = field.split(".", 1)[1]
+                author.external_ids = {**(author.external_ids or {}), key: conflict.new_value}
+
+    conflict.resolved = True
+    conflict.resolution = body.resolution
+    conflict.resolved_at = datetime.now(timezone.utc)
+    conflict.resolved_by = body.resolved_by
+    db.commit()
+    db.refresh(conflict)
+    return AuthorConflictRead.model_validate(conflict)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /authors/{id}/verify — cambiar estado de verificación
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/id/{author_id}/verify",
+    response_model=AuthorRead,
+    summary="Cambiar estado de verificación de un autor",
+)
+def verify_author(
+    author_id: int,
+    body: VerifyAuthorRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Actualiza el `verification_status` del autor.
+    Al marcar como `verified`, se limpia `possible_duplicate_of`.
+    """
+    valid_statuses = {"verified", "needs_review", "flagged", "auto_detected"}
+    if body.verification_status not in valid_statuses:
+        raise HTTPException(400, f"Estado inválido. Opciones: {valid_statuses}")
+
+    author = db.get(Author, author_id)
+    if not author:
+        raise HTTPException(404, "Autor no encontrado")
+
+    before = {
+        "verification_status": author.verification_status,
+        "possible_duplicate_of": author.possible_duplicate_of,
+    }
+    author.verification_status = body.verification_status
+    if body.verification_status == "verified":
+        author.possible_duplicate_of = None
+
+    # Audit log
+    entry = AuthorAuditLog(
+        author_id=author.id,
+        change_type="verified",
+        before_data=before,
+        after_data={"verification_status": author.verification_status},
+        field_changes={"verification_status": {"before": before["verification_status"], "after": author.verification_status}},
+        source="manual",
+        changed_by=body.changed_by,
+    )
+    db.add(entry)
+    db.commit()
+    db.refresh(author)
+
+    pc = (
+        db.query(func.count(PublicationAuthor.id))
+        .filter(PublicationAuthor.author_id == author_id)
+        .scalar() or 0
+    )
+    ar = AuthorRead.model_validate(author)
+    ar.pub_count = pc
+    return ar
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# POST /authors/batch-import — importación masiva
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.post(
+    "/batch-import",
+    response_model=BatchImportResponse,
+    summary="Importar autores en lote (upsert inteligente)",
+)
+def batch_import_authors(
+    body: BatchImportRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Importa hasta 500 autores usando la misma lógica upsert del pipeline:
+    - Busca por ORCID → external ID → nombre canónico → fuzzy (pg_trgm)
+    - Si encuentra el autor, lo enriquece sin duplicar
+    - Si no lo encuentra, lo crea con verification_status = 'auto_detected'
+
+    Ideal para cargas masivas desde archivos CSV/Excel.
+    """
+    from project.infrastructure.persistence.postgres_repository import PostgresRepository
+    from project.domain.models.author import Author as DomainAuthor
+
+    created = 0
+    updated = 0
+    skipped = 0
+    conflicts = 0
+    details = []
+
+    # Usamos la misma sesión del request para poder hacer un solo commit
+    session = db
+
+    for item in body.authors:
+        if not (item.name or "").strip():
+            skipped += 1
+            continue
+
+        # Construir un objeto dominio liviano para reusar _upsert_author
+        domain_author = DomainAuthor(
+            name=item.name,
+            orcid=item.orcid,
+            is_institutional=item.is_institutional,
+            external_ids={
+                k: v for k, v in {
+                    "openalex": item.openalex_id,
+                    "scopus": item.scopus_id,
+                    "wos": item.wos_id,
+                    "cvlac": item.cvlac_id,
+                }.items() if v
+            },
+        )
+
+        # Contar conflictos previos
+        prev_conflicts = db.query(func.count(AuthorConflict.id)).scalar() or 0
+
+        existing_count = db.query(func.count(Author.id)).scalar() or 0
+        PostgresRepository._upsert_author(session, domain_author, body.source)
+        new_count = db.query(func.count(Author.id)).scalar() or 0
+        after_conflicts = db.query(func.count(AuthorConflict.id)).scalar() or 0
+
+        if new_count > existing_count:
+            created += 1
+            details.append({"name": item.name, "action": "created"})
+        else:
+            updated += 1
+            details.append({"name": item.name, "action": "updated"})
+
+        if after_conflicts > prev_conflicts:
+            conflicts += after_conflicts - prev_conflicts
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        raise HTTPException(500, f"Error durante la importación: {e}")
+
+    return BatchImportResponse(
+        total_received=len(body.authors),
+        created=created,
+        updated=updated,
+        skipped=skipped,
+        conflicts=conflicts,
+        details=details[:100],  # Limitar detalles para no saturar la respuesta
+    )

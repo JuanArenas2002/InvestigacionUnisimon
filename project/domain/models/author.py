@@ -8,6 +8,7 @@ class Author:
 
     name: str
     orcid: Optional[str] = None
+    cedula: Optional[str] = None
     is_institutional: bool = False
     external_ids: Dict[str, str] = field(default_factory=dict)
     metadata: Dict[str, Any] = field(default_factory=dict)

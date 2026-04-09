@@ -111,7 +111,84 @@ def ensure_constraints(engine=None):
         engine = get_engine()
 
     ddl_statements = [
-        # --- Índices para autores ---
+        # --- v11: extensión pg_trgm (fuzzy matching) ---
+        "CREATE EXTENSION IF NOT EXISTS pg_trgm;",
+
+        # --- v12: cedula en authors ---
+        "ALTER TABLE authors ADD COLUMN IF NOT EXISTS cedula VARCHAR(30);",
+        """
+        DO $$ BEGIN
+            IF NOT EXISTS (
+                SELECT 1 FROM pg_indexes
+                WHERE tablename='authors' AND indexname='ix_authors_cedula'
+            ) THEN
+                CREATE UNIQUE INDEX ix_authors_cedula ON authors (cedula)
+                WHERE cedula IS NOT NULL;
+            END IF;
+        END $$;
+        """,
+
+        # --- v11: columnas nuevas en authors ---
+        """
+        ALTER TABLE authors
+            ADD COLUMN IF NOT EXISTS verification_status VARCHAR(30)
+                NOT NULL DEFAULT 'auto_detected';
+        """,
+        """
+        ALTER TABLE authors
+            ADD COLUMN IF NOT EXISTS possible_duplicate_of INTEGER
+                REFERENCES authors(id) ON DELETE SET NULL;
+        """,
+
+        # --- v11: índices en authors ---
+        "CREATE INDEX IF NOT EXISTS ix_authors_external_ids_gin ON authors USING GIN (external_ids);",
+        "CREATE INDEX IF NOT EXISTS ix_authors_normalized_name_trgm ON authors USING GIN (normalized_name gin_trgm_ops);",
+        "CREATE INDEX IF NOT EXISTS ix_authors_verification_status ON authors (verification_status);",
+        "CREATE INDEX IF NOT EXISTS ix_authors_possible_dup ON authors (possible_duplicate_of) WHERE possible_duplicate_of IS NOT NULL;",
+
+        # --- v11: tabla author_audit_log ---
+        """
+        CREATE TABLE IF NOT EXISTS author_audit_log (
+            id          SERIAL PRIMARY KEY,
+            author_id   INTEGER REFERENCES authors(id) ON DELETE CASCADE,
+            change_type VARCHAR(30) NOT NULL,
+            before_data JSONB,
+            after_data  JSONB,
+            field_changes JSONB,
+            source      VARCHAR(100),
+            changed_by  VARCHAR(200),
+            created_at  TIMESTAMPTZ DEFAULT now()
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_author_audit_author_id ON author_audit_log (author_id);",
+        "CREATE INDEX IF NOT EXISTS ix_author_audit_created ON author_audit_log (created_at DESC);",
+
+        # --- v11: tabla author_conflicts ---
+        """
+        CREATE TABLE IF NOT EXISTS author_conflicts (
+            id              SERIAL PRIMARY KEY,
+            author_id       INTEGER REFERENCES authors(id) ON DELETE CASCADE,
+            field_name      VARCHAR(100) NOT NULL,
+            existing_value  TEXT,
+            new_value       TEXT,
+            existing_source VARCHAR(100),
+            new_source      VARCHAR(100),
+            resolved        BOOLEAN DEFAULT FALSE,
+            resolution      VARCHAR(50),
+            resolved_at     TIMESTAMPTZ,
+            resolved_by     VARCHAR(200),
+            created_at      TIMESTAMPTZ DEFAULT now()
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_author_conflicts_author ON author_conflicts (author_id);",
+        "CREATE INDEX IF NOT EXISTS ix_author_conflicts_unresolved ON author_conflicts (resolved, created_at DESC);",
+
+        # --- v11: columnas nuevas en author_institutions ---
+        "ALTER TABLE author_institutions ADD COLUMN IF NOT EXISTS start_year INTEGER;",
+        "ALTER TABLE author_institutions ADD COLUMN IF NOT EXISTS end_year INTEGER;",
+        "ALTER TABLE author_institutions ADD COLUMN IF NOT EXISTS is_current BOOLEAN DEFAULT TRUE;",
+
+        # --- Índices para autores (legacy — pueden fallar silenciosamente) ---
         "CREATE INDEX IF NOT EXISTS ix_authors_openalex ON authors (openalex_id) WHERE openalex_id IS NOT NULL;",
         "CREATE INDEX IF NOT EXISTS ix_authors_scopus ON authors (scopus_id) WHERE scopus_id IS NOT NULL;",
 
@@ -153,14 +230,24 @@ def ensure_constraints(engine=None):
             f"USING GIN (to_tsvector('spanish', coalesce(title, '')));"
         )
 
-    with engine.connect() as conn:
-        for stmt in ddl_statements:
-            try:
-                conn.execute(text(stmt))
-            except Exception as e:
-                logger.debug(f"Migración omitida: {e}")
-        conn.commit()
-    logger.info("Migración idempotente completada — constraints e índices verificados.")
+    # Cada sentencia DDL se ejecuta en su propia conexión con autocommit=True.
+    # Esto evita que un fallo en una sentencia aborte el resto de la transacción
+    # (comportamiento por defecto de PostgreSQL dentro de un bloque de transacción).
+    applied = 0
+    skipped = 0
+    for stmt in ddl_statements:
+        try:
+            with engine.connect().execution_options(isolation_level="AUTOCOMMIT") as conn:
+                conn.execute(text(stmt.strip()))
+            applied += 1
+        except Exception as e:
+            skipped += 1
+            logger.debug("DDL omitido (%s): %.120s", type(e).__name__, stmt.strip()[:120])
+
+    logger.info(
+        "Migración idempotente completada — %d sentencias aplicadas, %d omitidas.",
+        applied, skipped,
+    )
 
 
 def drop_all_tables():

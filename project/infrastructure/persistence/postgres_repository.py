@@ -1,14 +1,22 @@
+import logging
+from datetime import datetime, timezone
 from typing import Dict, List, Optional
 
-from sqlalchemy import desc, or_
+from sqlalchemy import desc, func, or_, text
 
-from db.models import Author, CanonicalPublication, PublicationAuthor
+from db.models import Author, AuthorAuditLog, AuthorConflict, CanonicalPublication, PublicationAuthor
 from db.session import get_session
 from db.source_registry import SOURCE_REGISTRY
 from shared.normalizers import normalize_author_name, normalize_text
 
 from project.domain.models.publication import Publication
 from project.ports.repository_port import RepositoryPort
+
+logger = logging.getLogger(__name__)
+
+# Umbral de similitud fuzzy (pg_trgm) para considerar dos nombres el mismo autor.
+# 0.82 equivale a ~82% de trigramas en común — equilibrio entre precisión y recall.
+FUZZY_SIMILARITY_THRESHOLD = 0.82
 
 
 def _canonical_name(normalized: str) -> str:
@@ -22,6 +30,67 @@ def _canonical_name(normalized: str) -> str:
     la misma clave de busqueda, resolviendo el problema de nombres invertidos.
     """
     return " ".join(sorted(normalized.split()))
+
+
+def _author_snapshot(author: Author) -> dict:
+    """Genera un diccionario con los campos clave de un autor para el audit log."""
+    return {
+        "name": author.name,
+        "normalized_name": author.normalized_name,
+        "orcid": author.orcid,
+        "external_ids": dict(author.external_ids or {}),
+        "is_institutional": author.is_institutional,
+        "verification_status": author.verification_status,
+    }
+
+
+def _log_author_change(
+    session,
+    author: Author,
+    change_type: str,
+    before: Optional[dict],
+    source: str,
+    field_changes: Optional[dict] = None,
+) -> None:
+    """Registra un cambio en el audit log sin interrumpir el flujo principal."""
+    try:
+        after = _author_snapshot(author)
+        entry = AuthorAuditLog(
+            author_id=author.id,
+            change_type=change_type,
+            before_data=before,
+            after_data=after,
+            field_changes=field_changes,
+            source=source,
+        )
+        session.add(entry)
+    except Exception:
+        # El audit log nunca debe interrumpir el guardado de datos
+        logger.warning("No se pudo registrar audit log para autor %s", getattr(author, "id", "?"))
+
+
+def _log_conflict(
+    session,
+    author: Author,
+    field_name: str,
+    existing_value: str,
+    new_value: str,
+    existing_source: str,
+    new_source: str,
+) -> None:
+    """Registra un conflicto entre fuentes para un campo de autor."""
+    try:
+        conflict = AuthorConflict(
+            author_id=author.id,
+            field_name=field_name,
+            existing_value=str(existing_value) if existing_value is not None else None,
+            new_value=str(new_value) if new_value is not None else None,
+            existing_source=existing_source,
+            new_source=new_source,
+        )
+        session.add(conflict)
+    except Exception:
+        logger.warning("No se pudo registrar conflicto para autor %s campo %s", getattr(author, "id", "?"), field_name)
 
 
 class PostgresRepository(RepositoryPort):
@@ -288,9 +357,7 @@ class PostgresRepository(RepositoryPort):
                     author = candidate
                     break
 
-        # ── 3. Nombre canonico (maneja nombres invertidos) ────────────────
-        # Busca tanto la forma canonica (tokens ordenados) como el
-        # normalized_name as-is para compatibilidad con registros anteriores.
+        # ── 3. Nombre canonico exacto (maneja nombres invertidos) ─────────
         if author is None:
             author = (
                 session.query(Author)
@@ -303,17 +370,61 @@ class PostgresRepository(RepositoryPort):
                 .first()
             )
 
+        # ── 4. Similitud fuzzy por pg_trgm ────────────────────────────────
+        # Solo si no encontramos nada exacto. Usa similarity() de pg_trgm para
+        # detectar variantes del mismo nombre: abreviaciones, orden invertido
+        # con guion, acentos inconsistentes, etc.
+        # Política:
+        #   - similitud >= umbral Y comparte al menos un external_id
+        #     → mismo autor, fusionar (alta confianza)
+        #   - similitud >= umbral Y sin external_ids compartidos
+        #     → marcar como posible duplicado para revisión humana (no fusionar)
+        if author is None and canonical:
+            try:
+                fuzzy_candidates = (
+                    session.query(Author)
+                    .filter(
+                        func.similarity(Author.normalized_name, canonical)
+                        >= FUZZY_SIMILARITY_THRESHOLD,
+                        Author.normalized_name.isnot(None),
+                    )
+                    .order_by(
+                        func.similarity(Author.normalized_name, canonical).desc()
+                    )
+                    .limit(5)
+                    .all()
+                )
+
+                for candidate in fuzzy_candidates:
+                    cand_ext = candidate.external_ids or {}
+                    # Verificar si comparten algún ID externo
+                    shared_keys = set(external_ids.keys()) & set(cand_ext.keys())
+                    has_shared_id = any(
+                        external_ids[k] == cand_ext[k] for k in shared_keys
+                    )
+
+                    if has_shared_id:
+                        # Alta confianza: mismo autor
+                        author = candidate
+                        break
+                    else:
+                        # Baja confianza: marcar para revisión si aún no está marcado
+                        if candidate.possible_duplicate_of is None:
+                            # Se marcará al crear el nuevo autor (ver abajo)
+                            pass
+            except Exception:
+                # pg_trgm no disponible o error de BD → continuar sin fuzzy
+                logger.debug("Fuzzy match no disponible para '%s'", canonical)
+
         # ── Crear nuevo autor ─────────────────────────────────────────────
         if author is None:
             author = Author(
                 name=clean_name,
-                # Guardar en forma canonica para que futuras busquedas
-                # encuentren este registro independientemente del orden
-                # nombre/apellido en la fuente.
                 normalized_name=canonical,
                 orcid=author_payload.orcid,
                 external_ids=external_ids,
                 is_institutional=bool(author_payload.is_institutional),
+                verification_status="auto_detected",
                 field_provenance={
                     source_name: {
                         "orcid": author_payload.orcid,
@@ -324,22 +435,82 @@ class PostgresRepository(RepositoryPort):
             )
             session.add(author)
             session.flush()
+
+            # Si hay candidatos fuzzy sin ID compartido, señalar posible duplicado
+            try:
+                fuzzy_flag_candidates = (
+                    session.query(Author)
+                    .filter(
+                        Author.id != author.id,
+                        func.similarity(Author.normalized_name, canonical)
+                        >= FUZZY_SIMILARITY_THRESHOLD,
+                        Author.normalized_name.isnot(None),
+                    )
+                    .order_by(
+                        func.similarity(Author.normalized_name, canonical).desc()
+                    )
+                    .limit(1)
+                    .all()
+                )
+                if fuzzy_flag_candidates:
+                    author.possible_duplicate_of = fuzzy_flag_candidates[0].id
+                    author.verification_status = "needs_review"
+            except Exception:
+                pass
+
+            _log_author_change(session, author, "created", None, source_name)
             return author
 
         # ── Enriquecer autor existente ────────────────────────────────────
+        before = _author_snapshot(author)
+        field_changes: dict = {}
+
         # Prefiere el nombre mas largo (mas informacion)
         if len(clean_name) > len(author.name or ""):
+            field_changes["name"] = {"before": author.name, "after": clean_name}
             author.name = clean_name
+
         # Migrar al formato canonico si el registro era del formato antiguo
         if author.normalized_name != canonical:
             author.normalized_name = canonical
-        # ORCID: no sobreescribir si ya existe (podria ser de otra persona)
-        if not author.orcid and author_payload.orcid:
-            author.orcid = author_payload.orcid
+
+        # ORCID: detectar conflicto si el autor ya tiene uno diferente
+        if author_payload.orcid:
+            if not author.orcid:
+                field_changes["orcid"] = {"before": None, "after": author_payload.orcid}
+                author.orcid = author_payload.orcid
+            elif author.orcid != author_payload.orcid:
+                # Conflicto: dos fuentes dan ORCIDs distintos — registrar sin sobreescribir
+                existing_source = (author.field_provenance or {}).get("orcid", "unknown")
+                _log_conflict(
+                    session, author,
+                    field_name="orcid",
+                    existing_value=author.orcid,
+                    new_value=author_payload.orcid,
+                    existing_source=existing_source,
+                    new_source=source_name,
+                )
+
         author.is_institutional = author.is_institutional or bool(author_payload.is_institutional)
 
-        merged_external_ids = {**(author.external_ids or {}), **external_ids}
-        author.external_ids = merged_external_ids
+        # Fusionar external_ids detectando conflictos campo a campo
+        current_ext = dict(author.external_ids or {})
+        for ext_key, ext_value in external_ids.items():
+            if ext_key not in current_ext:
+                current_ext[ext_key] = ext_value
+                field_changes[f"external_ids.{ext_key}"] = {"before": None, "after": ext_value}
+            elif current_ext[ext_key] != ext_value:
+                # Conflicto de ID externo
+                existing_source = (author.field_provenance or {}).get(f"external_ids.{ext_key}", "unknown")
+                _log_conflict(
+                    session, author,
+                    field_name=f"external_ids.{ext_key}",
+                    existing_value=current_ext[ext_key],
+                    new_value=ext_value,
+                    existing_source=existing_source,
+                    new_source=source_name,
+                )
+        author.external_ids = current_ext
 
         provenance = dict(author.field_provenance or {})
         provenance[source_name] = {
@@ -348,5 +519,8 @@ class PostgresRepository(RepositoryPort):
             "metadata": author_payload.metadata or {},
         }
         author.field_provenance = provenance
+
+        if field_changes:
+            _log_author_change(session, author, "updated", before, source_name, field_changes)
 
         return author
