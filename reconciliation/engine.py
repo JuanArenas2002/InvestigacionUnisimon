@@ -38,8 +38,9 @@ Flujo en cascada:
 import hashlib
 import logging
 import re as _re
+from collections import defaultdict
 from datetime import datetime, timezone
-from typing import List, Dict, Optional, Tuple, Any
+from typing import List, Dict, Optional, Tuple, Any, Set
 
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -57,7 +58,6 @@ from db.models import (
     ReconciliationLog,
     SOURCE_MODELS,
     find_record_by_doi_across_sources,
-    count_source_records_for_canonical,
 )
 from db.source_registry import SOURCE_REGISTRY
 from db.session import get_session
@@ -129,6 +129,8 @@ class ReconciliationEngine:
     def __init__(self, session: Session = None):
         self.session = session or get_session()
         self.stats = ReconciliationStats()
+        # Cache in-memory; se inicializa en reconcile_pending
+        self._cache: Optional[Dict] = None
 
     # ---------------------------------------------------------
     # API PÚBLICA
@@ -208,15 +210,67 @@ class ReconciliationEngine:
         PASO 0: Ingesta — inserta StandardRecords en la tabla de fuente correcta.
         Los marca como 'pending' para reconciliación posterior.
 
-        Protección anti-duplicados en 4 niveles:
-          1. Hash determinista (dedup_hash) con UNIQUE constraint en DB
-          2. Consulta previa por source_id (columna específica de la tabla)
-          3. Consulta por DOI dentro de la misma tabla de fuente
-          4. Consulta por título normalizado + año
+        Protección anti-duplicados en 4 niveles (ahora con pre-carga bulk):
+          1. Hash determinista (dedup_hash) — pre-cargado en set
+          2. source_id — pre-cargado en set por fuente
+          3. DOI dentro de la tabla — pre-cargado en set por fuente
+          4. título normalizado+año — pre-cargado en set por fuente
 
         Returns:
             Número de registros insertados (excluyendo duplicados)
         """
+        if not records:
+            return 0
+
+        # ── Pre-cargar sets de dedup por fuente (bulk, 4 queries por fuente) ──
+        # Agrupa por source_name para cargar solo los modelos que se usan
+        source_names_used = {r.source_name for r in records}
+        existing: Dict[str, Dict[str, set]] = {}
+
+        for src_name in source_names_used:
+            model_cls = SOURCE_MODELS.get(src_name)
+            if not model_cls:
+                continue
+            sid_attr = _SOURCE_ID_ATTR.get(src_name)
+
+            hashes = {
+                row[0]
+                for row in self.session.query(model_cls.dedup_hash).all()
+                if row[0]
+            }
+            sids = (
+                {
+                    str(row[0])
+                    for row in self.session.query(getattr(model_cls, sid_attr)).all()
+                    if row[0]
+                }
+                if sid_attr
+                else set()
+            )
+            dois = {
+                row[0]
+                for row in self.session.query(model_cls.doi).filter(
+                    model_cls.doi.isnot(None)
+                ).all()
+                if row[0]
+            }
+            title_year = {
+                (row[0], row[1])
+                for row in self.session.query(
+                    model_cls.normalized_title, model_cls.publication_year
+                ).filter(
+                    model_cls.normalized_title.isnot(None),
+                    model_cls.publication_year.isnot(None),
+                ).all()
+                if row[0] and row[1]
+            }
+            existing[src_name] = {
+                "hashes": hashes,
+                "sids": sids,
+                "dois": dois,
+                "title_year": title_year,
+            }
+
         inserted = 0
         skipped = 0
 
@@ -228,6 +282,7 @@ class ReconciliationEngine:
                     skipped += 1
                     continue
 
+                ex = existing.get(record.source_name, {})
                 sid_attr = _SOURCE_ID_ATTR.get(record.source_name)
 
                 # --- Calcular hash de deduplicación ---
@@ -236,51 +291,27 @@ class ReconciliationEngine:
                     record.doi, record.normalized_title, record.publication_year,
                 )
 
-                # --- Nivel 1: verificar por dedup_hash ---
-                exists_hash = (
-                    self.session.query(model_cls.id)
-                    .filter_by(dedup_hash=dedup)
-                    .first()
-                )
-                if exists_hash:
+                # --- Nivel 1: dedup_hash (in-memory) ---
+                if dedup in ex.get("hashes", set()):
                     skipped += 1
                     continue
 
-                # --- Nivel 2: verificar por source_id ---
+                # --- Nivel 2: source_id (in-memory) ---
                 if record.source_id and sid_attr:
-                    exists_sid = (
-                        self.session.query(model_cls.id)
-                        .filter(getattr(model_cls, sid_attr) == record.source_id)
-                        .first()
-                    )
-                    if exists_sid:
+                    if str(record.source_id) in ex.get("sids", set()):
                         skipped += 1
                         continue
 
-                # --- Nivel 3: verificar por DOI ---
+                # --- Nivel 3: DOI (in-memory) ---
                 if record.doi:
                     ndoi = normalize_doi(record.doi)
-                    if ndoi:
-                        exists_doi = (
-                            self.session.query(model_cls.id)
-                            .filter_by(doi=ndoi)
-                            .first()
-                        )
-                        if exists_doi:
-                            skipped += 1
-                            continue
+                    if ndoi and ndoi in ex.get("dois", set()):
+                        skipped += 1
+                        continue
 
-                # --- Nivel 4: verificar por título normalizado + año ---
+                # --- Nivel 4: título normalizado + año (in-memory) ---
                 if record.normalized_title and record.publication_year:
-                    exists_title = (
-                        self.session.query(model_cls.id)
-                        .filter_by(
-                            normalized_title=record.normalized_title,
-                            publication_year=record.publication_year,
-                        )
-                        .first()
-                    )
-                    if exists_title:
+                    if (record.normalized_title, record.publication_year) in ex.get("title_year", set()):
                         skipped += 1
                         continue
 
@@ -288,6 +319,20 @@ class ReconciliationEngine:
                 source_record = self._build_source_record(record, dedup)
                 self.session.add(source_record)
                 self.session.flush()
+
+                # Actualizar sets para detectar duplicados dentro del mismo lote
+                ex.setdefault("hashes", set()).add(dedup)
+                if record.source_id and sid_attr:
+                    ex.setdefault("sids", set()).add(str(record.source_id))
+                if record.doi:
+                    ndoi = normalize_doi(record.doi)
+                    if ndoi:
+                        ex.setdefault("dois", set()).add(ndoi)
+                if record.normalized_title and record.publication_year:
+                    ex.setdefault("title_year", set()).add(
+                        (record.normalized_title, record.publication_year)
+                    )
+
                 inserted += 1
 
             except IntegrityError:
@@ -311,6 +356,92 @@ class ReconciliationEngine:
         return inserted
 
     # ---------------------------------------------------------
+    # CACHÉ IN-MEMORY (evita N+1 queries en matching)
+    # ---------------------------------------------------------
+
+    def _build_cache(self) -> Dict:
+        """
+        Pre-carga en memoria los datos necesarios para la reconciliación.
+        Reemplaza el patrón N+1 en _find_fuzzy_match y _find_author_id_match:
+        en vez de hacer 1 query por canónico, se hacen 2 queries totales.
+
+        Estructura:
+            canonicals   : {pub_id → CanonicalPublication}
+            authors_text : {pub_id → "nombre1; nombre2; ..."}
+            author_ids   : {pub_id → frozenset of (source, id)}
+            by_year      : {year → [pub_id, ...]}
+            by_doi       : {doi_str → pub_id}
+        """
+        t0 = datetime.now()
+
+        # ── Query 1: todos los canónicos ──────────────────────
+        all_canonicals = self.session.query(CanonicalPublication).all()
+
+        # ── Query 2: todas las relaciones pub→autor en bulk ──
+        author_rows = (
+            self.session.query(
+                PublicationAuthor.publication_id,
+                Author.name,
+                Author.orcid,
+                Author.external_ids,
+            )
+            .join(Author, Author.id == PublicationAuthor.author_id)
+            .all()
+        )
+
+        # Agrupar autores por publicación
+        _txt: Dict[int, List[str]] = defaultdict(list)
+        _ids: Dict[int, Set] = defaultdict(set)
+
+        for pub_id, name, orcid, ext_ids in author_rows:
+            if name:
+                _txt[pub_id].append(name)
+            if orcid:
+                _ids[pub_id].add(("orcid", orcid.strip()))
+            for src in ("scopus", "openalex", "wos"):
+                val = (ext_ids or {}).get(src)
+                if val:
+                    _ids[pub_id].add((src, str(val).strip()))
+
+        # Índices auxiliares
+        by_year: Dict[Optional[int], List[int]] = defaultdict(list)
+        by_doi: Dict[str, int] = {}
+        canonicals: Dict[int, CanonicalPublication] = {}
+
+        for c in all_canonicals:
+            canonicals[c.id] = c
+            by_year[c.publication_year].append(c.id)
+            if c.doi:
+                by_doi[c.doi] = c.id
+
+        cache = {
+            "canonicals":   canonicals,
+            "authors_text": {pid: "; ".join(names) for pid, names in _txt.items()},
+            "author_ids":   {pid: frozenset(ids) for pid, ids in _ids.items()},
+            "by_year":      dict(by_year),
+            "by_doi":       by_doi,
+        }
+
+        elapsed = (datetime.now() - t0).total_seconds()
+        logger.info(
+            f"Caché construida en {elapsed:.1f}s: "
+            f"{len(canonicals)} canónicos, {len(author_rows)} relaciones autor-pub"
+        )
+        return cache
+
+    def _cache_add_canonical(self, canonical: CanonicalPublication):
+        """Registra un canónico recién creado en la caché in-memory."""
+        if self._cache is None:
+            return
+        self._cache["canonicals"][canonical.id] = canonical
+        self._cache["by_year"].setdefault(canonical.publication_year, []).append(canonical.id)
+        if canonical.doi:
+            self._cache["by_doi"][canonical.doi] = canonical.id
+        # sin autores aún
+        self._cache["authors_text"].setdefault(canonical.id, "")
+        self._cache["author_ids"].setdefault(canonical.id, frozenset())
+
+    # ---------------------------------------------------------
     # RECONCILIACIÓN
     # ---------------------------------------------------------
 
@@ -325,6 +456,11 @@ class ReconciliationEngine:
             Estadísticas del proceso
         """
         self.stats = ReconciliationStats()
+
+        # ── Construir caché in-memory ANTES del loop ──────────
+        # Esto reemplaza el patrón N+1 (1 query por canónico para cargar
+        # autores) por 2 queries totales, independientemente del volumen.
+        self._cache = self._build_cache()
 
         # Recoger pendientes de todas las tablas de fuente
         all_pending = []
@@ -498,6 +634,29 @@ class ReconciliationEngine:
                     return
 
         # =====================================================
+        # PASO 2.5: Match por solapamiento de IDs externos de autores
+        # Cubre el caso de títulos en idiomas distintos (sin DOI)
+        # donde el fuzzy de título falla pero los autores son los mismos.
+        # =====================================================
+        if not ext.doi:
+            author_match, overlap_count = self._find_author_id_match(ext)
+            if author_match:
+                details = {
+                    "method": "author_id_overlap",
+                    "shared_author_ids": overlap_count,
+                    "note": "Posible mismo paper en idioma distinto",
+                }
+                self._link_to_canonical(
+                    ext, author_match, MatchType.FUZZY_COMBINED, 80.0, details, now
+                )
+                self.stats.fuzzy_combined_matches += 1
+                logger.info(
+                    f"  AUTHOR-ID MATCH: {overlap_count} IDs externos compartidos → "
+                    f"canonical_id={author_match.id}"
+                )
+                return
+
+        # =====================================================
         # PASO 3: Crear nueva publicación canónica
         # =====================================================
         self._create_new_canonical(ext, now)
@@ -512,36 +671,31 @@ class ReconciliationEngine:
         Busca la mejor coincidencia fuzzy entre el registro de fuente
         y las publicaciones canónicas existentes.
 
-        Optimización: solo compara con canónicas del mismo año
-        (o año ± tolerancia si está configurado).
+        Usa la caché in-memory para evitar N+1 queries:
+        los autores de cada canónico ya están cargados en self._cache.
         """
         best_canonical = None
         best_result = None
         best_score = 0.0
 
-        # Filtrar candidatos por año para reducir comparaciones
-        candidates_query = self.session.query(CanonicalPublication)
+        cache = self._cache
+        canonicals = cache["canonicals"] if cache else {}
 
+        # Obtener IDs de candidatos filtrando por año desde la caché
         if ext.publication_year and rc_config.year_must_match:
-            tolerance = rc_config.year_tolerance
-            candidates_query = candidates_query.filter(
-                CanonicalPublication.publication_year.between(
-                    ext.publication_year - tolerance,
-                    ext.publication_year + tolerance,
-                )
-            )
+            tol = rc_config.year_tolerance
+            candidate_ids: List[int] = []
+            for yr in range(ext.publication_year - tol, ext.publication_year + tol + 1):
+                candidate_ids.extend(cache["by_year"].get(yr, []))
+        else:
+            candidate_ids = list(canonicals.keys())
 
-        candidates = candidates_query.all()
+        for pub_id in candidate_ids:
+            canonical = canonicals.get(pub_id)
+            if not canonical:
+                continue
 
-        for canonical in candidates:
-            # Cargar autores de la publicación canónica
-            canon_authors = (
-                self.session.query(Author.name)
-                .join(PublicationAuthor, Author.id == PublicationAuthor.author_id)
-                .filter(PublicationAuthor.publication_id == canonical.id)
-                .all()
-            )
-            authors_b_text = "; ".join(a[0] for a in canon_authors) if canon_authors else ""
+            authors_b_text = cache["authors_text"].get(pub_id, "") if cache else ""
 
             result = compare_records(
                 title_a=ext.title or "",
@@ -558,6 +712,67 @@ class ReconciliationEngine:
                 best_result = result
 
         return best_canonical, best_result
+
+    def _find_author_id_match(
+        self, ext
+    ) -> Tuple[Optional[CanonicalPublication], int]:
+        """
+        Busca un canónico del mismo año que comparta ≥ 2 IDs externos de autores
+        (orcid, scopus_id, openalex_id). Agnóstico al idioma del título.
+
+        Usa la caché in-memory; no hace queries a la BD.
+        Retorna (canonical, shared_count) o (None, 0).
+        """
+        # Recolectar IDs externos del registro entrante
+        incoming_ids: frozenset = frozenset()
+        raw_ids: set = set()
+        raw_data = ext.raw_data or {}
+        for author in raw_data.get("_parsed_authors") or raw_data.get("authors") or []:
+            if not isinstance(author, dict):
+                continue
+            if author.get("orcid"):
+                raw_ids.add(("orcid", author["orcid"].strip()))
+            if author.get("scopus_id"):
+                raw_ids.add(("scopus", str(author["scopus_id"]).strip()))
+            if author.get("openalex_id"):
+                val = str(author["openalex_id"]).strip().rstrip("/").split("/")[-1]
+                raw_ids.add(("openalex", val))
+
+        if not raw_ids:
+            return None, 0
+        incoming_ids = frozenset(raw_ids)
+
+        cache = self._cache
+        if not cache:
+            return None, 0
+
+        canonicals = cache["canonicals"]
+
+        # Candidatos: sin DOI, mismo año (desde caché)
+        if ext.publication_year and rc_config.year_must_match:
+            tol = rc_config.year_tolerance
+            candidate_ids = [
+                pid
+                for yr in range(ext.publication_year - tol, ext.publication_year + tol + 1)
+                for pid in cache["by_year"].get(yr, [])
+                if not canonicals.get(pid, None) or not canonicals[pid].doi
+            ]
+        else:
+            candidate_ids = [
+                pid for pid, c in canonicals.items() if not c.doi
+            ]
+
+        best_canonical = None
+        best_overlap = 0
+
+        for pub_id in candidate_ids:
+            canon_ids = cache["author_ids"].get(pub_id, frozenset())
+            shared = len(incoming_ids & canon_ids)
+            if shared >= 2 and shared > best_overlap:
+                best_overlap = shared
+                best_canonical = canonicals[pub_id]
+
+        return best_canonical, best_overlap
 
     # ---------------------------------------------------------
     # ACCIONES
@@ -579,10 +794,8 @@ class ReconciliationEngine:
         ext.match_score = score
         ext.reconciled_at = timestamp
 
-        # Actualizar conteo de fuentes (cross-source)
-        canonical.sources_count = (
-            count_source_records_for_canonical(self.session, canonical.id) + 1
-        )
+        # Actualizar conteo de fuentes incrementalmente (evita 5 queries a BD)
+        canonical.sources_count = (canonical.sources_count or 0) + 1
 
         # Enriquecer la canónica con datos faltantes de esta fuente
         self._enrich_canonical(canonical, ext)
@@ -745,6 +958,9 @@ class ReconciliationEngine:
             f"  NUEVO: {ext.source_name}:{ext.id} → canon={canonical.id} "
             f"('{canonical.title[:50]}...')"
         )
+
+        # Registrar en caché para que el resto del lote lo encuentre
+        self._cache_add_canonical(canonical)
 
     def _flag_for_review(
         self,
@@ -1169,19 +1385,6 @@ class ReconciliationEngine:
             ),
             "muestra_cambios": changed_sample,
         }
-
-
-def _count_filled(canonical: CanonicalPublication) -> int:
-    """Cuenta cuántos campos enriquecibles tienen valor."""
-    fields = [
-        "doi", "source_journal", "publication_type", "is_open_access",
-        "oa_status", "issn", "citation_count", "publication_year",
-        "publication_date", "language", "abstract", "keywords",
-        "source_url", "page_range", "publisher", "journal_coverage",
-        "first_author", "coauthorships_count", "corresponding_author",
-        "knowledge_area", "cine_code",
-    ]
-    return sum(1 for f in fields if getattr(canonical, f, None) not in (None, "", 0))
 
 
     # ---------------------------------------------------------
@@ -1653,3 +1856,20 @@ def _count_filled(canonical: CanonicalPublication) -> int:
         if updated > 0:
             self.session.commit()
             logger.info(f"Backfill de IDs de autores: {updated} autores actualizados")
+
+
+# =============================================================
+# HELPER DE MÓDULO (fuera de la clase)
+# =============================================================
+
+def _count_filled(canonical: CanonicalPublication) -> int:
+    """Cuenta cuántos campos enriquecibles tienen valor en una publicación canónica."""
+    fields = [
+        "doi", "source_journal", "publication_type", "is_open_access",
+        "oa_status", "issn", "citation_count", "publication_year",
+        "publication_date", "language", "abstract", "keywords",
+        "source_url", "page_range", "publisher", "journal_coverage",
+        "first_author", "coauthorships_count", "corresponding_author",
+        "knowledge_area", "cine_code",
+    ]
+    return sum(1 for f in fields if getattr(canonical, f, None) not in (None, "", 0))

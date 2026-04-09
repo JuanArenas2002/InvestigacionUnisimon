@@ -1,14 +1,14 @@
 from typing import List, Optional
 
-from extractors.cvlac.extractor import CvlacExtractor
+from extractors.wos.extractor import WosExtractor
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
 from project.ports.source_port import SourcePort
 
 
-class CvlacAdapter(SourcePort):
-    SOURCE_NAME = "cvlac"
+class WosAdapter(SourcePort):
+    SOURCE_NAME = "wos"
 
     @property
     def source_name(self) -> str:
@@ -21,16 +21,12 @@ class CvlacAdapter(SourcePort):
         max_results: Optional[int] = None,
         **kwargs,
     ) -> List[Publication]:
-        cvlac_codes = kwargs.get("cvlac_codes") or []
-        if not cvlac_codes:
-            return []
-
-        extractor = CvlacExtractor()
+        extractor = WosExtractor()
         records = extractor.extract(
             year_from=year_from,
             year_to=year_to,
             max_results=max_results,
-            cvlac_codes=cvlac_codes,
+            org_enhanced=kwargs.get("org_enhanced"),
         )
         return [self._to_publication(record) for record in records]
 
@@ -42,8 +38,8 @@ class CvlacAdapter(SourcePort):
                 orcid=author.get("orcid"),
                 is_institutional=bool(author.get("is_institutional", False)),
                 external_ids={
-                    "cvlac": str(author.get("cvlac_id"))
-                } if author.get("cvlac_id") else {},
+                    "wos": str(author.get("wos_id"))
+                } if author.get("wos_id") else {},
                 metadata={k: v for k, v in author.items() if v is not None},
             )
             for author in (record.authors or [])
@@ -57,10 +53,8 @@ class CvlacAdapter(SourcePort):
             publication_year=record.publication_year,
             publication_type=record.publication_type,
             source_journal=record.source_journal,
-            issn=record.issn,
             authors=authors,
             citation_count=record.citation_count,
-            url=record.url,
             raw_data=record.raw_data or {},
             extracted_at=record.extracted_at,
         )

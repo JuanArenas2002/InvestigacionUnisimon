@@ -617,60 +617,94 @@ def merge_authors(body: MergeAuthorsRequest, db: Session = Depends(get_db)):
     pubs_reassigned = 0
     ids_inherited = {}
 
+    # Capturar keep_id como valor Python puro antes del loop
+    # (evita que SQLAlchemy expire el objeto y evalúe keep.id como None)
+    keep_id: int = keep.id
+
     for donor in to_merge:
-        # ── 1. Detectar publicaciones que ya tiene el autor principal (para evitar duplicados) ──
+        donor_id: int = donor.id
+
+        # ── 1. Detectar publicaciones que ya tiene el autor principal ──
         keep_pub_ids = {
             r[0] for r in
             db.query(PublicationAuthor.publication_id)
-            .filter(PublicationAuthor.author_id == keep.id)
+            .filter(PublicationAuthor.author_id == keep_id)
             .all()
         }
 
-        # Publicaciones del donor que NO tiene el principal → reasignar en bulk
-        donor_links_to_reassign = (
-            db.query(PublicationAuthor)
-            .filter(
-                PublicationAuthor.author_id == donor.id,
-                ~PublicationAuthor.publication_id.in_(keep_pub_ids),
+        # Contar cuántas se van a reasignar
+        if keep_pub_ids:
+            n_to_reassign = (
+                db.query(func.count(PublicationAuthor.id))
+                .filter(
+                    PublicationAuthor.author_id == donor_id,
+                    ~PublicationAuthor.publication_id.in_(keep_pub_ids),
+                )
+                .scalar() or 0
             )
-            .all()
-        )
-        if donor_links_to_reassign:
-            ids_to_reassign = [lnk.id for lnk in donor_links_to_reassign]
+        else:
+            n_to_reassign = (
+                db.query(func.count(PublicationAuthor.id))
+                .filter(PublicationAuthor.author_id == donor_id)
+                .scalar() or 0
+            )
+
+        # Reasignar en bulk usando Core con synchronize_session=False encadenado
+        # al statement (no como kwarg de db.execute, que no funciona en SA 2.x).
+        if keep_pub_ids:
             db.execute(
                 update(PublicationAuthor)
-                .where(PublicationAuthor.id.in_(ids_to_reassign))
-                .values(author_id=keep.id)
+                .where(
+                    PublicationAuthor.author_id == donor_id,
+                    ~PublicationAuthor.publication_id.in_(keep_pub_ids),
+                )
+                .values(author_id=keep_id)
+                .execution_options(synchronize_session=False)
             )
-            pubs_reassigned += len(ids_to_reassign)
-
-        # Eliminar duplicados del donor que ya tenía el principal
-        db.execute(
-            delete(PublicationAuthor)
-            .where(
-                PublicationAuthor.author_id == donor.id,
-                PublicationAuthor.publication_id.in_(keep_pub_ids),
+            db.execute(
+                delete(PublicationAuthor)
+                .where(
+                    PublicationAuthor.author_id == donor_id,
+                    PublicationAuthor.publication_id.in_(keep_pub_ids),
+                )
+                .execution_options(synchronize_session=False)
             )
-        )
+        else:
+            db.execute(
+                update(PublicationAuthor)
+                .where(PublicationAuthor.author_id == donor_id)
+                .values(author_id=keep_id)
+                .execution_options(synchronize_session=False)
+            )
 
-        # ── 2. Reasignar instituciones en bulk ──
+        pubs_reassigned += n_to_reassign
+
+        # Limpiar identity map para que el ORM no intente re-aplicar los
+        # cambios de las filas que ya movimos con Core.
+        db.expire_all()
+
+        # ── 2. Reasignar instituciones ──
         from db.models import AuthorInstitution
         keep_inst_ids = {
             r[0] for r in
             db.query(AuthorInstitution.institution_id)
-            .filter(AuthorInstitution.author_id == keep.id)
+            .filter(AuthorInstitution.author_id == keep_id)
             .all()
         }
         donor_inst_rows = (
             db.query(AuthorInstitution)
-            .filter(AuthorInstitution.author_id == donor.id)
+            .filter(AuthorInstitution.author_id == donor_id)
             .all()
         )
         for inst_link in donor_inst_rows:
             if inst_link.institution_id in keep_inst_ids:
                 db.delete(inst_link)
             else:
-                inst_link.author_id = keep.id
+                inst_link.author_id = keep_id
+
+        # Recargar keep y donor después del expire_all
+        keep   = db.get(Author, keep_id)
+        donor  = db.get(Author, donor_id)
 
         # ── 3. Heredar IDs externos ──
         for attr in ("orcid", "openalex_id", "scopus_id", "wos_id", "cvlac_id"):

@@ -182,9 +182,16 @@ class FullSyncService:
                     stats.enriched += enriched_count
                     stats.reconciled += 1
                 else:
+                    title = getattr(record, "title", None)
+                    if not title:
+                        logger.warning(
+                            f"Registro sin título omitido al crear canónico "
+                            f"(source={source_name}, doi={doi})"
+                        )
+                        continue
                     canon = CanonicalPublication(
                         doi=doi,
-                        title=getattr(record, "title", None),
+                        title=title,
                         field_provenance={"title": source_name},
                     )
                     db.add(canon)

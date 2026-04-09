@@ -63,6 +63,114 @@ class ResolveReviewRequest(BaseModel):
     )
 
 
+class StatusSummaryItem(BaseModel):
+    status: str
+    total: int
+    by_source: dict  # {source_name: count}
+
+
+class ResetRejectedRequest(BaseModel):
+    match_type: Optional[str] = Field(
+        None,
+        description=(
+            "Filtrar por tipo de rechazo. "
+            "Ej: 'invalid_title_blacklisted', 'invalid_title_too_short'. "
+            "Si se omite, resetea TODOS los registros rechazados."
+        ),
+    )
+    source: Optional[str] = Field(
+        None, description="Limitar a una fuente específica (openalex, scopus, …)"
+    )
+    dry_run: bool = Field(
+        False, description="Si True, solo cuenta sin modificar nada."
+    )
+
+
+class ResetRejectedResponse(BaseModel):
+    dry_run: bool
+    match_type_filter: Optional[str]
+    source_filter: Optional[str]
+    reset: dict   # {source_name: count}
+    total_reset: int
+
+
+# ── Action Queue ─────────────────────────────────────────────
+
+class ActionItem(BaseModel):
+    """Un registro que requiere acción humana."""
+    id: int
+    source_name: str
+    title: Optional[str] = None
+    doi: Optional[str] = None
+    publication_year: Optional[int] = None
+    match_score: Optional[float] = None
+    match_type: Optional[str] = None
+    # Para manual_review: canónico candidato sugerido por el motor
+    suggested_canonical_id: Optional[int] = None
+    suggested_canonical_title: Optional[str] = None
+    suggested_canonical_doi: Optional[str] = None
+    # Instrucción clara de qué hacer
+    recommended_action: str
+    resolve_hint: str
+
+
+class ActionGroup(BaseModel):
+    status: str
+    count: int
+    description: str
+    bulk_action_available: bool
+    items: List[ActionItem]
+
+
+class ActionQueueResponse(BaseModel):
+    total_pending_action: int
+    groups: List[ActionGroup]
+
+
+# ── Bulk Resolve ─────────────────────────────────────────────
+
+class BulkResolveRequest(BaseModel):
+    action: str = Field(
+        ...,
+        pattern="^(link_suggested|reject_all|reset_pending)$",
+        description=(
+            "link_suggested: vincula cada registro a su canónico sugerido "
+            "(solo los que tengan candidato y score >= min_score). "
+            "reject_all: rechaza todos los de manual_review. "
+            "reset_pending: devuelve a pending para re-reconciliar."
+        ),
+    )
+    source: Optional[str] = Field(None, description="Limitar a una fuente")
+    min_score: float = Field(
+        0.90,
+        ge=0.0, le=1.0,
+        description="Score mínimo para link_suggested (default 0.90 = 90%)",
+    )
+    dry_run: bool = Field(False, description="Si True, solo cuenta sin modificar")
+
+
+class BulkResolveResponse(BaseModel):
+    dry_run: bool
+    action: str
+    source_filter: Optional[str]
+    min_score: Optional[float]
+    linked: int = 0
+    rejected: int = 0
+    reset: int = 0
+    skipped: int = 0
+    total_affected: int
+
+
+class PromoteToCanonicalResponse(BaseModel):
+    """Resultado de promover un registro de fuente a canónico nuevo."""
+    source_name: str
+    source_record_id: int
+    canonical_id: int
+    title: str
+    doi: Optional[str] = None
+    message: str
+
+
 # ── Reconciliación ───────────────────────────────────────────
 
 class ReconciliationStatsResponse(BaseModel):

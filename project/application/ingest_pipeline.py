@@ -16,6 +16,7 @@ class PipelineResult:
     normalized: int
     matched: int
     enriched: int
+    authors_saved: int
     source_saved: int
     canonical_upserted: int
     by_source: Dict[str, int] = field(default_factory=dict)
@@ -62,9 +63,13 @@ class IngestPipeline:
         matched = self.match(normalized)
         enriched = self.enrich(matched)
 
+        authors_saved = 0
         source_saved = 0
         canonical_upserted = 0
         if persist:
+            # Guardar autores primero, desde el conjunto completo recolectado
+            # (antes de dedup), para no perder autores de registros descartados.
+            authors_saved = self.repository.save_authors(collected)
             source_saved = self.repository.save_source_records(collected_by_source)
             canonical_upserted = self.repository.upsert_canonical_publications(enriched)
 
@@ -74,6 +79,7 @@ class IngestPipeline:
             normalized=len(normalized),
             matched=len(matched),
             enriched=len(enriched),
+            authors_saved=authors_saved,
             source_saved=source_saved,
             canonical_upserted=canonical_upserted,
             by_source={name: len(rows) for name, rows in collected_by_source.items()},

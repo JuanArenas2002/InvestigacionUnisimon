@@ -168,9 +168,13 @@ class CriteriaConfig:
     year_tolerance: int = 2                      # +/- años permitidos
 
     # --- Palabras prohibidas (contenido no científico) ---
+    # IMPORTANTE: deben ser frases completas o palabras muy específicas que
+    # jamás aparezcan en un título académico legítimo.
+    # "error" es demasiado genérico → falsos positivos en "Medical Errors", etc.
     blacklist_keywords: list = field(default_factory=lambda: [
-        "404", "error", "not found", "confidencial",
-        "borrador", "draft", "untitled", "sin titulo"
+        "404 not found", "page not found", "access denied",
+        "confidencial", "borrador", "draft", "untitled", "sin titulo",
+        "error 404", "http error",
     ])
 
     # --- Fuentes válidas ---

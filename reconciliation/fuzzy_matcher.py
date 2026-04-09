@@ -111,24 +111,52 @@ def normalize_author_name(name: str) -> str:
     return name
 
 
+def _author_token_set(authors_text: str) -> frozenset:
+    """
+    Extrae el conjunto de todos los tokens de una cadena de autores.
+    Normaliza y descarta puntuación, manteniendo todas las palabras.
+
+    Esto permite comparar "García, Juan" con "Juan García" correctamente
+    porque ambas producen el mismo conjunto: {"garcia", "juan"}.
+
+    Ejemplos:
+        "García López, Juan"  → frozenset({"garcia", "lopez", "juan"})
+        "Juan García López"   → frozenset({"garcia", "lopez", "juan"})
+        "Smith J.; López M."  → frozenset({"smith", "j", "lopez", "m"})
+    """
+    if not authors_text:
+        return frozenset()
+    normalized = normalize_author_name(authors_text)
+    # Eliminar comas y punto y coma residuales tras normalizar
+    normalized = re.sub(r'[,;]', ' ', normalized)
+    return frozenset(t for t in normalized.split() if t)
+
+
 def extract_author_surnames(authors_text: str) -> List[str]:
     """
     Extrae apellidos de una cadena de autores.
-    Útil para comparación rápida.
+
+    NOTA: para comparación robusta prefiere _author_token_set,
+    que no asume qué posición ocupa el apellido.
     """
     if not authors_text:
         return []
 
     normalized = normalize_author_name(authors_text)
-    # Dividir por separadores comunes
-    parts = re.split(r'\s*[;,]\s*', normalized)
+    # Dividir solo por punto y coma (cada autor es una entrada)
+    parts = re.split(r'\s*;\s*', normalized)
 
     surnames = []
     for part in parts:
-        words = part.strip().split()
-        if words:
-            # Tomar la primera palabra como apellido (heurística)
-            surnames.append(words[0])
+        # Si hay coma, el apellido está antes (formato "Apellido, Nombre")
+        if ',' in part:
+            surname_part = part.split(',')[0].strip()
+        else:
+            # Sin coma: tomar la última palabra como apellido (heurística)
+            words = part.strip().split()
+            surname_part = words[-1] if words else ""
+        if surname_part:
+            surnames.append(surname_part)
 
     return surnames
 
@@ -216,46 +244,68 @@ def compare_years(
 def compare_authors(
     authors_a: str,
     authors_b: str,
+    orcids_a: Optional[frozenset] = None,
+    orcids_b: Optional[frozenset] = None,
 ) -> float:
     """
-    Compara cadenas de autores.
+    Compara autores bibliográficos con cascada de prioridad:
 
-    Estrategia en cascada:
-    1. Si uno o ambos están vacíos → 50 (neutro)
-    2. Comparación de apellidos: ¿cuántos coinciden?
-    3. Fuzzy de la cadena completa
+    1. ORCID (cuando disponible) — identificador único, máxima confianza.
+    2. Token-set Jaccard — maneja nombres invertidos:
+       "García, Juan" ≡ "Juan García" porque ambos producen el mismo token set.
+    3. Fuzzy completo (token_sort_ratio) — fallback para variaciones tipográficas.
+
+    Args:
+        authors_a / authors_b : cadenas de autores (separadas por ";")
+        orcids_a / orcids_b   : conjuntos de ORCID ya extraídos (opcional).
+                                 Si se pasan, se evalúan ANTES del fuzzy.
 
     Returns:
-        Score de 0 a 100
+        Score de 0 a 100.
     """
+    # ── 0. Datos vacíos → neutro ──────────────────────────────────────────
     if not authors_a or not authors_b:
-        return 50.0  # Sin datos → no penalizar ni premiar
+        return 50.0
 
     norm_a = normalize_author_name(authors_a)
     norm_b = normalize_author_name(authors_b)
-
     if not norm_a or not norm_b:
         return 50.0
 
-    # 1. Comparación por apellidos
-    surnames_a = set(extract_author_surnames(authors_a))
-    surnames_b = set(extract_author_surnames(authors_b))
+    # ── 1. ORCID primero ──────────────────────────────────────────────────
+    if orcids_a and orcids_b:
+        common = orcids_a & orcids_b
+        total = max(len(orcids_a), len(orcids_b))
+        orcid_score = (len(common) / total) * 100 if total > 0 else 0.0
+        if orcid_score > 0:
+            # Al menos un ORCID coincide → retornar score alto directamente.
+            # Mezclamos con token fuzzy para no penalizar si faltan ORCIDs
+            # en algunos autores del mismo paper.
+            token_score = _token_jaccard(authors_a, authors_b)
+            return orcid_score * 0.70 + token_score * 0.30
 
-    if surnames_a and surnames_b:
-        common = surnames_a & surnames_b
-        total = max(len(surnames_a), len(surnames_b))
-        surname_score = (len(common) / total) * 100 if total > 0 else 0
+    # ── 2. Token-set Jaccard (maneja nombres invertidos) ──────────────────
+    token_score = _token_jaccard(authors_a, authors_b)
+
+    # ── 3. Fuzzy completo con token_sort (maneja reorden de palabras) ─────
+    fuzzy_score = float(fuzz.token_sort_ratio(norm_a, norm_b))
+
+    # Combinar: Jaccard domina si hay buena coincidencia, fuzzy actúa de red
+    if token_score >= 60:
+        return token_score * 0.65 + fuzzy_score * 0.35
     else:
-        surname_score = 0
+        return token_score * 0.35 + fuzzy_score * 0.65
 
-    # 2. Fuzzy de cadena completa
-    fuzzy_score = fuzz.token_set_ratio(norm_a, norm_b)
 
-    # Combinar: dar más peso a apellidos si hay buena coincidencia
-    if surname_score >= 60:
-        return surname_score * 0.6 + fuzzy_score * 0.4
-    else:
-        return surname_score * 0.3 + fuzzy_score * 0.7
+def _token_jaccard(authors_a: str, authors_b: str) -> float:
+    """Similitud Jaccard sobre el conjunto de tokens de ambas cadenas."""
+    tokens_a = _author_token_set(authors_a)
+    tokens_b = _author_token_set(authors_b)
+    if not tokens_a or not tokens_b:
+        return 0.0
+    intersection = len(tokens_a & tokens_b)
+    union = len(tokens_a | tokens_b)
+    return (intersection / union * 100) if union > 0 else 0.0
 
 
 # =============================================================

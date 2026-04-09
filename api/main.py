@@ -356,6 +356,8 @@ from api.routers import (
     stats, search, pipeline, catalogs, scopus, admin, charts,
 )
 from api.routers.sources import router as sources_router
+from project.app.routes.ingest import router as hex_ingest_router
+from project.app.routes.publications import router as hex_publications_router
 
 # ── FASE 1: fuentes independientes ───────────────────────────
 app.include_router(sources_router, prefix="/api")
@@ -377,6 +379,10 @@ app.include_router(search.router,           prefix="/api")
 app.include_router(external_records.router, prefix="/api")
 app.include_router(catalogs.router,         prefix="/api")
 app.include_router(admin.router,            prefix="/api")
+
+# ── Nueva arquitectura hexagonal (compatibilidad en app principal) ──
+app.include_router(hex_ingest_router,       prefix="/api/hex")
+app.include_router(hex_publications_router, prefix="/api/hex")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -406,5 +412,7 @@ def root():
             },
             "fase_2_reconciliacion": "/api/pipeline/reconcile-all",
             "publicaciones_canonicas": "/api/publications",
+            "hex_ingest": "/api/hex/ingest",
+            "hex_publications": "/api/hex/publications",
         },
     }

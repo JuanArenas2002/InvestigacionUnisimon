@@ -32,6 +32,10 @@ class OpenAlexAdapter(SourcePort):
                 name=str(author.get("name") or "").strip(),
                 orcid=author.get("orcid"),
                 is_institutional=bool(author.get("is_institutional", False)),
+                external_ids={
+                    "openalex": str(author.get("openalex_id"))
+                } if author.get("openalex_id") else {},
+                metadata={k: v for k, v in author.items() if v is not None},
             )
             for author in (record.authors or [])
             if author.get("name")

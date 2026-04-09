@@ -86,6 +86,14 @@ def list_publications(
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
     institutional_only: Optional[bool] = Query(None, description="Si es True, solo publicaciones institucionales (institutional_authors_count > 0). Si es False, solo no institucionales. Si es None, todas."),
+    needs_review: Optional[bool] = Query(
+        None,
+        description=(
+            "True → solo canónicos sin registros de fuente vinculados "
+            "(source records en manual_review o sin vincular). "
+            "False → solo los que sí tienen al menos un source record vinculado."
+        ),
+    ),
 ):
     """Lista paginada de publicaciones canónicas con filtros y estado (id y nombre)."""
     q = db.query(CanonicalPublication)
@@ -124,6 +132,28 @@ def list_publications(
             q = q.filter(CanonicalPublication.institutional_authors_count > 1)
         else:
             q = q.filter(CanonicalPublication.institutional_authors_count <= 1)
+
+    # Filtro needs_review: canónicos sin source records vinculados.
+    # Ocurre cuando Phase 1 crea el canónico por DOI pero el reconciliador
+    # dejó el source record en manual_review (canonical_publication_id = NULL).
+    if needs_review is not None:
+        # Subquery: IDs de canónicos que SÍ tienen al menos un source record vinculado
+        linked_ids_subqueries = [
+            db.query(model_cls.canonical_publication_id)
+            .filter(model_cls.canonical_publication_id.isnot(None))
+            .subquery()
+            for model_cls in SOURCE_MODELS.values()
+        ]
+        # UNION de todos los canonical_publication_id vinculados
+        from sqlalchemy import union
+        linked_union = union(*[sq.select() for sq in linked_ids_subqueries]).subquery()
+        has_source = CanonicalPublication.id.in_(
+            db.query(linked_union.c[0])
+        )
+        if needs_review:
+            q = q.filter(~has_source)   # sin source records → necesita revisión
+        else:
+            q = q.filter(has_source)    # tiene source records → OK
 
     total = q.count()
     items = (
@@ -705,13 +735,21 @@ def merge_publications(body: MergePublicationsRequest, db: Session = Depends(get
             record.canonical_publication_id = keeper.id
             db.add(record)
 
-    # --- Unir field_provenance ---
-    if removable.field_provenance:
-        if keeper.field_provenance is None:
-            keeper.field_provenance = {}
-        for field, source in removable.field_provenance.items():
-            if field not in keeper.field_provenance:
-                keeper.field_provenance[field] = source
+    # --- Enriquecer campos nulos del keeper con datos del removable ---
+    _MERGE_FIELDS = [
+        "title", "normalized_title", "publication_year", "publication_date",
+        "publication_type", "language", "source_journal", "issn", "abstract",
+        "keywords", "source_url", "page_range", "publisher", "journal_coverage",
+        "knowledge_area", "cine_code", "first_author", "corresponding_author",
+        "is_open_access", "oa_status", "citation_count", "doi", "pmid", "pmcid",
+    ]
+    prov = dict(keeper.field_provenance or {})
+    rem_prov = dict(removable.field_provenance or {})
+    for f in _MERGE_FIELDS:
+        if not getattr(keeper, f, None) and getattr(removable, f, None):
+            setattr(keeper, f, getattr(removable, f))
+            prov[f] = rem_prov.get(f, "merged")
+    keeper.field_provenance = prov
 
     # --- Actualizar sources_count ---
     keeper.sources_count = (keeper.sources_count or 1) + (removable.sources_count or 1)
