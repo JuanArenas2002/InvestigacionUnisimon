@@ -29,6 +29,10 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse, parse_qs
 
+from db.models import Author
+from db.session import get_session
+from shared.normalizers import normalize_author_name
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -251,7 +255,7 @@ def seed(excel_path: Path, dry_run: bool = False) -> dict:
                 normalized = _normalize_name(row["name"])
                 ext_ids = _build_external_ids({}, row)
                 author = Author(
-                    name=row["name"],
+                    name=normalize_author_name(row["name"]),
                     normalized_name=normalized,
                     cedula=row["cedula"],
                     orcid=row["orcid"],

@@ -61,7 +61,8 @@ from db.models import (
 )
 from db.source_registry import SOURCE_REGISTRY
 from db.session import get_session
-from extractors.base import StandardRecord, normalize_text, normalize_doi, normalize_author_name
+from extractors.base import StandardRecord, normalize_text, normalize_doi
+from shared.normalizers import normalize_publication_type, normalize_author_name
 from reconciliation.fuzzy_matcher import compare_records, FuzzyMatchResult
 
 logger = logging.getLogger(__name__)
@@ -179,7 +180,7 @@ class ReconciliationEngine:
             normalized_title=record.normalized_title,
             publication_year=record.publication_year,
             publication_date=record.publication_date,
-            publication_type=record.publication_type,
+            publication_type=normalize_publication_type(record.publication_type),
             source_journal=record.source_journal,
             issn=record.issn,
             language=record.language,
@@ -902,7 +903,7 @@ class ReconciliationEngine:
             normalized_title=ext.normalized_title,
             publication_year=ext.publication_year,
             publication_date=ext.publication_date,
-            publication_type=ext.publication_type,
+            publication_type=normalize_publication_type(ext.publication_type),
             source_journal=ext.source_journal,
             issn=ext.issn,
             language=ext.language,
@@ -1060,7 +1061,7 @@ class ReconciliationEngine:
 
         # Tipo de publicación
         if not canonical.publication_type and ext.publication_type:
-            canonical.publication_type = ext.publication_type
+            canonical.publication_type = normalize_publication_type(ext.publication_type)
             enriched_fields.append("publication_type")
             prov["publication_type"] = src
 
@@ -1622,7 +1623,7 @@ class ReconciliationEngine:
                     author_prov["cvlac"] = src
 
                 author = Author(
-                    name=name,
+                    name=normalize_author_name(name) if name else name,
                     normalized_name=normalize_text(name),
                     orcid=orcid if orcid else None,
                     is_institutional=is_inst,

@@ -92,3 +92,37 @@ def normalize_title_for_search(title: str) -> str:
     """
     nfkd = unicodedata.normalize("NFKD", title.lower())
     return "".join(c for c in nfkd if not unicodedata.combining(c))
+
+
+def normalize_publication_type(pub_type: Optional[str]) -> Optional[str]:
+    """
+    Normaliza el tipo de publicación a mayúsculas.
+    
+    Esto evita duplicados como: article/ARTICLE, review/REVIEW, etc.
+    
+    Ejemplo:
+        "article" → "ARTICLE"
+        "REVIEW" → "REVIEW"
+        "book-chapter" → "BOOK-CHAPTER"
+        None → None
+    """
+    if not pub_type:
+        return None
+    return pub_type.strip().upper()
+
+
+def normalize_author_name(name: Optional[str]) -> Optional[str]:
+    """
+    Normaliza el nombre de autor a mayúsculas.
+    
+    Esto evita duplicados de autores como: "juan Pérez" vs "JUAN PÉREZ".
+    
+    Ejemplo:
+        "juan pérez" → "JUAN PÉREZ"
+        "MARIA GARCIA" → "MARIA GARCIA"
+        "José Luis" → "JOSÉ LUIS"
+        None → None
+    """
+    if not name:
+        return None
+    return name.strip().upper()

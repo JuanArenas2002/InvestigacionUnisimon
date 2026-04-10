@@ -234,6 +234,16 @@ openapi_tags = [
         "description": "Consultas en tiempo real contra las APIs externas sin almacenar resultados (útil para verificación puntual).",
     },
 
+    # ── Portal del Investigador ───────────────────────────────
+    {
+        "name": "Portal del Investigador",
+        "description": (
+            "Endpoints de solo lectura para investigadores autenticados. "
+            "Requieren `Authorization: Bearer <token>` (JWT obtenido en `/api/auth/login`). "
+            "Cada endpoint opera exclusivamente sobre los datos del investigador autenticado."
+        ),
+    },
+
     # ── Soporte ───────────────────────────────────────────────
     {
         "name": "Registros Externos",
@@ -354,6 +364,7 @@ app.add_middleware(
 from api.routers import (
     publications, authors, external_records,
     stats, search, pipeline, catalogs, scopus, admin, charts, auth,
+    researcher_portal,
 )
 from api.routers.sources import router as sources_router
 from project.app.routes.ingest import router as hex_ingest_router
@@ -364,6 +375,9 @@ app.include_router(sources_router, prefix="/api")
 
 # ── Autenticación ────────────────────────────────────────────
 app.include_router(auth.router, prefix="/api")
+
+# ── Portal del Investigador (solo lectura, JWT requerido) ─────
+app.include_router(researcher_portal.router, prefix="/api")
 
 # ── FASE 2: reconciliación y pipeline ────────────────────────
 app.include_router(pipeline.router,         prefix="/api")

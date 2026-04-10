@@ -8,7 +8,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, Header, status
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
 
@@ -17,7 +17,6 @@ from api.dependencies import get_db
 from api.schemas.auth import (
     LoginRequest,
     TokenResponse,
-    ChangePasswordRequest,
     ErrorResponse,
     CreateCredentialRequest,
     ResearcherCredentialResponse,
@@ -85,7 +84,7 @@ def verify_token(token: str) -> str:
         )
 
 
-def get_token_from_header(authorization: Optional[str] = None) -> str:
+def get_token_from_header(authorization: Optional[str] = Header(None)) -> str:
     """
     Extrae el token JWT del header Authorization.
     
@@ -224,61 +223,6 @@ def login(request: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse
         researcher_name=author.name,
         cedula=author.cedula,
     )
-
-
-@router.post(
-    "/change-password",
-    summary="Cambiar contraseña",
-    description="Permite que un investigador autenticado cambie su contraseña.",
-    responses={
-        401: {"model": ErrorResponse, "description": "No autorizado"},
-        400: {"model": ErrorResponse, "description": "Contraseña actual incorrecta"},
-    }
-)
-def change_password(
-    request: ChangePasswordRequest,
-    token: str = Depends(get_token_from_header),
-    db: Session = Depends(get_db),
-):
-    """
-    Cambia la contraseña del investigador autenticado.
-    
-    **Requiere:** Token JWT válido en header Authorization
-    """
-    # Verificar token
-    cedula = verify_token(token)
-    
-    # Buscar investigador
-    author = db.query(Author).filter(Author.cedula == cedula).first()
-    if not author:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autorizado")
-    
-    # Buscar credencial activa
-    credential = (
-        db.query(ResearcherCredential)
-        .filter(
-            ResearcherCredential.author_id == author.id,
-            ResearcherCredential.is_active == True,
-        )
-        .first()
-    )
-    if not credential:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="No autorizado")
-    
-    # Verificar contraseña anterior
-    if not credential.verify_password(request.old_password):
-        logger.warning(f"Intento de cambio de contraseña con clave anterior incorrecta: {cedula}")
-        raise HTTPException(
-            status_code=status.HTTP_400_BAD_REQUEST,
-            detail="Contraseña actual incorrecta",
-        )
-    
-    # Actualizar contraseña
-    credential.password_hash = ResearcherCredential.hash_password(request.new_password)
-    db.commit()
-    logger.info(f"Contraseña actualizada para investigador: {cedula}")
-    
-    return {"message": "Contraseña actualizada exitosamente"}
 
 
 @router.post(

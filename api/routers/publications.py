@@ -39,6 +39,7 @@ from db.models import (
     find_record_by_doi_across_sources,
 )
 from extractors.base import normalize_text, normalize_doi
+from shared.normalizers import normalize_publication_type
 from api.routers.publications_duplicates import find_possible_duplicates
 
 logger = logging.getLogger(__name__)
@@ -112,7 +113,8 @@ def list_publications(
     if year_to:
         q = q.filter(CanonicalPublication.publication_year <= year_to)
     if publication_type:
-        q = q.filter(CanonicalPublication.publication_type == publication_type)
+        normalized_type = normalize_publication_type(publication_type)
+        q = q.filter(CanonicalPublication.publication_type == normalized_type)
     if is_open_access is not None:
         q = q.filter(CanonicalPublication.is_open_access == is_open_access)
     if source:

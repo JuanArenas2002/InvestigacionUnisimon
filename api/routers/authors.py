@@ -29,7 +29,7 @@ from api.dependencies import get_db
 from api.utils import get_clean_source_id
 from api.schemas.common import PaginatedResponse
 from api.services.unified_extractor_service import UnifiedExtractorService, UnifiedAuthorProfile
-from shared.normalizers import normalize_author_name
+from shared.normalizers import normalize_author_name, normalize_publication_type
 from api.routers.pipeline.endpoints.reconciliation import reconcile_all_sources
 from api.schemas.authors import (
     AuthorRead,
@@ -873,7 +873,8 @@ def get_author_inventory(
     if year:
         q = q.filter(CanonicalPublication.publication_year == year)
     if publication_type:
-        q = q.filter(CanonicalPublication.publication_type == publication_type)
+        normalized_type = normalize_publication_type(publication_type)
+        q = q.filter(CanonicalPublication.publication_type == normalized_type)
     if institutional_only:
         q = q.filter(CanonicalPublication.institutional_authors_count > 0)
 
@@ -1149,7 +1150,8 @@ def get_author_publications(
     if year:
         q = q.filter(CanonicalPublication.publication_year == year)
     if publication_type:
-        q = q.filter(CanonicalPublication.publication_type == publication_type)
+        normalized_type = normalize_publication_type(publication_type)
+        q = q.filter(CanonicalPublication.publication_type == normalized_type)
 
     pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).all()
     pub_ids = [p.id for p in pubs]

@@ -468,7 +468,7 @@ class PostgresRepository(RepositoryPort):
         # Prefiere el nombre mas largo (mas informacion)
         if len(clean_name) > len(author.name or ""):
             field_changes["name"] = {"before": author.name, "after": clean_name}
-            author.name = clean_name
+            author.name = normalize_author_name(clean_name)
 
         # Migrar al formato canonico si el registro era del formato antiguo
         if author.normalized_name != canonical:

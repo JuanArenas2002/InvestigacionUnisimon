@@ -10,6 +10,7 @@ from datetime import datetime
 import logging
 
 from ..entities.publication import Publication, Journal, CoveragePeriod
+from shared.normalizers import normalize_publication_type
 
 
 logger = logging.getLogger("pipeline.domain")
@@ -114,7 +115,7 @@ class CoverageService:
             publication.title = openalex_data["title"]
         
         if not publication.publication_type and openalex_data.get("publication_type"):
-            publication.publication_type = openalex_data["publication_type"]
+            publication.publication_type = normalize_publication_type(openalex_data["publication_type"])
         
         if not publication.citation_count and openalex_data.get("citation_count"):
             publication.citation_count = openalex_data["citation_count"]
