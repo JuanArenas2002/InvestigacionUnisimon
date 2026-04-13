@@ -1,4 +1,5 @@
-from typing import List, Optional
+import logging
+from typing import List, Optional, Dict, Any
 
 from extractors.google_scholar.extractor import GoogleScholarExtractor
 
@@ -6,8 +7,12 @@ from project.domain.models.author import Author
 from project.domain.models.publication import Publication
 from project.ports.source_port import SourcePort
 
+logger = logging.getLogger(__name__)
+
 
 class GoogleScholarAdapter(SourcePort):
+    """Adapter para Google Scholar (web scraping través de scholarly)."""
+    
     SOURCE_NAME = "google_scholar"
 
     @property
@@ -21,45 +26,131 @@ class GoogleScholarAdapter(SourcePort):
         max_results: Optional[int] = None,
         **kwargs,
     ) -> List[Publication]:
+        """
+        Extrae publicaciones de Google Scholar.
+        
+        Args:
+            year_from: Año inicial del filtro
+            year_to: Año final del filtro
+            max_results: Límite de registros
+            **kwargs: Debe contener 'scholar_ids' (lista de Scholar IDs)
+        
+        Returns:
+            Lista de Publication objects normalizados
+        """
         scholar_ids = kwargs.get("scholar_ids") or []
         if not scholar_ids:
+            logger.warning("[GoogleScholarAdapter] No scholar_ids provided")
+            print(f"[DEBUG ADAPTER] No scholar_ids provided")
             return []
 
-        extractor = GoogleScholarExtractor()
-        records = extractor.extract(
-            year_from=year_from,
-            year_to=year_to,
-            max_results=max_results,
-            scholar_ids=scholar_ids,
-        )
-        return [self._to_publication(record) for record in records]
+        try:
+            print(f"[DEBUG ADAPTER] Iniciando GoogleScholarExtractor para: {scholar_ids}")
+            extractor = GoogleScholarExtractor()
+            print(f"[DEBUG ADAPTER] GoogleScholarExtractor creado")
+            
+            print(f"[DEBUG ADAPTER] Llamando extractor.extract() con scholar_ids={scholar_ids}")
+            records = extractor.extract(
+                year_from=year_from,
+                year_to=year_to,
+                max_results=max_results,
+                scholar_ids=scholar_ids,
+            )
+            print(f"[DEBUG ADAPTER] extractor.extract() completado. Total registros: {len(records)}")
+            
+            logger.info(f"[GoogleScholarAdapter] Extracted {len(records)} records")
+            print(f"[DEBUG ADAPTER] Convirtiendo {len(records)} registros a Publication objects...")
+            
+            result = [self._to_publication(record) for record in records]
+            print(f"[DEBUG ADAPTER] Conversión completada. Total Publications: {len(result)}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"[GoogleScholarAdapter] Error fetching records: {e}")
+            print(f"[DEBUG ADAPTER] ERROR: {e}")
+            import traceback
+            print(traceback.format_exc())
+            return []
 
     @staticmethod
     def _to_publication(record) -> Publication:
-        authors = [
-            Author(
-                name=str(author.get("name") or "").strip(),
-                orcid=author.get("orcid"),
-                is_institutional=bool(author.get("is_institutional", False)),
-                external_ids={
-                    "google_scholar": str(author.get("google_scholar_id"))
-                } if author.get("google_scholar_id") else {},
-                metadata={k: v for k, v in author.items() if v is not None},
-            )
-            for author in (record.authors or [])
-            if author.get("name")
-        ]
+        """
+        Convierte StandardRecord a Publication domain object.
+        
+        Preserva toda la información disponible del extractor:
+        - DOI para matching exacto
+        - Citation count y métricas
+        - Metadatos completos en raw_data
+        """
+        
+        # Procesar autores: cada uno es un dict con name, orcid, is_institutional, etc.
+        authors = []
+        for author_data in (record.authors or []):
+            if isinstance(author_data, dict):
+                name = str(author_data.get("name") or "").strip()
+                if name:
+                    external_ids = {}
+                    if author_data.get("orcid"):
+                        external_ids["orcid"] = author_data.get("orcid")
+                    if author_data.get("google_scholar_id"):
+                        external_ids["google_scholar_id"] = author_data.get("google_scholar_id")
+                    
+                    author = Author(
+                        name=name,
+                        orcid=author_data.get("orcid"),
+                        is_institutional=bool(author_data.get("is_institutional", False)),
+                        external_ids=external_ids if external_ids else {},
+                        metadata={
+                            k: v for k, v in author_data.items() 
+                            if v is not None and k not in ["name", "orcid", "google_scholar_id"]
+                        },
+                    )
+                    authors.append(author)
+        
+        # Retornar Publication con TODOS los campos disponibles
         return Publication(
+            # --- Fuente ---
             source_name=record.source_name,
             source_id=record.source_id,
+            
+            # --- Identificadores ---
             doi=record.doi,
+            pmid=getattr(record, "pmid", None),
+            pmcid=getattr(record, "pmcid", None),
+            
+            # --- Metadatos principales ---
             title=record.title,
             publication_year=record.publication_year,
+            publication_date=getattr(record, "publication_date", None),
             publication_type=record.publication_type,
+            language=getattr(record, "language", None),
+            
+            # --- Fuente / revista ---
             source_journal=record.source_journal,
+            issn=record.issn,
+            
+            # --- Open Access ---
+            is_open_access=getattr(record, "is_open_access", None),
+            oa_status=getattr(record, "oa_status", None),
+            
+            # --- Autores ---
             authors=authors,
+            
+            # --- Métricas ---
             citation_count=record.citation_count,
+            citations_by_year=getattr(record, "citations_by_year", {}),
+            
+            # --- URL ---
             url=record.url,
+            
+            # --- Datos crudos preservados ---
             raw_data=record.raw_data or {},
+            
+            # --- Normalización ---
+            normalized_title=getattr(record, "normalized_title", None),
+            authors_text=getattr(record, "authors_text", None),
+            normalized_authors=getattr(record, "normalized_authors", None),
+            
+            # --- Timestamp ---
             extracted_at=record.extracted_at,
         )

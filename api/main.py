@@ -20,6 +20,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel
 
 from db.session import create_all_tables, check_connection
 
@@ -109,6 +110,22 @@ openapi_tags = [
     },
 
     # ── FASE 1: Fuentes independientes ────────────────────────
+    {
+        "name": "Fuentes · Google Scholar",
+        "description": (
+            "**FASE 1 · Scraping de Google Scholar.**\n\n"
+            "Extrae publicaciones de perfiles de investigadores en Google Scholar "
+            "y las almacena en `google_Scholar_records` (status=`pending`).\n\n"
+            "Búsqueda por **Scholar Profile ID** (ej: V94aovUAAAAJ).\n\n"
+            "Soporta múltiples perfiles simultáneamente con filtros de año.\n\n"
+            "> Usa la librería `scholarly` con delays respetuosos para web scraping ético.\n\n"
+            "> Datos disponibles: título, autores, año, citas, DOI, URL, métricas por año."
+        ),
+        "externalDocs": {
+            "description": "Google Scholar Profiles",
+            "url": "https://scholar.google.com",
+        },
+    },
     {
         "name": "Fuentes · OpenAlex",
         "description": (
@@ -303,6 +320,7 @@ FASE 2 — Reconciliación global (bajo demanda)
 
 | Fuente | Tipo de acceso | Identificador de búsqueda |
 |---|---|---|
+| Google Scholar | Web scraping | Scholar Profile ID (ej: V94aovUAAAAJ) |
 | OpenAlex | REST API pública | ROR ID / ORCID / OpenAlex Author ID |
 | Scopus | API con key (Elsevier) | Affiliation ID / ORCID / Scopus AU-ID |
 | Web of Science | API con key (Clarivate) | Nombre institución / ORCID / ResearcherID |
@@ -402,6 +420,256 @@ app.include_router(hex_ingest_router,       prefix="/api/hex")
 app.include_router(hex_publications_router, prefix="/api/hex")
 
 
+@app.get("/", tags=["General"], summary="Estado del servicio")
+def root():
+    """Retorna información básica del servicio y enlaces de navegación."""
+    return {
+        "servicio": "Reconciliación Bibliográfica API",
+        "version": "2.0.0",
+        "estado": "activo",
+        "enlaces": {
+            "documentacion_swagger": "/docs",
+            "documentacion_redoc":   "/redoc",
+            "health":                "/api/stats/health",
+            "estadisticas":          "/api/stats/summary",
+        },
+        "flujo": {
+            "fase_1_fuentes": {
+                "google_scholar": "/api/scholar/test",
+                "openalex":       "/api/sources/openalex/search/by-institution",
+                "scopus":         "/api/sources/scopus/search/by-institution",
+                "wos":            "/api/sources/wos/search/by-institution",
+                "cvlac":          "/api/sources/cvlac/search/by-author",
+                "datos_abiertos": "/api/sources/datos-abiertos/search/by-institution",
+            },
+            "fase_2_reconciliacion": "/api/pipeline/reconcile-all",
+            "publicaciones_canonicas": "/api/publications",
+            "hex_ingest": "/api/hex/ingest",
+            "hex_publications": "/api/hex/publications",
+        },
+    }
+
+
+# ─────────────────────────────────────────────────────────────
+# GOOGLE SCHOLAR — ENDPOINTS DE PRUEBA
+# ─────────────────────────────────────────────────────────────
+
+class GoogleScholarExtractRequest(BaseModel):
+    """Modelo para request de extracción de Google Scholar"""
+    scholar_ids: list[str]
+    year_from: int = 2020
+    year_to: int = 2024
+    max_results: int = 50
+    dry_run: bool = True
+    
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "scholar_ids": ["V94aovUAAAAJ"],
+                "year_from": 2020,
+                "year_to": 2024,
+                "max_results": 50,
+                "dry_run": True
+            }
+        }
+
+@app.get("/api/scholar/test", tags=["Fuentes · Google Scholar"], summary="Test de Google Scholar")
+def test_google_scholar():
+    """
+    🧪 **Endpoint de prueba para Google Scholar**
+    
+    Retorna información sobre cómo usar Google Scholar en la API.
+    
+    ### Ejemplo de uso:
+    
+    ```json
+    POST /api/hex/ingest
+    {
+        "sources": ["google_Scholar"],
+        "scholar_ids": ["V94aovUAAAAJ"],
+        "year_from": 2020,
+        "max_results": 50,
+        "dry_run": false
+    }
+    ```
+    
+    ### Scholar Profile IDs de ejemplo:
+    - V94aovUAAAAJ — Gustavo Aroca Martinez
+    - jzXp-fUAAAAJ — Simón Bauer
+    
+    ### Respuesta esperada:
+    - 5-10 publicaciones por perfil
+    - Campos: título, autores, año, citas, DOI, URL
+    - Estado: pending (esperando reconciliación)
+    - Destino: tabla `google_Scholar_records`
+    """
+    return {
+        "status": "ready",
+        "service": "Google Scholar Extractor",
+        "version": "1.0.0",
+        "modo": "Web scraping con scholarly library",
+        "uso": {
+            "endpoint": "/api/hex/ingest",
+            "metodo": "POST",
+            "parametros": {
+                "sources": ["google_Scholar"],
+                "scholar_ids": ["ID1", "ID2", "..."],
+                "year_from": 2020,
+                "year_to": 2024,
+                "max_results": 100,
+                "dry_run": False,
+            },
+            "ejemplo_request": {
+                "sources": ["google_Scholar"],
+                "scholar_ids": ["V94aovUAAAAJ"],
+                "year_from": 2020,
+                "max_results": 50,
+                "dry_run": False
+            },
+        },
+        "scholar_ids_ejemplo": {
+            "Gustavo_Aroca_Martinez": "V94aovUAAAAJ",
+            "Simon_Bauer": "jzXp-fUAAAAJ",
+        },
+        "campos_extraidos": [
+            "title",
+            "authors",
+            "publication_year",
+            "citation_count",
+            "doi",
+            "url",
+            "publication_type",
+            "source_journal",
+            "citations_by_year",
+            "raw_data",
+        ],
+        "destino_bd": "google_Scholar_records",
+        "status_inicial": "pending",
+        "proximos_pasos": [
+            "1. POST /api/hex/ingest con scholar_ids",
+            "2. Verificar resultados en google_Scholar_records",
+            "3. Ejecutar /api/pipeline/reconcile-all para matching",
+            "4. Ver en canonical_publications",
+        ],
+        "documentacion": "/docs#/Fuentes%20·%20Google%20Scholar",
+        "esquema_tabla": {
+            "id": "SERIAL PRIMARY KEY",
+            "google_Scholar_id": "VARCHAR(50) UNIQUE",
+            "scholar_profile_id": "VARCHAR(50)",
+            "title": "VARCHAR(1000) NOT NULL",
+            "authors_json": "JSONB",
+            "publication_year": "INTEGER",
+            "doi": "VARCHAR(100) UNIQUE",
+            "citation_count": "INTEGER",
+            "citations_by_year": "JSONB",
+            "status": "VARCHAR(30) DEFAULT 'pending'",
+            "canonical_publication_id": "FK → canonical_publications(id)",
+            "raw_data": "JSONB",
+            "created_at": "TIMESTAMP",
+            "updated_at": "TIMESTAMP",
+        },
+    }
+
+
+@app.post("/api/scholar/extract", tags=["Fuentes · Google Scholar"], summary="Extraer de Google Scholar")
+def extract_google_scholar(request: GoogleScholarExtractRequest):
+    """
+    📥 **Extrae publicaciones de Google Scholar**
+    
+    ### Request Body (JSON):
+    ```json
+    {
+        "scholar_ids": ["V94aovUAAAAJ"],
+        "year_from": 2020,
+        "year_to": 2024,
+        "max_results": 50,
+        "dry_run": true
+    }
+    ```
+    
+    ### Parámetros:
+    - `scholar_ids`: Lista de Scholar Profile IDs (requerido)
+    - `year_from`: Año inicial (default: 2020)
+    - `year_to`: Año final (default: 2024)
+    - `max_results`: Máximo de resultados por perfil (default: 50)
+    - `dry_run`: Si true, no persiste en BD (default: true para testing)
+    
+    ### Ejemplo de request (con cURL):
+    ```bash
+    curl -X POST "http://localhost:8000/api/scholar/extract" \\
+      -H "Content-Type: application/json" \\
+      -d '{
+        "scholar_ids": ["V94aovUAAAAJ"],
+        "year_from": 2020,
+        "max_results": 50,
+        "dry_run": true
+      }'
+    ```
+    
+    ### Retorno:
+    - `dry_run=true`: Datos extraídos sin guardar
+    - `dry_run=false`: Datos insertados en `google_Scholar_records`
+    """
+    from project.config.container import build_pipeline
+    
+    try:
+        logger.info(f"Extrayendo de Google Scholar: {request.scholar_ids}")
+        print(f"\n[DEBUG ENDPOINT] Iniciando extracción de Google Scholar para: {request.scholar_ids}")
+        
+        # Validar entrada
+        if not request.scholar_ids:
+            return {
+                "status": "error",
+                "error": "scholar_ids vacío o no proporcionado",
+                "ejemplo": {"scholar_ids": ["V94aovUAAAAJ"]}
+            }
+        
+        print(f"[DEBUG ENDPOINT] Construyendo pipeline...")
+        pipeline = build_pipeline(["google_scholar"])
+        print(f"[DEBUG ENDPOINT] Pipeline construido exitosamente")
+
+        print(f"[DEBUG ENDPOINT] Iniciando ejecución del pipeline...")
+        result = pipeline.run(
+            year_from=request.year_from,
+            year_to=request.year_to,
+            max_results=request.max_results,
+            persist=not request.dry_run,
+            source_kwargs={
+                "google_scholar": {
+                    "scholar_ids": request.scholar_ids
+                }
+            }
+        )
+        print(f"[DEBUG ENDPOINT] Pipeline ejecutado. Resultados: {result.collected} recolectados, {result.source_saved if not request.dry_run else 0} guardados")
+
+        return {
+            "status": "success",
+            "dry_run": request.dry_run,
+            "scholar_ids": request.scholar_ids,
+            "extraidos": result.collected,
+            "guardados": result.source_saved if not request.dry_run else 0,
+            "by_source": result.by_source,
+            "errors": result.errors,
+            "proximos_pasos": [
+                "Ver en BD: SELECT * FROM google_scholar_records",
+                "Reconciliar: POST /api/pipeline/reconcile-all",
+                "Verificar: GET /api/publications?source=google_scholar",
+            ]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error en Google Scholar extraction: {str(e)}")
+        print(f"[DEBUG ENDPOINT] ERROR: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        print(traceback.format_exc())
+        return {
+            "status": "error",
+            "error": str(e),
+            "tipo": type(e).__name__,
+        }
+
+
 # ─────────────────────────────────────────────────────────────
 # ROOT
 # ─────────────────────────────────────────────────────────────
@@ -421,6 +689,7 @@ def root():
         },
         "flujo": {
             "fase_1_fuentes": {
+                "google_scholar": "/api/scholar/test",
                 "openalex":       "/api/sources/openalex/search/by-institution",
                 "scopus":         "/api/sources/scopus/search/by-institution",
                 "wos":            "/api/sources/wos/search/by-institution",

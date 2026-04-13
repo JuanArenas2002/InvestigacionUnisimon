@@ -968,6 +968,10 @@ async def get_unified_author_profile(
         True,
         description="Si True, ejecuta reconciliación y guarda publicaciones canónicas en BD. Si False, solo extrae datos."
     ),
+    force_refresh: bool = Query(
+        False,
+        description="Si True, ignora el caché de sincronización y llama a todas las APIs externas aunque los datos sean recientes."
+    ),
     background_tasks: BackgroundTasks = BackgroundTasks(),
     db: Session = Depends(get_db),
 ):
@@ -1031,6 +1035,7 @@ async def get_unified_author_profile(
             orcid=orcid,
             include_platforms=include_platforms,
             reconcile=reconcile,
+            force_refresh=force_refresh,
         )
         
         # Si reconcile=true, ejecutar reconciliación global en background
@@ -1063,6 +1068,7 @@ async def get_unified_author_profile(
             "platforms": {
                 platform: {
                     "success": result.success,
+                    "skipped": result.skipped,
                     "records_count": result.records_count,
                     "error": result.error,
                     "extracted_at": result.extracted_at,

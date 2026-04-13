@@ -14,7 +14,7 @@ import asyncio
 import logging
 from typing import Dict, List, Optional, Any, Tuple
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 
 from sqlalchemy.orm import Session
 import pyalex
@@ -46,7 +46,12 @@ class PlatformExtractionResult:
     records_count: int = 0
     records: List[StandardRecord] = field(default_factory=list)  # StandardRecord, no dict
     error: Optional[str] = None
+    skipped: bool = False  # True si se omitió por datos recientes en BD
     extracted_at: str = field(default_factory=lambda: datetime.now().isoformat())
+
+
+# TTL por defecto para considerar datos frescos (7 días)
+DEFAULT_SYNC_TTL_HOURS = 168
 
 
 @dataclass
@@ -111,6 +116,8 @@ class UnifiedExtractorService:
         orcid: Optional[str] = None,
         include_platforms: Optional[List[str]] = None,
         reconcile: bool = True,
+        force_refresh: bool = False,
+        sync_ttl_hours: int = DEFAULT_SYNC_TTL_HOURS,
     ) -> UnifiedAuthorProfile:
         """
         Extrae información del autor de todas las plataformas disponibles
@@ -185,26 +192,41 @@ class UnifiedExtractorService:
         # 4. Ejecutar extracciones
         for platform in include_platforms:
             try:
+                # Verificar si los datos son recientes para evitar llamadas innecesarias
+                if not force_refresh and self._should_skip_platform(author, platform, sync_ttl_hours):
+                    result = PlatformExtractionResult(
+                        platform=platform,
+                        success=True,
+                        skipped=True,
+                        records_count=0,
+                    )
+                    profile.platform_results[platform] = result
+                    logger.info(f"⏭ {platform}: datos recientes en BD, omitiendo llamada API")
+                    continue
+
                 result = self._extract_from_platform(author, platform)
                 profile.platform_results[platform] = result
-                
+
                 if result.success:
                     profile.platforms_with_data.append(platform)
                     profile.total_publications += result.records_count
-                    
+
                     # Contar citas
                     for record in result.records:
                         if isinstance(record, dict):
                             profile.total_citations += int(record.get('citation_count', 0) or 0)
                         elif isinstance(record, StandardRecord):
                             profile.total_citations += record.citation_count
-                            
+
+                    # Registrar timestamp de sincronización exitosa
+                    self._mark_platform_synced(author, platform)
+
                     logger.info(
                         f"✓ {platform}: {result.records_count} publicaciones extraídas"
                     )
                 else:
                     logger.warning(f"✗ {platform}: {result.error}")
-                    
+
             except Exception as e:
                 logger.error(f"Error inesperado en {platform}: {e}", exc_info=True)
                 profile.platform_results[platform] = PlatformExtractionResult(
@@ -803,10 +825,50 @@ class UnifiedExtractorService:
             logger.error(f"Error guardando datos del autor: {e}")
             self.db.rollback()
     
+    def _should_skip_platform(self, author: Author, platform: str, ttl_hours: int) -> bool:
+        """
+        Retorna True si la plataforma tiene datos recientes en BD (dentro del TTL).
+
+        El timestamp de última sincronización se guarda en:
+            author.field_provenance['last_sync'][platform]
+        """
+        try:
+            provenance = author.field_provenance or {}
+            last_sync = provenance.get('last_sync', {})
+            ts_str = last_sync.get(platform)
+            if not ts_str:
+                return False
+            last_synced = datetime.fromisoformat(ts_str)
+            # Asegurar timezone-aware para comparar
+            if last_synced.tzinfo is None:
+                last_synced = last_synced.replace(tzinfo=timezone.utc)
+            age = datetime.now(timezone.utc) - last_synced
+            return age < timedelta(hours=ttl_hours)
+        except Exception:
+            return False
+
+    def _mark_platform_synced(self, author: Author, platform: str) -> None:
+        """
+        Guarda el timestamp actual como última sincronización exitosa de la plataforma.
+
+        Persiste en author.field_provenance['last_sync'][platform].
+        """
+        try:
+            provenance = dict(author.field_provenance or {})
+            last_sync = dict(provenance.get('last_sync', {}))
+            last_sync[platform] = datetime.now(timezone.utc).isoformat()
+            provenance['last_sync'] = last_sync
+            author.field_provenance = provenance
+            self.db.add(author)
+            self.db.commit()
+        except Exception as e:
+            logger.warning(f"No se pudo guardar timestamp de sync para {platform}: {e}")
+            self.db.rollback()
+
     def _determine_available_platforms(self, author: Author) -> List[str]:
         """Determina qué plataformas se pueden consultar según IDs disponibles"""
         available = []
-        
+
         if author.scopus_id:
             available.append('scopus')
         if author.wos_id:

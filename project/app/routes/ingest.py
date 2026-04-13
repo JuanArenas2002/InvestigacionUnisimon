@@ -1,4 +1,4 @@
-from typing import List, Optional
+from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
@@ -13,10 +13,13 @@ class IngestRequest(BaseModel):
     year_from: Optional[int] = Field(default=None, ge=1900, le=2100)
     year_to: Optional[int] = Field(default=None, ge=1900, le=2100)
     max_results: Optional[int] = Field(default=100, ge=1)
-    cvlac_codes: List[str] = Field(default_factory=list)
-    wos_org_enhanced: Optional[str] = None
-    datos_abiertos_dataset_id: Optional[str] = None
-    datos_abiertos_institution_filter: Optional[str] = None
+    source_kwargs: Dict[str, Dict[str, Any]] = Field(
+        default_factory=dict,
+        description=(
+            "Parámetros específicos por fuente. "
+            "Ej: {'cvlac': {'cvlac_codes': ['123']}, 'google_scholar': {'scholar_ids': ['abc']}}"
+        ),
+    )
     dry_run: bool = False
 
 
@@ -37,20 +40,12 @@ def ingest(request: IngestRequest):
         )
 
     pipeline = build_pipeline(selected_sources)
-    source_kwargs = {
-        "cvlac": {"cvlac_codes": request.cvlac_codes},
-        "wos": {"org_enhanced": request.wos_org_enhanced},
-        "datos_abiertos": {
-            "dataset_id": request.datos_abiertos_dataset_id,
-            "institution_filter": request.datos_abiertos_institution_filter,
-        },
-    }
 
     result = pipeline.run(
         year_from=request.year_from,
         year_to=request.year_to,
         max_results=request.max_results,
-        source_kwargs=source_kwargs,
+        source_kwargs=request.source_kwargs,
         persist=not request.dry_run,
     )
 

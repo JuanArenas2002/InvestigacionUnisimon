@@ -4,12 +4,16 @@ Dashboard completo sobre registros, contribuciones y cobertura de Scopus.
 Ahora usa directamente la tabla scopus_records.
 """
 
+import io
 import logging
+import time
 from typing import Optional, List
 
-from fastapi import APIRouter, Depends, Query, HTTPException
+from fastapi import APIRouter, Depends, Query, HTTPException, UploadFile, File
+from fastapi.responses import StreamingResponse
 from sqlalchemy import func, or_, text
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 
 from api.dependencies import get_db
 from api.schemas.scopus import (
@@ -22,6 +26,7 @@ from api.schemas.scopus import (
     ScopusTopJournal,
     ScopusYearDistribution,
     ScopusEnrichedPublicationSample,
+    ScopusSearchResponse,
 )
 from api.schemas.common import PaginatedResponse
 from api.schemas.external_records import ExternalRecordRead, ExternalRecordDetail
@@ -30,6 +35,8 @@ from db.models import (
     ScopusRecord,
     Author,
 )
+from api.exporters.excel.scopus_search import generate_scopus_search_excel
+from api.services.scopus_search_service import ScopusSearchService
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/scopus", tags=["Scopus Dashboard"])
@@ -722,20 +729,122 @@ def _build_citation_stats(db: Session) -> ScopusCitationStats:
     pubs = q.all()
     count = len(pubs)
 
-    if count == 0:
+    if not pubs:
         return ScopusCitationStats()
 
-    total_cites = sum(p.citation_count for p in pubs)
-    top = max(pubs, key=lambda p: p.citation_count)
+    total = sum(p.citation_count for p in pubs if p.citation_count)
+    max_pub = max(pubs, key=lambda p: p.citation_count or 0)
 
     return ScopusCitationStats(
         publications_with_citations_from_scopus=count,
-        total_citations_from_scopus=total_cites,
-        max_citation_count=top.citation_count,
-        max_citation_doi=top.doi,
-        max_citation_title=top.title[:200] if top.title else None,
-        avg_citations=round(total_cites / count, 1),
+        total_citations_from_scopus=total,
+        max_citation_count=max_pub.citation_count or 0,
+        max_citation_doi=max_pub.doi,
+        max_citation_title=max_pub.title,
+        avg_citations=round(total / count, 1) if count else 0.0,
     )
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /scopus/search-products
+# Búsqueda masiva de productos en Scopus desde Excel
+# ══════════════════════════════════════════════════════════════
+
+@router.post(
+    "/search-products",
+    summary="Buscar productos en Scopus desde Excel",
+    description=(
+        "Carga un archivo Excel con publicaciones y busca cada una en Scopus.\n\n"
+        "El Excel debe contener las siguientes columnas:\n"
+        "- **Título** (requerido): Título de la publicación\n"
+        "- **Año**: Año de publicación\n"
+        "- **DOI**: Identificador digital\n"
+        "- **ISSN**: ISSN de la revista\n"
+        "- **Revista**: Nombre de la revista\n\n"
+        "Devuelve un Excel con dos hojas:\n"
+        "1. **Encontrados**: Productos hallados en Scopus con sus IDs y detalles\n"
+        "2. **No Encontrados**: Productos no encontrados con los parámetros de búsqueda\n"
+        "3. **Resumen**: Estadísticas de la búsqueda"
+    ),
+    responses={
+        200: {
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+            "description": "Excel con resultados de búsqueda"
+        },
+        400: {"description": "Archivo vacío o formato inválido"},
+        425: {"description": "Error al procesar el archivo"},
+    },
+)
+async def search_products_in_scopus(
+    file: UploadFile = File(..., description="Archivo Excel (.xlsx) con publicaciones"),
+    max_workers: int = Query(5, ge=1, le=10, description="Búsquedas simultáneas (1-10)"),
+    max_delay: float = Query(0.1, ge=0.05, le=1.0, description="Delay por slot concurrente (seg)"),
+):
+    """
+    Endpoint para búsqueda masiva de productos en Scopus.
+
+    Procesa cada fila del Excel, busca la publicación en Scopus y devuelve
+    un Excel con productos encontrados y no encontrados.
+    Usa hasta `max_workers` búsquedas simultáneas para reducir el tiempo total.
+    """
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Solo se aceptan archivos Excel (.xlsx o .xls)")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "El archivo está vacío")
+
+    logger.info(
+        f"[search-products] Archivo recibido: {file.filename} "
+        f"({len(file_bytes):,} bytes) — workers={max_workers}, delay={max_delay}s"
+    )
+
+    # Crear servicio de búsqueda con concurrencia configurada
+    service = ScopusSearchService(max_workers=max_workers)
+    service.delay_between_requests = max_delay
+    
+    try:
+        # Ejecutar búsqueda masiva
+        _t0 = time.time()
+        found_results, not_found_results = await service.search_publications_batch(file_bytes)
+        elapsed = time.time() - _t0
+        
+        logger.info(
+            f"[search-products] Búsqueda completada en {elapsed:.1f}s\n"
+            f"  - Encontrados: {len(found_results)}\n"
+            f"  - No encontrados: {len(not_found_results)}"
+        )
+        
+        # Convertir a dicts para exportar
+        found_dicts = [r.dict() for r in found_results]
+        not_found_dicts = [r.dict() for r in not_found_results]
+        
+        # Generar Excel
+        _t1 = time.time()
+        excel_bytes = await run_in_threadpool(
+            generate_scopus_search_excel,
+            found_dicts,
+            not_found_dicts,
+        )
+        logger.info(f"[search-products] Excel generado en {time.time() - _t1:.1f}s")
+        
+        # Retornar como descarga
+        filename = f"scopus_search_{len(found_results) + len(not_found_results)}_productos.xlsx"
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+        
+    except ValueError as e:
+        logger.error(f"[search-products] Error de validación: {e}")
+        raise HTTPException(422, f"Error procesando archivo: {str(e)}")
+    except Exception as e:
+        logger.error(f"[search-products] Error inesperado: {e}", exc_info=True)
+        raise HTTPException(
+            500,
+            f"Error durante la búsqueda en Scopus: {str(e)}"
+        )
 
 
 def _build_top_journals(db: Session, limit: int = 20) -> List[ScopusTopJournal]:

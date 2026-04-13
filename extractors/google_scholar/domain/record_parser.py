@@ -3,13 +3,15 @@ Conversión de publicaciones de Google Scholar al formato StandardRecord.
 
 Google Scholar devuelve datos mínimos por publicación:
   - title, year, citation count, venue (revista/conferencia), url
-  - No incluye DOI ni autores co-autores en la lista del perfil
+  - Co-autores disponibles en bib["author"] como string "A and B and C"
 
-Los autores se infieren del perfil: el dueño del perfil es siempre
-marcado como autor institucional.
+Los autores se extraen del campo bib["author"]. El dueño del perfil
+siempre se marca como institucional si aparece entre los co-autores,
+o se agrega al final si no está en la lista.
 """
 
-from typing import Optional
+import hashlib
+from typing import List, Optional
 
 
 def parse_publication(pub: dict, scholar_id: str, profile_name: str) -> dict:
@@ -32,28 +34,71 @@ def parse_publication(pub: dict, scholar_id: str, profile_name: str) -> dict:
     url = pub.get("pub_url") or pub.get("url")
     pub_id = pub.get("author_pub_id") or pub.get("citekey")
 
-    # El dueño del perfil es siempre el autor institucional
-    author_entry = {
-        "name": profile_name,
-        "orcid": None,
-        "is_institutional": True,
-        "google_scholar_id": scholar_id,
-    }
+    authors = _extract_authors(bib, scholar_id, profile_name)
 
     return {
-        "source_id":             pub_id or f"{scholar_id}_{title[:30] if title else 'unknown'}",
+        "source_id":             pub_id or _stable_id(scholar_id, title, url),
         "doi":                   _extract_doi(pub),
         "title":                 title,
         "publication_year":      year,
         "publication_type":      _infer_type(bib),
         "source_journal":        journal,
         "issn":                  None,
-        "authors":               [author_entry],
-        "institutional_authors": [author_entry],
+        "authors":               authors,
+        "institutional_authors": [a for a in authors if a["is_institutional"]],
         "citation_count":        citations,
         "url":                   url,
         "raw_data":              pub,
     }
+
+
+def _extract_authors(bib: dict, scholar_id: str, profile_name: str) -> List[dict]:
+    """
+    Extrae co-autores del campo bib["author"] (string "A and B and C").
+    Marca al dueño del perfil como institucional.
+    Si el campo no existe, retorna solo el dueño del perfil.
+    """
+    author_str = bib.get("author", "")
+    if not author_str:
+        return [{
+            "name": profile_name,
+            "orcid": None,
+            "is_institutional": True,
+            "google_scholar_id": scholar_id,
+        }]
+
+    names = [n.strip() for n in author_str.split(" and ") if n.strip()]
+    profile_name_lower = profile_name.lower()
+
+    authors = []
+    profile_found = False
+    for name in names:
+        is_owner = profile_name_lower in name.lower() or name.lower() in profile_name_lower
+        if is_owner:
+            profile_found = True
+        authors.append({
+            "name": name,
+            "orcid": None,
+            "is_institutional": is_owner,
+            "google_scholar_id": scholar_id if is_owner else None,
+        })
+
+    # Si el perfil no apareció en la lista de autores, agregarlo
+    if not profile_found:
+        authors.append({
+            "name": profile_name,
+            "orcid": None,
+            "is_institutional": True,
+            "google_scholar_id": scholar_id,
+        })
+
+    return authors
+
+
+def _stable_id(scholar_id: str, title: Optional[str], url: Optional[str]) -> str:
+    """Genera un ID estable y único cuando author_pub_id no está disponible."""
+    content = f"{scholar_id}|{title or ''}|{url or ''}"
+    return f"{scholar_id}_{hashlib.md5(content.encode()).hexdigest()[:8]}"
 
 
 def _safe_int(value) -> Optional[int]:
@@ -68,7 +113,6 @@ def _extract_doi(pub: dict) -> Optional[str]:
     doi = pub.get("bib", {}).get("doi") or pub.get("doi")
     if doi:
         return doi.strip()
-    # Algunos registros tienen el DOI en el URL
     url = pub.get("pub_url", "") or ""
     if "doi.org/" in url:
         return url.split("doi.org/")[-1].strip()
@@ -77,8 +121,11 @@ def _extract_doi(pub: dict) -> Optional[str]:
 
 def _infer_type(bib: dict) -> str:
     """Infiere el tipo de publicación desde los metadatos disponibles."""
-    if bib.get("conference"):
+    venue = (bib.get("venue") or "").lower()
+    if bib.get("conference") or any(
+        kw in venue for kw in ("conference", "proceedings", "workshop", "symposium")
+    ):
         return "conference_paper"
-    if bib.get("journal"):
+    if bib.get("journal") or bib.get("venue"):
         return "article"
     return "publication"

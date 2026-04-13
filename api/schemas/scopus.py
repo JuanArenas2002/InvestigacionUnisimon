@@ -122,3 +122,41 @@ class ScopusInsightsResponse(BaseModel):
         default_factory=list,
         description="Hasta 10 ejemplos de publicaciones enriquecidas por Scopus",
     )
+
+
+# ── Búsqueda masiva de productos en Scopus ───────────────────
+
+class ScopusPublicationSearchResult(BaseModel):
+    """Resultado de la búsqueda de una publicación en Scopus."""
+    row_num: int = Field(..., description="Número de fila en el Excel original")
+    title: str = Field(..., description="Título del artículo")
+    year: Optional[int] = Field(None, description="Año de publicación")
+    doi: Optional[str] = Field(None, description="DOI")
+    issn: Optional[str] = Field(None, description="ISSN")
+    magazine: Optional[str] = Field(None, description="Nombre de la revista")
+    found_in_scopus: bool = Field(..., description="¿Encontrado en Scopus?")
+    scopus_id: Optional[str] = Field(None, description="ID de Scopus (si encontrado)")
+    scopus_title: Optional[str] = Field(None, description="Título en Scopus")
+    scopus_journal: Optional[str] = Field(None, description="Revista en Scopus")
+    scopus_doi: Optional[str] = Field(None, description="DOI en Scopus")
+    scopus_issn: Optional[str] = Field(None, description="ISSN en Scopus (si encontrado)")
+    search_method: str = Field(
+        default="title",
+        description="Método usado: 'doi', 'title', 'issn' o 'not_searched'"
+    )
+    search_query: Optional[str] = Field(None, description="Query usada en la búsqueda")
+    matched_fields: List[str] = Field(
+        default_factory=list,
+        description="Campos que coincidieron: 'title', 'year', 'issn', etc."
+    )
+
+
+class ScopusSearchResponse(BaseModel):
+    """Resultado de la búsqueda masiva de productos en Scopus."""
+    total_processed: int = Field(..., description="Total de productos procesados")
+    found: int = Field(0, description="Productos encontrados en Scopus")
+    not_found: int = Field(0, description="Productos no encontrados")
+    results: List[ScopusPublicationSearchResult] = Field(
+        default_factory=list,
+        description="Detalles de cada búsqueda realizada"
+    )
