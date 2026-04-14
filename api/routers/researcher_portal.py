@@ -279,10 +279,10 @@ def get_my_coauthors(
     Ordenados por `shared_pubs` (publicaciones compartidas) de mayor a menor.
     El flag `is_institutional` indica si el co-autor pertenece a la institución.
     """
-    author_pub_ids = (
-        db.query(PublicationAuthor.publication_id)
-        .filter(PublicationAuthor.author_id == researcher.id)
-        .subquery()
+    from sqlalchemy import select
+
+    author_pub_ids = select(PublicationAuthor.publication_id).filter(
+        PublicationAuthor.author_id == researcher.id
     )
 
     rows = (
