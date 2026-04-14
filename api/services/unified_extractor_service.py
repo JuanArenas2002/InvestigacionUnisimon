@@ -488,22 +488,24 @@ class UnifiedExtractorService:
     def _determine_available_platforms(self, author: Author) -> List[str]:
         """Determina qué plataformas se pueden consultar según IDs disponibles"""
         available = []
-        
+
         if author.scopus_id:
             available.append('scopus')
         if author.wos_id:
             available.append('wos')
         if author.openalex_id:
             available.append('openalex')
-        if author.cvlac_id:
+        # CvLAC: disponible si tiene cédula (Metrik) o cvlac_id (legacy)
+        if author.cedula or author.cvlac_id:
             available.append('cvlac')
         if author.orcid:
-            available.append('openalex')  # OpenAlex también busca por ORCID
-            
+            if 'openalex' not in available:
+                available.append('openalex')  # OpenAlex también busca por ORCID
+
         # OpenAlex casi siempre está disponible (por ROR de institución)
         if 'openalex' not in available:
             available.append('openalex')
-        
+
         # Datos Abiertos Colombia (siempre disponible para búsqueda)
         available.append('datos_abiertos')
         
@@ -875,21 +877,22 @@ class UnifiedExtractorService:
             available.append('wos')
         if author.openalex_id:
             available.append('openalex')
-        if author.cvlac_id:
+        # CvLAC: disponible si tiene cédula (fuente Metrik) o cvlac_id (legacy)
+        if author.cedula or author.cvlac_id:
             available.append('cvlac')
         if author.orcid:
             if 'openalex' not in available:
                 available.append('openalex')  # OpenAlex también busca por ORCID
-            
+
         # OpenAlex casi siempre está disponible (por ROR de institución)
         if 'openalex' not in available:
             available.append('openalex')
-        
+
         # Datos Abiertos Colombia (siempre disponible para búsqueda)
         available.append('datos_abiertos')
-        
+
         return available
-    
+
     def _extract_from_platform(
         self,
         author: Author,
@@ -1091,27 +1094,35 @@ class UnifiedExtractorService:
             )
     
     def _extract_cvlac(self, author: Author) -> PlatformExtractionResult:
-        """Extrae de CVLac usando cvlac_id"""
+        """Extrae de CvLAC usando cédula (Metrik Unisimon JSON API) o cvlac_id (legacy)."""
         try:
-            if not author.cvlac_id:
+            # Prioridad: cédula (Metrik JSON API) > cvlac_id (legacy scraper)
+            cedula = author.cedula
+            cvlac_id = author.cvlac_id
+
+            if not cedula and not cvlac_id:
                 return PlatformExtractionResult(
                     platform='cvlac',
                     success=False,
-                    error="cvlac_id no disponible",
+                    error="Sin cédula ni cvlac_id para consultar CvLAC",
                 )
-            
+
             extractor = CvlacExtractor()
-            records = extractor.extract(cvlac_codes=[author.cvlac_id])
-            
-            # IMPORTANTE: Mantener StandardRecord sin convertir a dict
-            # reconcile_batch() los necesita como objetos
+
+            if cedula:
+                logger.info(f"CvLAC: extrayendo por cédula={cedula}")
+                records = extractor.extract(cc_investigadores=[cedula])
+            else:
+                logger.info(f"CvLAC: extrayendo por cvlac_id={cvlac_id} (legacy)")
+                records = extractor.extract(cvlac_codes=[cvlac_id])
+
             return PlatformExtractionResult(
                 platform='cvlac',
                 success=True,
                 records_count=len(records),
-                records=records,  # Mantener como StandardRecord, no convertir a dict
+                records=records,
             )
-            
+
         except CvlacScrapingError as e:
             logger.error(f"CVLac scraping error: {e}")
             return PlatformExtractionResult(
@@ -1267,6 +1278,8 @@ class UnifiedExtractorService:
                 logger.info(f"Reconciliando {len(records_new)} publicaciones NUEVAS...")
                 engine = ReconciliationEngine(session=self.db)
                 stats = engine.reconcile_batch(records_new)
+                # CRÍTICO: Hacer flush para que las canónicas recién creadas sean visibles en queries posteriores
+                self.db.flush()
             else:
                 # Si todos ya existían, crear stats dummy
                 from reconciliation.engine import ReconciliationStats
@@ -1279,13 +1292,13 @@ class UnifiedExtractorService:
                     new_canonical=0,
                     errors=0,
                 )
-            
+
             # Guardar estadísticas en el perfil
             profile.reconciliation_status = "completed"
             stats_dict = stats.to_dict()
             stats_dict['already_existed'] = already_existed_count
             profile.reconciliation_stats = stats_dict
-            
+
             # ─ FASE 3: Vincular los registros NUEVOS creados (como antes)
             logger.info(f"Vinculando {len(records_new)} publicaciones NUEVAS al autor...")
             self._link_author_to_publications(author, records_new)
