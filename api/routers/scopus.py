@@ -847,6 +847,111 @@ async def search_products_in_scopus(
         )
 
 
+# ══════════════════════════════════════════════════════════════
+# POST /scopus/author-production
+# Extrae la producción de autores por Scopus Author ID desde Excel
+# ══════════════════════════════════════════════════════════════
+
+@router.post(
+    "/author-production",
+    summary="Extraer producción de autores desde Scopus",
+    description=(
+        "Carga un archivo Excel con IDs de autores de Scopus y extrae su producción.\n\n"
+        "El Excel debe contener las siguientes columnas:\n"
+        "- **author_id** (requerido): Scopus Author ID\n"
+        "- **author_name** (opcional): Nombre del autor\n"
+        "- **affiliation** (opcional): Afiliación del autor\n\n"
+        "Devuelve un Excel con:\n"
+        "1. **Summary**: Resumen de autores y cantidad de publicaciones\n"
+        "2. **Por autor**: Una hoja por cada autor con todas sus publicaciones y metadatos"
+    ),
+    responses={
+        200: {
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+            "description": "Excel con producción de autores"
+        },
+        400: {"description": "Archivo vacío o formato inválido"},
+        422: {"description": "Error al procesar el archivo"},
+    },
+)
+async def extract_author_production(
+    file: UploadFile = File(..., description="Archivo Excel (.xlsx) con IDs de autores"),
+    max_workers: int = Query(3, ge=1, le=10, description="Extracciones simultáneas (1-10)"),
+):
+    """
+    Endpoint para extraer la producción académica de múltiples autores desde Scopus.
+
+    Procesa cada autor del Excel, busca todas sus publicaciones en Scopus 
+    y devuelve un Excel con la producción completa incluídos todos los metadatos.
+    
+    Usa hasta `max_workers` extracciones simultáneas para reducir el tiempo total.
+    """
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Solo se aceptan archivos Excel (.xlsx o .xls)")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "El archivo está vacío")
+
+    logger.info(
+        f"[author-production] Archivo recibido: {file.filename} "
+        f"({len(file_bytes):,} bytes) — workers={max_workers}"
+    )
+
+    # Importar servicio
+    from api.services.scopus_author_production_service import ScopusAuthorProductionService
+    from api.exporters.excel.scopus_author_production import generate_author_production_excel
+
+    service = ScopusAuthorProductionService(max_workers=max_workers)
+    
+    try:
+        # Ejecutar extracción masiva
+        _t0 = time.time()
+        author_results = await service.process_author_ids(file_bytes)
+        elapsed = time.time() - _t0
+        
+        if not author_results:
+            raise HTTPException(422, "No se encontraron autores en el archivo")
+        
+        logger.info(
+            f"[author-production] Extracción completada en {elapsed:.1f}s\n"
+            f"  - Total autores: {len(author_results)}\n"
+            f"  - Exitosos: {sum(1 for r in author_results if r['status'] == 'success')}\n"
+            f"  - Con errores: {sum(1 for r in author_results if r['status'] == 'error')}"
+        )
+        
+        # Generar Excel
+        _t1 = time.time()
+        excel_bytes = await run_in_threadpool(
+            generate_author_production_excel,
+            author_results,
+        )
+        logger.info(f"[author-production] Excel generado en {time.time() - _t1:.1f}s")
+        
+        # Retornar como descarga
+        num_authors = len(author_results)
+        total_pubs = sum(r.get("publications_count", 0) for r in author_results)
+        filename = f"scopus_autores_{num_authors}_produccion_{total_pubs}.xlsx"
+        
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+        )
+        
+    except ValueError as e:
+        logger.error(f"[author-production] Error de validación: {e}")
+        raise HTTPException(422, f"Error procesando archivo: {str(e)}")
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[author-production] Error inesperado: {e}", exc_info=True)
+        raise HTTPException(
+            500,
+            f"Error durante la extracción de Scopus: {str(e)}"
+        )
+
+
 def _build_top_journals(db: Session, limit: int = 20) -> List[ScopusTopJournal]:
     """Revistas más frecuentes en registros Scopus (columna tipada)."""
     rows = (

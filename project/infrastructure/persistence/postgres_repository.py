@@ -339,8 +339,15 @@ class PostgresRepository(RepositoryPort):
 
         author = None
 
+        # ── 0. Cédula (identificador colombiano, columna directa con unique index) ──
+        cedula = getattr(author_payload, "cedula", None)
+        if cedula:
+            author = session.query(Author).filter(
+                Author.cedula == str(cedula).strip()
+            ).first()
+
         # ── 1. ORCID (identificador unico, maxima prioridad) ──────────────
-        if author_payload.orcid:
+        if author is None and author_payload.orcid:
             author = session.query(Author).filter(
                 Author.orcid == author_payload.orcid
             ).first()
@@ -422,6 +429,7 @@ class PostgresRepository(RepositoryPort):
                 name=clean_name,
                 normalized_name=canonical,
                 orcid=author_payload.orcid,
+                cedula=str(cedula).strip() if cedula else None,
                 external_ids=external_ids,
                 is_institutional=bool(author_payload.is_institutional),
                 verification_status="auto_detected",
@@ -491,6 +499,11 @@ class PostgresRepository(RepositoryPort):
                     new_source=source_name,
                 )
 
+        # Cédula: rellenar si el autor existente no la tenía
+        if cedula and not author.cedula:
+            field_changes["cedula"] = {"before": None, "after": str(cedula).strip()}
+            author.cedula = str(cedula).strip()
+
         author.is_institutional = author.is_institutional or bool(author_payload.is_institutional)
 
         # Fusionar external_ids detectando conflictos campo a campo
@@ -524,3 +537,250 @@ class PostgresRepository(RepositoryPort):
             _log_author_change(session, author, "updated", before, source_name, field_changes)
 
         return author
+
+    # ─────────────────────────────────────────────────────────────────
+    # Edición controlada de perfil de autor
+    # ─────────────────────────────────────────────────────────────────
+
+    def get_author_by_id(self, author_id: int) -> Optional[dict]:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            if not author:
+                return None
+            return {
+                "id": author.id,
+                "name": author.name,
+                "normalized_name": author.normalized_name,
+                "orcid": author.orcid,
+                "cedula": author.cedula,
+                "external_ids": dict(author.external_ids or {}),
+                "is_institutional": author.is_institutional,
+                "verification_status": author.verification_status,
+            }
+        finally:
+            session.close()
+
+    def get_author_name_options(self, author_id: int) -> list:
+        """
+        Para cada fuente vinculada, extrae el nombre del autor desde raw_data
+        de sus publicaciones en esa fuente.
+        """
+        from db.models import SOURCE_MODELS, PublicationAuthor, CanonicalPublication
+
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            if not author:
+                return []
+
+            external_ids = dict(author.external_ids or {})
+            options = []
+            seen_names: set = set()
+
+            # IDs de publicaciones canónicas del autor
+            pub_ids = [
+                pa.publication_id
+                for pa in session.query(PublicationAuthor.publication_id)
+                .filter(PublicationAuthor.author_id == author_id)
+                .all()
+            ]
+
+            for source, source_model in SOURCE_MODELS.items():
+                ext_id = external_ids.get(source)
+                if not ext_id:
+                    continue
+
+                # Buscar registros de esta fuente vinculados a pubs del autor
+                records = (
+                    session.query(source_model)
+                    .filter(source_model.canonical_publication_id.in_(pub_ids))
+                    .limit(10)
+                    .all()
+                )
+
+                for rec in records:
+                    name = _extract_author_name_from_record(rec, source, ext_id)
+                    if name and name.lower() not in seen_names:
+                        seen_names.add(name.lower())
+                        options.append({
+                            "source": source,
+                            "name": name,
+                            "profile_url": _build_profile_url_for_source(source, ext_id),
+                        })
+                        break  # una opción por fuente es suficiente
+
+            return options
+        finally:
+            session.close()
+
+    def update_author_name(self, author_id: int, name: str, source: str) -> dict:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            before = _author_snapshot(author)
+            author.name = name
+            author.normalized_name = normalize_text(normalize_author_name(name))
+            field_changes = {
+                "name": {"before": before["name"], "after": name},
+                "normalized_name": {"before": before["normalized_name"], "after": author.normalized_name},
+            }
+            _log_author_change(session, author, "name_updated", before, source, field_changes)
+            session.commit()
+            return self.get_author_by_id(author_id)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def get_author_source_links(self, author_id: int) -> list:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            if not author:
+                return []
+
+            external_ids = dict(author.external_ids or {})
+            known_sources = ["cvlac", "openalex", "scopus", "wos", "google_scholar"]
+            links = []
+            for source in known_sources:
+                ext_id = external_ids.get(source)
+                links.append({
+                    "source": source,
+                    "external_id": ext_id,
+                    "profile_url": _build_profile_url_for_source(source, ext_id) if ext_id else None,
+                    "linked": bool(ext_id),
+                })
+            return links
+        finally:
+            session.close()
+
+    def update_author_source_link(self, author_id: int, source: str, external_id: str) -> dict:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            before = _author_snapshot(author)
+            current = dict(author.external_ids or {})
+            old_value = current.get(source)
+            current[source] = external_id
+            author.external_ids = current
+            field_changes = {f"external_ids.{source}": {"before": old_value, "after": external_id}}
+            _log_author_change(session, author, "source_link_updated", before, "manual", field_changes)
+            session.commit()
+            return {"author_id": author_id, "links": self.get_author_source_links(author_id)}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def remove_author_source_link(self, author_id: int, source: str) -> dict:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            before = _author_snapshot(author)
+            current = dict(author.external_ids or {})
+            old_value = current.pop(source, None)
+            author.external_ids = current
+            field_changes = {f"external_ids.{source}": {"before": old_value, "after": None}}
+            _log_author_change(session, author, "source_link_removed", before, "manual", field_changes)
+            session.commit()
+            return {"author_id": author_id, "links": self.get_author_source_links(author_id)}
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def update_author_orcid(self, author_id: int, orcid: str) -> dict:
+        session = get_session()
+        try:
+            author = session.query(Author).filter(Author.id == author_id).first()
+            before = _author_snapshot(author)
+            field_changes = {"orcid": {"before": author.orcid, "after": orcid}}
+            author.orcid = orcid
+            _log_author_change(session, author, "orcid_updated", before, "manual", field_changes)
+            session.commit()
+            return self.get_author_by_id(author_id)
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    def check_source_id_conflict(
+        self, source: str, external_id: str, exclude_author_id: int
+    ) -> Optional[int]:
+        session = get_session()
+        try:
+            if source == "orcid":
+                existing = (
+                    session.query(Author.id)
+                    .filter(Author.orcid == external_id, Author.id != exclude_author_id)
+                    .first()
+                )
+            else:
+                existing = (
+                    session.query(Author.id)
+                    .filter(
+                        Author.external_ids[source].astext == external_id,
+                        Author.id != exclude_author_id,
+                    )
+                    .first()
+                )
+            return existing[0] if existing else None
+        finally:
+            session.close()
+
+
+# ── Helpers privados ─────────────────────────────────────────────────────────
+
+_PROFILE_URL_TEMPLATES = {
+    "cvlac": "https://scienti.minciencias.gov.co/cvlac/visualizador/generateCurriculoCvLac.do?cod_rh={id}",
+    "openalex": "https://openalex.org/{id}",
+    "scopus": "https://www.scopus.com/authid/detail.uri?authorId={id}",
+    "google_scholar": "https://scholar.google.com/citations?user={id}",
+    "orcid": "https://orcid.org/{id}",
+}
+
+
+def _build_profile_url_for_source(source: str, external_id: str) -> Optional[str]:
+    template = _PROFILE_URL_TEMPLATES.get(source)
+    return template.format(id=external_id) if template else None
+
+
+def _extract_author_name_from_record(record, source: str, external_id: str) -> Optional[str]:
+    """Extrae el nombre del autor específico desde el raw_data del registro."""
+    raw = record.raw_data or {}
+
+    if source == "cvlac":
+        investigador = raw.get("_investigador") or {}
+        return investigador.get("nombre") or None
+
+    if source == "openalex":
+        for authorship in raw.get("authorships", []):
+            author_data = authorship.get("author") or {}
+            # El ID en OpenAlex incluye la URL completa, comparar por sufijo
+            oa_id = author_data.get("id", "")
+            if external_id in oa_id or oa_id.endswith(external_id):
+                return author_data.get("display_name") or None
+        return None
+
+    if source == "scopus":
+        for author_data in raw.get("author", []):
+            if str(author_data.get("authid", "")) == str(external_id):
+                given = author_data.get("given-name", "")
+                surname = author_data.get("surname", "")
+                full = f"{given} {surname}".strip()
+                return full or None
+        return None
+
+    if source == "wos":
+        # WoS almacena autores en authors_text; usar como fallback
+        return record.authors_text.split(";")[0].strip() if record.authors_text else None
+
+    if source == "google_scholar":
+        return raw.get("author_name") or raw.get("name") or None
+
+    return None

@@ -1,22 +1,26 @@
 """
 Router: CvLAC (Minciencias Colombia)
 
-CvLAC no tiene una API pública oficial — la extracción es por web scraping.
-La búsqueda se hace por código CvLAC del investigador (cod_rh).
+Dos fuentes de datos:
 
-Rutas:
-  POST /sources/cvlac/search/by-author
-  GET  /sources/cvlac/records
-  GET  /sources/cvlac/records/{id}
+1. Scraping HTML de Minciencias (existente):
+   CvLAC no tiene API pública — se hace web scraping por cod_rh.
+   POST /sources/cvlac/search/by-author
+   POST /sources/cvlac/search/by-institution
+   GET  /sources/cvlac/records
+   GET  /sources/cvlac/records/{id}
 
-Nota: No existe búsqueda por institución directa en CvLAC.
-      Se puede iterar sobre una lista de códigos de investigadores.
+2. API JSON de Metrik Unisimon (nueva):
+   Consume el endpoint REST de Metrik por cédula del investigador.
+   GET  /sources/cvlac/profile/{cc}
 """
 
 import logging
 from typing import Optional, List, Any
 
+import requests
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
@@ -34,22 +38,19 @@ router = APIRouter(prefix="/cvlac", tags=["Fuentes · CvLAC"])
 # ─────────────────────────────────────────────────────────────
 
 class CvlacSearchByAuthorRequest(BaseModel):
-    """Parámetros para búsqueda en CvLAC. Usa código CvLAC o ORCID."""
-    cvlac_code: Optional[str] = Field(
-        None,
-        description="Código CvLAC del investigador (cod_rh en la URL del perfil)",
-    )
-    orcid: Optional[str] = Field(
-        None,
-        description="ORCID del investigador (se intenta mapear a código CvLAC)",
+    """Parámetros para búsqueda en CvLAC por cédula del investigador."""
+    cc: str = Field(
+        ...,
+        description="Cédula de ciudadanía del investigador",
+        examples=["7977197"],
     )
 
 
 class CvlacBatchSearchRequest(BaseModel):
-    """Búsqueda por lote de códigos CvLAC (equivalente a 'por institución')."""
-    cvlac_codes: List[str] = Field(
+    """Búsqueda por lote de cédulas (equivalente a 'por institución')."""
+    cc_investigadores: List[str] = Field(
         ...,
-        description="Lista de códigos CvLAC de los investigadores de la institución",
+        description="Lista de cédulas de los investigadores de la institución",
         min_length=1,
     )
 
@@ -111,71 +112,63 @@ class CvlacRecordDetail(BaseModel):
 @router.post(
     "/search/by-author",
     response_model=SearchResult,
-    summary="Scraping de publicaciones CvLAC para un investigador",
+    summary="Extracción CvLAC por cédula del investigador (Metrik Unisimon)",
 )
 def search_by_author(
     body: CvlacSearchByAuthorRequest,
     db: Session = Depends(get_db),
 ):
     """
-    Hace scraping del perfil CvLAC de un investigador y almacena los productos
-    en `cvlac_records` con status='pending'.
+    Consulta el perfil CvLAC de un investigador por cédula usando el API JSON
+    de Metrik Unisimon y almacena los productos en `cvlac_records`.
 
-    Requiere el código CvLAC (cod_rh) del investigador.
+    Requiere la cédula de ciudadanía del investigador (campo `cc`).
     """
     from extractors.cvlac import CvlacExtractor
 
-    if not body.cvlac_code and not body.orcid:
-        raise HTTPException(400, "Se requiere cvlac_code u orcid.")
-
-    logger.info(f"CvLAC · búsqueda por autor: code={body.cvlac_code}, orcid={body.orcid}")
+    logger.info(f"CvLAC · búsqueda por cédula: cc={body.cc}")
     try:
         extractor = CvlacExtractor()
-        records = extractor.extract(cvlac_code=body.cvlac_code, orcid=body.orcid)
+        records = extractor.extract(cc_investigadores=[body.cc])
+    except ValueError as e:
+        raise HTTPException(400, str(e))
     except Exception as e:
-        logger.error(f"Error extrayendo CvLAC: {e}")
-        raise HTTPException(502, f"Error en scraping CvLAC: {e}")
+        logger.error(f"Error extrayendo CvLAC cc={body.cc}: {e}")
+        raise HTTPException(502, f"Error al consultar CvLAC: {e}")
 
     return _ingest(records, db, "by-author")
 
 
 # ─────────────────────────────────────────────────────────────
-# POST /search/by-institution  (lote de códigos)
+# POST /search/by-institution  (lote de cédulas)
 # ─────────────────────────────────────────────────────────────
 
 @router.post(
     "/search/by-institution",
     response_model=SearchResult,
-    summary="Scraping de CvLAC para múltiples investigadores (lote por institución)",
+    summary="Extracción CvLAC para múltiples investigadores por cédula",
 )
 def search_by_institution(
     body: CvlacBatchSearchRequest,
     db: Session = Depends(get_db),
 ):
     """
-    Itera sobre una lista de códigos CvLAC (investigadores de la institución)
-    y extrae los productos de cada uno.
+    Itera sobre una lista de cédulas y extrae los productos CvLAC de cada
+    investigador desde el API JSON de Metrik Unisimon.
 
-    Útil para cargar el inventario completo de una institución desde CvLAC.
+    Útil para cargar el inventario completo de una institución.
     """
     from extractors.cvlac import CvlacExtractor
 
-    logger.info(f"CvLAC · búsqueda por institución: {len(body.cvlac_codes)} investigadores")
-    all_records = []
-    errors = 0
+    logger.info(f"CvLAC · búsqueda por institución: {len(body.cc_investigadores)} investigadores")
+    try:
+        extractor = CvlacExtractor()
+        records = extractor.extract(cc_investigadores=body.cc_investigadores)
+    except Exception as e:
+        logger.error(f"Error en extracción institucional CvLAC: {e}")
+        raise HTTPException(502, f"Error al consultar CvLAC: {e}")
 
-    extractor = CvlacExtractor()
-    for code in body.cvlac_codes:
-        try:
-            records = extractor.extract(cvlac_code=code)
-            all_records.extend(records)
-        except Exception as e:
-            logger.warning(f"Error en CvLAC para código {code}: {e}")
-            errors += 1
-
-    result = _ingest(all_records, db, "by-institution")
-    result.errors += errors
-    return result
+    return _ingest(records, db, "by-institution")
 
 
 # ─────────────────────────────────────────────────────────────
@@ -225,6 +218,61 @@ def get_record(record_id: int, db: Session = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────────────────────
+# GET /profile/{cc}  — API JSON Metrik Unisimon
+# ─────────────────────────────────────────────────────────────
+
+@router.get(
+    "/profile/{cc}",
+    summary="Perfil CvLAC por cédula (API JSON Metrik Unisimon)",
+    response_class=JSONResponse,
+)
+def get_profile_by_cc(cc: str):
+    """
+    Consulta el perfil CvLAC de un investigador usando su cédula de ciudadanía.
+
+    Consume el endpoint REST de Metrik Unisimon:
+        https://metrik.unisimon.edu.co/scienti/cvlac/{cc}
+
+    Devuelve JSON normalizado con la estructura:
+    ```json
+    {
+      "investigador": { "cc", "nombre", "categoria", "nacionalidad" },
+      "produccion": [
+        { "cc", "autor_principal", "tipo", "subtipo", "titulo",
+          "revista", "anio", "doi", "editorial", "autores" }
+      ]
+    }
+    ```
+
+    Reglas de normalización:
+    - Campos "N/A" se omiten.
+    - DOI vacío → null.
+    - anio → entero.
+    - autores → lista (split por coma).
+    """
+    from extractors.cvlac.application.metrik_service import fetch_profile
+
+    try:
+        data = fetch_profile(cc_investigador=cc)
+    except requests.HTTPError as e:
+        status = e.response.status_code if e.response is not None else 502
+        if status == 404:
+            raise HTTPException(404, f"Investigador con cc={cc} no encontrado en Metrik CvLAC.")
+        raise HTTPException(502, f"Error HTTP al consultar Metrik CvLAC: {e}")
+    except requests.Timeout:
+        raise HTTPException(504, "Timeout al consultar el API Metrik CvLAC.")
+    except requests.ConnectionError as e:
+        raise HTTPException(503, f"No se pudo conectar al API Metrik CvLAC: {e}")
+    except ValueError as e:
+        raise HTTPException(422, str(e))
+    except Exception as e:
+        logger.error(f"[CvLAC Metrik] Error inesperado para cc={cc}: {e}")
+        raise HTTPException(500, f"Error interno al procesar perfil CvLAC: {e}")
+
+    return data
+
+
+# ─────────────────────────────────────────────────────────────
 # HELPER PRIVADO
 # ─────────────────────────────────────────────────────────────
 
@@ -233,19 +281,31 @@ def _ingest(records, db: Session, context: str) -> SearchResult:
         return SearchResult(
             source="cvlac",
             inserted=0, skipped=0, errors=0,
-            message="El scraping no devolvió productos.",
+            message="No se encontraron productos para este investigador.",
         )
     try:
-        engine   = ReconciliationEngine(session=db)
-        inserted = engine.ingest_records(records)
-        skipped  = len(records) - inserted
-        logger.info(f"CvLAC [{context}]: {inserted} insertados, {skipped} omitidos.")
+        engine = ReconciliationEngine(session=db)
+        # reconcile_batch = ingest_records + reconcile_pending en un solo paso:
+        #   1. Guarda en cvlac_records (status=pending)
+        #   2. Crea/vincula canonical_publications
+        #   3. Crea publication_author (asigna al investigador)
+        stats = engine.reconcile_batch(records)
+        logger.info(
+            f"CvLAC [{context}]: {stats.new_canonical} canónicos nuevos, "
+            f"{stats.doi_exact_matches + stats.fuzzy_high_matches + stats.fuzzy_combined_matches} vinculados, "
+            f"{stats.errors} errores."
+        )
         return SearchResult(
             source="cvlac",
-            inserted=inserted,
-            skipped=max(skipped, 0),
-            errors=0,
-            message=f"{inserted} productos nuevos almacenados en cvlac_records.",
+            inserted=stats.new_canonical,
+            skipped=max(len(records) - stats.total_processed, 0),
+            errors=stats.errors,
+            message=(
+                f"{stats.new_canonical} publicaciones nuevas creadas, "
+                f"{stats.doi_exact_matches + stats.fuzzy_high_matches + stats.fuzzy_combined_matches} "
+                f"vinculadas a publicaciones existentes. "
+                f"Autor asignado en publication_author."
+            ),
         )
     except Exception as e:
         logger.error(f"Error en ingesta CvLAC: {e}")

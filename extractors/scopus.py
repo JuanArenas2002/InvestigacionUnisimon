@@ -366,6 +366,96 @@ class ScopusExtractor(BaseExtractor):
 
         return self._post_process(records)
 
+    def get_author_profile(self, author_id: str) -> Optional[Dict[str, str]]:
+        """
+        Obtiene el perfil completo de un autor desde Scopus Author Retrieval API.
+
+        Returns:
+            Dict con: name, orcid, subject_areas, institution_current, etc.
+            None si falla
+        """
+        AUTHOR_URL = f"{scopus_config.base_url}/author/author_id/{author_id}"
+
+        headers = {
+            "User-Agent": "ScopusExtractor/1.0",
+            "Accept": "application/json",
+        }
+
+        if self.api_key:
+            headers["X-ELS-APIKey"] = self.api_key
+        if self.inst_token:
+            headers["X-ELS-Insttoken"] = self.inst_token
+
+        try:
+            resp = self.session.get(AUTHOR_URL, headers=headers, timeout=self.config.timeout)
+            resp.raise_for_status()
+            data = resp.json()
+
+            # Navegar por la estructura JSON de respuesta
+            author_entry = data.get("author-retrieval-response", {})
+            if isinstance(author_entry, list):
+                author_entry = author_entry[0] if author_entry else {}
+
+            author_data = author_entry.get("author-profile", {})
+            personal_data = author_data.get("personal-data", {})
+
+            # Extraer fields
+            given_name = personal_data.get("given-name", "")
+            surname = personal_data.get("surname", "")
+            name = f"{given_name} {surname}".strip() or personal_data.get("name", "")
+
+            # ORCID
+            orcid = personal_data.get("orcid", "")
+
+            # Subject areas
+            subject_areas = []
+            subject_elements = author_data.get("subject-areas", {}).get("subject-area", [])
+            if not isinstance(subject_elements, list):
+                subject_elements = [subject_elements] if subject_elements else []
+            for subj in subject_elements:
+                if isinstance(subj, dict):
+                    subject_areas.append(subj.get("$", ""))
+                else:
+                    subject_areas.append(str(subj))
+
+            # Institución actual (de affiliation-current)
+            institution = ""
+            aff_current = author_data.get("affiliation-current", {})
+            if isinstance(aff_current, dict):
+                aff_data = aff_current.get("affiliation-data", {})
+                if isinstance(aff_data, dict):
+                    institution = aff_data.get("institution-display-name", "")
+
+            # Citaciones
+            citation_count = author_entry.get("coredata", {}).get("citation-count", 0)
+
+            logger.info(
+                f"Perfil cargado: {name} (ID={author_id}), "
+                f"ORCID={orcid}, Institution={institution}, "
+                f"Citations={citation_count}"
+            )
+
+            return {
+                "name": name,
+                "given_name": given_name,
+                "surname": surname,
+                "orcid": orcid,
+                "subject_areas": "; ".join(subject_areas) if subject_areas else "",
+                "institution_current": institution,
+                "citation_count": int(citation_count),
+                "author_id": author_id,
+            }
+
+        except requests.exceptions.HTTPError as e:
+            if e.response.status_code == 404:
+                logger.warning(f"Autor {author_id} no encontrado en Scopus")
+            else:
+                logger.error(f"Error HTTP obteniendo perfil {author_id}: {e}")
+            return None
+        except Exception as e:
+            logger.error(f"Error inesperado obteniendo perfil {author_id}: {e}")
+            return None
+
     def _parse_record(self, entry: dict) -> StandardRecord:
         """Convierte una entrada de Scopus Search a StandardRecord"""
 

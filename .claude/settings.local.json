@@ -25,7 +25,9 @@
       "Bash(python -m db.seeders.seed_authors_from_excel --dry-run)",
       "Bash(python -m pip install bcrypt -q)",
       "Bash(python -m db.seeders.seed_authors_from_excel)",
-      "Bash(sed 's/@router\\\\.//')"
+      "Bash(sed 's/@router\\\\.//')",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "Read(//c/Users/juan.arenas1/Desktop//**)"
     ]
   }
 }

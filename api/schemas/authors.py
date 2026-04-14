@@ -301,3 +301,44 @@ class SimilarAuthorRead(BaseModel):
     similarity_score: float = Field(..., description="Similitud pg_trgm 0-1")
 
     model_config = {"from_attributes": True}
+
+
+# ── Edición controlada de perfil de autor ───────────────────
+
+class NameOption(BaseModel):
+    """Nombre disponible desde una fuente vinculada."""
+    source: str = Field(..., description="cvlac | openalex | scopus | wos | google_scholar")
+    name: str
+    profile_url: Optional[str] = None
+
+
+class NameOptionsResponse(BaseModel):
+    author_id: int
+    current_name: str
+    options: List[NameOption]
+
+
+class UpdateNameRequest(BaseModel):
+    source: str = Field(..., description="Fuente de donde proviene el nombre")
+    value: str = Field(..., min_length=2, max_length=300)
+
+
+class SourceLinkItem(BaseModel):
+    source: str
+    external_id: Optional[str] = None
+    profile_url: Optional[str] = None
+    linked: bool
+
+
+class SourceLinksResponse(BaseModel):
+    author_id: int
+    links: List[SourceLinkItem]
+
+
+class UpdateSourceLinkRequest(BaseModel):
+    source: str = Field(..., description="cvlac | openalex | scopus | google_scholar | orcid")
+    profile_url: str = Field(..., description="URL pública del perfil del investigador en la fuente")
+
+
+class UpdateOrcidRequest(BaseModel):
+    orcid: str = Field(..., description="ORCID en formato 0000-0001-2345-6789")

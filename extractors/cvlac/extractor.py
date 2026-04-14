@@ -1,50 +1,46 @@
 """
-Orquestador principal del extractor CVLAC (Minciencias Colombia).
+Orquestador principal del extractor CVLAC.
 
-CVLAC (Currículum Vitae de Latinoamérica y el Caribe) es el sistema de
-Minciencias para registrar la producción científica de investigadores colombianos.
+Fuente primaria: API JSON de Metrik Unisimon
+    GET https://metrik.unisimon.edu.co/scienti/cvlac/{cc_investigador}
 
-Este módulo implementa la interfaz BaseExtractor usando arquitectura DDD:
-  infrastructure.http_client  → sesión HTTP con User-Agent apropiado
-  application.profile_service → descarga y parsea cada perfil individual
-  domain.html_parser          → extrae datos del HTML por sección
-  domain.record_parser        → transforma dicts crudos a campos de StandardRecord
+Entrada:
+    cc_investigadores: lista de cédulas de ciudadanía.
 
-NOTA: CVLAC no tiene API REST pública. Este extractor usa web scraping
-del portal público. La estructura HTML puede cambiar si Minciencias
-actualiza el portal — en ese caso, actualizar domain/html_parser.py.
+Flujo por cédula:
+  1. metrik_service.fetch_profile(cc)  →  {investigador, produccion[]}
+  2. Filtro por año (year_from / year_to).
+  3. record_parser.parse_raw(item)     →  fields dict
+  4. _parse_record(fields)             →  StandardRecord
 
-Portal: https://scienti.minciencias.gov.co/cvlac/visualizador/
+El scraper HTML de Minciencias (profile_service / html_parser) queda como
+módulo legacy para referencia pero ya no es el camino principal.
 """
 
 import logging
 import time
 from typing import List, Optional
 
-from config import cvlac_config, institution, SourceName
+import requests as _requests
+
+from config import cvlac_config, SourceName
 from extractors.base import BaseExtractor, StandardRecord
-from extractors.cvlac._exceptions import CvlacScrapingError
-from extractors.cvlac.application import profile_service
-from extractors.cvlac.infrastructure import http_client
+from extractors.cvlac.application import metrik_service
+from extractors.cvlac.domain import record_parser
+
+from unidecode import unidecode
 
 logger = logging.getLogger(__name__)
 
 
 class CvlacExtractor(BaseExtractor):
     """
-    Extractor de producción científica desde perfiles CVLAC.
+    Extractor de producción científica desde CvLAC vía API Metrik Unisimon.
 
-    Itera una lista de códigos CVLAC, descarga cada perfil y extrae
-    los productos bibliográficos (artículos, libros, capítulos, etc.).
-
-    Requiere:
-      - beautifulsoup4 y lxml instalados:
-        pip install beautifulsoup4 lxml
-
-    Uso típico:
+    Uso:
         extractor = CvlacExtractor()
         records = extractor.extract(
-            cvlac_codes=["0000123456", "0000789012"],
+            cc_investigadores=["7977197", "12345678"],
             year_from=2020,
             year_to=2025,
         )
@@ -53,16 +49,8 @@ class CvlacExtractor(BaseExtractor):
     source_name = SourceName.CVLAC
 
     def __init__(self):
-        """
-        Inicializa el extractor y crea la sesión HTTP con User-Agent institucional.
-        """
         self.config = cvlac_config
-        # La sesión se crea en infraestructura con el email de contacto institucional
-        self.session = http_client.create_session(
-            config=self.config,
-            institution_email=institution.contact_email,
-        )
-        logger.info("CvlacExtractor inicializado.")
+        logger.info("CvlacExtractor inicializado (fuente: Metrik Unisimon JSON API).")
 
     # ------------------------------------------------------------------
     # Interfaz BaseExtractor
@@ -73,95 +61,82 @@ class CvlacExtractor(BaseExtractor):
         year_from: Optional[int] = None,
         year_to: Optional[int] = None,
         max_results: Optional[int] = None,
+        cc_investigadores: Optional[List[str]] = None,
+        # alias legacy por si algún caller pasa cvlac_codes
         cvlac_codes: Optional[List[str]] = None,
         **kwargs,
     ) -> List[StandardRecord]:
         """
-        Extrae producción bibliográfica de una lista de perfiles CVLAC.
-
-        Flujo por cada código:
-          1. Descarga la página HTML del perfil (aplicación + infraestructura).
-          2. Parsea cada sección bibliográfica (dominio).
-          3. Convierte a StandardRecord (dominio + base).
-          4. Aplica delay entre requests para no sobrecargar el servidor.
+        Extrae producción bibliográfica de una lista de investigadores por cédula.
 
         Args:
-            year_from:    Año inicial del filtro (inclusive). None = sin límite.
-            year_to:      Año final del filtro (inclusive). None = sin límite.
-            max_results:  Límite total de registros. None = todos.
-            cvlac_codes:  Lista de códigos CVLAC a consultar (REQUERIDO).
-                          Ejemplo: ['0000123456', '0000789012']
+            year_from:           Año inicial del filtro (inclusive). None = sin límite.
+            year_to:             Año final del filtro (inclusive). None = sin límite.
+            max_results:         Límite total de registros. None = todos.
+            cc_investigadores:   Lista de cédulas de ciudadanía (REQUERIDO).
 
         Returns:
             Lista de StandardRecord normalizados y post-procesados.
-
-        Raises:
-            CvlacScrapingError: Si beautifulsoup4 no está instalado.
-            ValueError: Si no se proveen cvlac_codes.
         """
-        if not cvlac_codes:
+        cedulas = cc_investigadores or cvlac_codes or []
+        if not cedulas:
             raise ValueError(
-                "Debes proporcionar una lista de códigos CVLAC. "
-                "Ejemplo: cvlac_codes=['0000123456']"
+                "Debes proporcionar cc_investigadores. "
+                "Ejemplo: cc_investigadores=['7977197']"
             )
 
         records: List[StandardRecord] = []
         total_fetched = 0
 
-        for idx, code in enumerate(cvlac_codes):
+        for idx, cc in enumerate(cedulas):
             logger.info(
-                f"[CVLAC] Consultando perfil {code} "
-                f"({idx + 1}/{len(cvlac_codes)})"
+                f"[CVLAC] Consultando cc={cc} "
+                f"({idx + 1}/{len(cedulas)})"
             )
             try:
-                # La aplicación orquesta el scraping completo del perfil
-                profile_fields = profile_service.scrape_profile(
-                    session=self.session,
-                    config=self.config,
-                    base_url=self.config.base_url,
-                    cvlac_code=code,
-                    source_name=self.source_name,
-                    year_from=year_from,
-                    year_to=year_to,
+                profile = metrik_service.fetch_profile(
+                    cc_investigador=cc,
+                    timeout=self.config.timeout,
                 )
-
-                # Construir StandardRecords a partir de los campos parseados
-                for fields in profile_fields:
-                    record = self._parse_record(fields)
-                    records.append(record)
-                    total_fetched += 1
-                    if max_results and total_fetched >= max_results:
-                        break
-
-            except CvlacScrapingError as e:
-                logger.warning(f"[CVLAC] Error con perfil {code}: {e}")
+            except _requests.HTTPError as e:
+                logger.warning(f"[CVLAC] HTTP error para cc={cc}: {e}")
+                continue
+            except (_requests.Timeout, _requests.ConnectionError) as e:
+                logger.warning(f"[CVLAC] Conexión fallida para cc={cc}: {e}")
+                continue
+            except ValueError as e:
+                logger.warning(f"[CVLAC] Respuesta inválida para cc={cc}: {e}")
                 continue
             except Exception as e:
-                logger.warning(f"[CVLAC] Error inesperado con perfil {code}: {e}")
+                logger.warning(f"[CVLAC] Error inesperado para cc={cc}: {e}")
                 continue
+
+            investigador = profile.get("investigador", {})
+
+            for item in profile.get("produccion", []):
+                # Filtro por año
+                anio = item.get("anio")
+                if year_from and anio and anio < year_from:
+                    continue
+                if year_to and anio and anio > year_to:
+                    continue
+
+                fields = record_parser.parse_raw(item, investigador)
+                records.append(self._parse_record(fields))
+                total_fetched += 1
+
+                if max_results and total_fetched >= max_results:
+                    break
 
             if max_results and total_fetched >= max_results:
                 break
 
-            # Delay entre requests para respetar el servidor de Minciencias
-            time.sleep(self.config.delay_between_requests)
+            if idx < len(cedulas) - 1:
+                time.sleep(self.config.delay_between_requests)
 
         return self._post_process(records)
 
     def _parse_record(self, fields: dict) -> StandardRecord:
-        """
-        Construye un StandardRecord a partir del dict de campos parseados.
-
-        Los campos ya vienen procesados por domain.record_parser;
-        este método solo construye el objeto StandardRecord.
-
-        Args:
-            fields: Dict con claves listas para StandardRecord, producido
-                    por domain.record_parser.parse_raw().
-
-        Returns:
-            StandardRecord completo con source_name incluido.
-        """
         return StandardRecord(
             source_name=self.source_name,
             source_id=fields["source_id"],

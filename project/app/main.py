@@ -19,6 +19,7 @@ load_dotenv()
 
 from project.app.routes.ingest import router as ingest_router
 from project.app.routes.publications import router as publications_router
+from project.app.routes.author_profile import router as author_profile_router
 
 # ──────────────────────────────────────────────
 # LOGGING
@@ -141,6 +142,7 @@ app.add_middleware(
 
 app.include_router(ingest_router)
 app.include_router(publications_router)
+app.include_router(author_profile_router)
 
 
 # ──────────────────────────────────────────────

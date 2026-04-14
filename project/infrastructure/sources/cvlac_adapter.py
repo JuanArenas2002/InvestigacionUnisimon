@@ -21,8 +21,13 @@ class CvlacAdapter(SourcePort):
         max_results: Optional[int] = None,
         **kwargs,
     ) -> List[Publication]:
-        cvlac_codes = kwargs.get("cvlac_codes") or []
-        if not cvlac_codes:
+        # Acepta cc_investigadores (nuevo) o cvlac_codes (alias legacy)
+        cedulas = (
+            kwargs.get("cc_investigadores")
+            or kwargs.get("cvlac_codes")
+            or []
+        )
+        if not cedulas:
             return []
 
         extractor = CvlacExtractor()
@@ -30,7 +35,7 @@ class CvlacAdapter(SourcePort):
             year_from=year_from,
             year_to=year_to,
             max_results=max_results,
-            cvlac_codes=cvlac_codes,
+            cc_investigadores=cedulas,
         )
         return [self._to_publication(record) for record in records]
 
@@ -40,10 +45,9 @@ class CvlacAdapter(SourcePort):
             Author(
                 name=str(author.get("name") or "").strip(),
                 orcid=author.get("orcid"),
+                cedula=author.get("cedula"),
                 is_institutional=bool(author.get("is_institutional", False)),
-                external_ids={
-                    "cvlac": str(author.get("cvlac_id"))
-                } if author.get("cvlac_id") else {},
+                external_ids={},
                 metadata={k: v for k, v in author.items() if v is not None},
             )
             for author in (record.authors or [])

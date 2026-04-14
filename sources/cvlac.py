@@ -88,11 +88,16 @@ class CvlacRecord(SourceRecordMixin, Base):
 # =============================================================
 
 def _build_kwargs(record, raw: dict, kwargs: dict) -> None:
-    """Campos específicos de CvLAC (Minciencias)."""
+    """Campos específicos de CvLAC (Minciencias / Metrik Unisimon)."""
     kwargs["cvlac_product_id"] = record.source_id
-    kwargs["cvlac_code"]       = raw.get("cvlac_code")
+    # Metrik Unisimon usa "cc" como cédula del investigador; legacy usa "cvlac_code"
+    kwargs["cvlac_code"] = (
+        raw.get("cc")
+        or raw.get("cvlac_code")
+        or (raw.get("_investigador") or {}).get("cc")
+    )
     kwargs["isbn"]             = raw.get("isbn")
-    kwargs["product_type"]     = raw.get("product_type") or raw.get("tipo_producto")
+    kwargs["product_type"]     = raw.get("product_type") or raw.get("tipo_producto") or raw.get("tipo")
     kwargs["abstract"]         = raw.get("abstract") or raw.get("resumen")
     kwargs["keywords"]         = raw.get("keywords") or raw.get("palabras_clave")
     kwargs["volume"]           = raw.get("volume") or raw.get("volumen")

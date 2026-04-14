@@ -1477,7 +1477,13 @@ class ReconciliationEngine:
 
             # Buscar autor existente
             author = None
-            if orcid:
+            cedula = author_data.get("cedula")
+
+            # 0. Cédula (columna directa con unique index — máxima prioridad para CvLAC)
+            if not author and cedula:
+                author = self.session.query(Author).filter_by(cedula=str(cedula).strip()).first()
+
+            if orcid and not author:
                 author = self.session.query(Author).filter_by(orcid=orcid).first()
 
             scopus_id = author_data.get("scopus_id")
@@ -1626,6 +1632,7 @@ class ReconciliationEngine:
                     name=normalize_author_name(name) if name else name,
                     normalized_name=normalize_text(name),
                     orcid=orcid if orcid else None,
+                    cedula=str(cedula).strip() if cedula else None,
                     is_institutional=is_inst,
                     external_ids=eids if eids else None,
                 )
@@ -1648,6 +1655,10 @@ class ReconciliationEngine:
                 # Actualizar datos si tenemos info nueva
                 prov = dict(author.field_provenance or {})
                 changed = False
+                if cedula and not author.cedula:
+                    author.cedula = str(cedula).strip()
+                    prov["cedula"] = src
+                    changed = True
                 if orcid and not author.orcid:
                     author.orcid = orcid
                     prov["orcid"] = src
