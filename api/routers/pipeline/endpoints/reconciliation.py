@@ -65,15 +65,20 @@ def enrich_canonicals(
     response_model=ReconciliationStatsResponse,
     summary="Reconciliar lote de pendientes",
 )
-def reconcile_pending(batch_size: int = 500):
-    """Ejecuta un lote de reconciliación sobre registros pendientes."""
-    engine = ReconciliationEngine()
-    with engine.session:
-        try:
-            stats = engine.reconcile_pending(batch_size=batch_size)
-            return ReconciliationStatsResponse(**stats.to_dict())
-        except Exception as e:
-            raise HTTPException(500, f"Error en reconciliación: {e}")
+async def reconcile_pending(batch_size: int = 500):
+    """Ejecuta un lote de reconciliación sobre registros pendientes (non-blocking)."""
+    from starlette.concurrency import run_in_threadpool
+
+    def _reconcile_sync():
+        engine = ReconciliationEngine()
+        with engine.session:
+            try:
+                stats = engine.reconcile_pending(batch_size=batch_size)
+                return ReconciliationStatsResponse(**stats.to_dict())
+            except Exception as e:
+                raise HTTPException(500, f"Error en reconciliación: {e}")
+
+    return await run_in_threadpool(_reconcile_sync)
 
 
 # ── POST /pipeline/reconcile-all ──────────────────────────────────────────
@@ -83,26 +88,31 @@ def reconcile_pending(batch_size: int = 500):
     response_model=ReconciliationStatsResponse,
     summary="Reconciliar todos los pendientes",
 )
-def reconcile_all():
-    """Reconcilia TODOS los registros pendientes."""
-    engine = ReconciliationEngine()
-    with engine.session:
-        try:
-            total_stats = ReconciliationStatsResponse()
-            while True:
-                stats = engine.reconcile_pending(batch_size=500)
-                if stats.total_processed == 0:
-                    break
-                total_stats.total_processed += stats.total_processed
-                total_stats.doi_exact_matches += stats.doi_exact_matches
-                total_stats.fuzzy_high_matches += stats.fuzzy_high_matches
-                total_stats.fuzzy_combined_matches += stats.fuzzy_combined_matches
-                total_stats.manual_review += stats.manual_review
-                total_stats.new_canonical_created += stats.new_canonical
-                total_stats.errors += stats.errors
-            return total_stats
-        except Exception as e:
-            raise HTTPException(500, f"Error: {e}")
+async def reconcile_all():
+    """Reconcilia TODOS los registros pendientes (non-blocking)."""
+    from starlette.concurrency import run_in_threadpool
+
+    def _reconcile_all_sync():
+        engine = ReconciliationEngine()
+        with engine.session:
+            try:
+                total_stats = ReconciliationStatsResponse()
+                while True:
+                    stats = engine.reconcile_pending(batch_size=500)
+                    if stats.total_processed == 0:
+                        break
+                    total_stats.total_processed += stats.total_processed
+                    total_stats.doi_exact_matches += stats.doi_exact_matches
+                    total_stats.fuzzy_high_matches += stats.fuzzy_high_matches
+                    total_stats.fuzzy_combined_matches += stats.fuzzy_combined_matches
+                    total_stats.manual_review += stats.manual_review
+                    total_stats.new_canonical_created += stats.new_canonical
+                    total_stats.errors += stats.errors
+                return total_stats
+            except Exception as e:
+                raise HTTPException(500, f"Error: {e}")
+
+    return await run_in_threadpool(_reconcile_all_sync)
 
 
 # ── POST /pipeline/all-sources ────────────────────────────────────────────────
@@ -112,19 +122,25 @@ def reconcile_all():
     response_model=dict,
     summary="Reconciliar todos los registros de todas las fuentes + enriquecimiento Scopus",
 )
-def reconcile_all_sources(
+async def reconcile_all_sources(
     batch_size: int = 50,
     db: Session = Depends(get_db),
 ):
     """
-    Flujo COMPLETO de sincronización (delegado a FullSyncService):
+    Flujo COMPLETO de sincronización (non-blocking).
 
+    Delegado a FullSyncService:
     1. Reconcilia todos los registros de todas las fuentes (Scopus, OpenAlex, WoS, CvLAC, Datos Abiertos)
        contra canonical_publications usando el DOI como clave.
     2. Enriquece canónicos cruzándolos con Scopus por DOI (por lotes de `batch_size`).
     3. Actualiza autores con Scopus Author IDs.
     """
-    try:
-        return FullSyncService().run(db, batch_size=batch_size)
-    except Exception as e:
-        raise HTTPException(500, f"Error en sincronización: {e}")
+    from starlette.concurrency import run_in_threadpool
+
+    def _full_sync():
+        try:
+            return FullSyncService().run(db, batch_size=batch_size)
+        except Exception as e:
+            raise HTTPException(500, f"Error en sincronización: {e}")
+
+    return await run_in_threadpool(_full_sync)

@@ -813,6 +813,7 @@ def get_author_inventory(
     publication_type: Optional[str] = Query(None),
     source: Optional[str]      = Query(None),
     institutional_only: bool   = Query(False, description="Si es True, solo publicaciones con autores institucionales (institutional_authors_count > 0)"),
+    force_refresh: bool = Query(False, description="Fuerza extracción de datos incluso si son recientes"),
     db: Session = Depends(get_db),
 ):
     """
@@ -1024,13 +1025,15 @@ async def get_unified_author_profile(
             )
         
         service = UnifiedExtractorService(db)
-        
+
         include_platforms = None
         if platforms:
             include_platforms = [p.strip().lower() for p in platforms.split(",")]
-        
-        # Ejecutar con parámetro reconcile
-        profile = service.extract_author_profile(
+
+        # CRÍTICO: Ejecutar en threadpool para no bloquear el event loop
+        from starlette.concurrency import run_in_threadpool
+        profile = await run_in_threadpool(
+            service.extract_author_profile,
             author_id=author_id,
             orcid=orcid,
             include_platforms=include_platforms,
@@ -1723,3 +1726,108 @@ def batch_import_authors(
         conflicts=conflicts,
         details=details[:100],  # Limitar detalles para no saturar la respuesta
     )
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# GET /authors/{author_id}/source-publications
+# ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/{author_id}/source-publications",
+    summary="Todas las publicaciones de un autor agrupadas por fuente",
+    response_model=dict,
+)
+def get_author_source_publications(
+    author_id: int,
+    year_from:        Optional[int] = Query(None),
+    year_to:          Optional[int] = Query(None),
+    publication_type: Optional[str] = Query(None),
+    db: Session = Depends(get_db),
+):
+    """
+    Devuelve todas las publicaciones canónicas de un autor con los registros
+    de cada fuente que las respaldaron (scopus, cvlac, openalex, etc.).
+
+    Lee únicamente de la base de datos — no hace llamadas a APIs externas.
+
+    Respuesta:
+    ```json
+    {
+      "author": { "id", "name", "orcid", "cedula", "is_institutional" },
+      "total_publications": 42,
+      "sources_summary": { "scopus": 30, "cvlac": 15, "openalex": 40 },
+      "publications": [
+        {
+          "id": 1,
+          "title": "...",
+          "doi": "...",
+          "publication_year": 2023,
+          "publication_type": "article",
+          "source_journal": "...",
+          "citation_count": 5,
+          "sources": ["scopus", "cvlac"],
+          "source_links": { "scopus": "85123456789", "cvlac": "metrik_7977197_ab12cd34" }
+        }
+      ]
+    }
+    ```
+    """
+    author = db.get(Author, author_id)
+    if not author:
+        raise HTTPException(404, f"Autor con id={author_id} no encontrado")
+
+    # Publicaciones del autor via JOIN
+    q = (
+        db.query(CanonicalPublication)
+        .join(PublicationAuthor, CanonicalPublication.id == PublicationAuthor.publication_id)
+        .filter(PublicationAuthor.author_id == author_id)
+    )
+    if year_from:
+        q = q.filter(CanonicalPublication.publication_year >= year_from)
+    if year_to:
+        q = q.filter(CanonicalPublication.publication_year <= year_to)
+    if publication_type:
+        q = q.filter(
+            CanonicalPublication.publication_type == normalize_publication_type(publication_type)
+        )
+
+    pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).all()
+    pub_ids = [p.id for p in pubs]
+
+    # Registros de fuente (UNION ALL, una sola query)
+    sources_map, sources_list_map = _batch_source_records(db, pub_ids)
+
+    # Conteo por fuente
+    source_counter: dict = {}
+    products = []
+    for p in pubs:
+        srcs = sorted(set(sources_list_map.get(p.id, [])))
+        for s in srcs:
+            source_counter[s] = source_counter.get(s, 0) + 1
+        products.append({
+            "id":               p.id,
+            "title":            p.title,
+            "doi":              p.doi,
+            "publication_year": p.publication_year,
+            "publication_type": p.publication_type,
+            "source_journal":   p.source_journal,
+            "citation_count":   p.citation_count or 0,
+            "is_open_access":   p.is_open_access,
+            "sources":          srcs,
+            "source_links":     sources_map.get(p.id, {}),
+        })
+
+    return {
+        "author": {
+            "id":             author.id,
+            "name":           author.name,
+            "orcid":          author.orcid,
+            "cedula":         author.cedula,
+            "scopus_id":      author.scopus_id,
+            "openalex_id":    author.openalex_id,
+            "is_institutional": author.is_institutional,
+        },
+        "total_publications": len(products),
+        "sources_summary":    source_counter,
+        "publications":       products,
+    }
