@@ -43,27 +43,53 @@ async def get_scopus_author_profile(author_id: str) -> dict:
             if isinstance(author_entry, list):
                 author_entry = author_entry[0] if author_entry else {}
 
-            author_data = author_entry.get("author-profile", {})
-            personal_data = author_data.get("personal-data", {})
+            # ═══════════════════════════════════════════════════════════
+            # EXTRAER NOMBRE desde preferred-name
+            # ═══════════════════════════════════════════════════════════
+            author_profile = author_entry.get("author-profile", {})
+            preferred_name = author_profile.get("preferred-name", {})
 
-            given_name = personal_data.get("given-name", "")
-            surname = personal_data.get("surname", "")
+            given_name = preferred_name.get("given-name", "")
+            surname = preferred_name.get("surname", "")
             name = f"{given_name} {surname}".strip()
 
-            aff_current = author_data.get("affiliation-current", {})
-            aff_data = aff_current.get("affiliation-data", {}) if isinstance(aff_current, dict) else {}
-            institution = aff_data.get("institution-display-name", "") if isinstance(aff_data, dict) else ""
+            if not name:
+                # Fallback al indexed-name
+                name = preferred_name.get("indexed-name", "")
 
-            # Extraer áreas de investigación (subject areas)
+            # ═══════════════════════════════════════════════════════════
+            # EXTRAER INSTITUCIÓN ACTUAL
+            # ═══════════════════════════════════════════════════════════
+            aff_current = author_profile.get("affiliation-current", {})
+            institution = ""
+            if aff_current and isinstance(aff_current, dict):
+                # La afiliación actual es una lista dentro de affiliation-current
+                aff_list = aff_current.get("affiliation", [])
+                if aff_list and isinstance(aff_list, list) and len(aff_list) > 0:
+                    aff = aff_list[0]
+                    if isinstance(aff, dict):
+                        # Intentar obtener el nombre de la institución
+                        ip_doc = aff.get("ip-doc", {})
+                        if isinstance(ip_doc, dict):
+                            # Preferir afdispname que es el nombre legible
+                            institution = ip_doc.get("afdispname", "") or \
+                                        ip_doc.get("preferred-name", {}).get("$", "") or \
+                                        ip_doc.get("sort-name", "")
+
+            # ═══════════════════════════════════════════════════════════
+            # EXTRAER ÁREAS DE INVESTIGACIÓN (subject-areas)
+            # ═══════════════════════════════════════════════════════════
             subject_areas_list = []
-            research_areas = author_data.get("research-areas", {})
-            if research_areas and isinstance(research_areas, dict):
-                areas = research_areas.get("research-area", [])
+            subject_areas_data = author_entry.get("subject-areas", {})
+            if subject_areas_data and isinstance(subject_areas_data, dict):
+                areas = subject_areas_data.get("subject-area", [])
                 if areas and isinstance(areas, list):
                     subject_areas_list = [
-                        area.get("@abbrev", "") or area.get("$", "")
+                        area.get("$", "") or area.get("@abbrev", "")
                         for area in areas if isinstance(area, dict)
                     ]
+                    # Deduplicar y limitar a 5
+                    subject_areas_list = list(dict.fromkeys(subject_areas_list))[:5]
 
             subject_areas = "; ".join(filter(None, subject_areas_list)) if subject_areas_list else ""
 
@@ -74,7 +100,7 @@ async def get_scopus_author_profile(author_id: str) -> dict:
                 "subject_areas": subject_areas
             }
     except Exception as e:
-        logger.debug(f"No se pudo obtener perfil de {author_id}: {e}")
+        logger.warning(f"No se pudo obtener perfil de {author_id}: {e}")
 
     return {"name": "", "institution_current": "", "subject_areas": ""}
 
