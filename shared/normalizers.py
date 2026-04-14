@@ -61,14 +61,20 @@ def normalize_text(text: str) -> str:
 
 def normalize_author_name(name: str) -> str:
     """
-    Limpia un nombre de autor para almacenamiento legible:
-      - Reemplaza guiones Unicode y ASCII por espacios.
-      - Colapsa espacios múltiples.
-      - Conserva tildes (este normalizador es para display, no comparación).
+    Limpia un nombre de autor para almacenamiento legible y normalización:
+      - Convierte a mayúsculas
+      - Reemplaza guiones Unicode y ASCII por espacios
+      - Colapsa espacios múltiples
+      - Conserva tildes (este normalizador es para display, no comparación)
+
+    Ejemplos:
+        "juan pérez" → "JUAN PÉREZ"
+        "josé-luis garcía" → "JOSÉ LUIS GARCÍA"
+        "MARIA GARCIA" → "MARIA GARCIA"
     """
     if not name:
         return ""
-    name = str(name).strip()
+    name = str(name).strip().upper()
     # Reemplazar todos los tipos de guion/hyphen por espacio
     name = re.sub(
         r'[\u2010\u2011\u2012\u2013\u2014\u2015\u00AD\u002D\uFE58\uFE63\uFF0D]+',
@@ -96,33 +102,17 @@ def normalize_title_for_search(title: str) -> str:
 
 def normalize_publication_type(pub_type: Optional[str]) -> Optional[str]:
     """
-    Normaliza el tipo de publicación a mayúsculas.
-    
-    Esto evita duplicados como: article/ARTICLE, review/REVIEW, etc.
-    
-    Ejemplo:
+    Normaliza el tipo de publicación a mayúsculas y limpia espacios.
+
+    Evita inconsistencias: article/ARTICLE/Article, review/REVIEW/Review, etc.
+
+    Ejemplos:
         "article" → "ARTICLE"
         "REVIEW" → "REVIEW"
         "book-chapter" → "BOOK-CHAPTER"
+        "  JOURNAL ARTICLE  " → "JOURNAL ARTICLE"
         None → None
     """
     if not pub_type:
         return None
     return pub_type.strip().upper()
-
-
-def normalize_author_name(name: Optional[str]) -> Optional[str]:
-    """
-    Normaliza el nombre de autor a mayúsculas.
-    
-    Esto evita duplicados de autores como: "juan Pérez" vs "JUAN PÉREZ".
-    
-    Ejemplo:
-        "juan pérez" → "JUAN PÉREZ"
-        "MARIA GARCIA" → "MARIA GARCIA"
-        "José Luis" → "JOSÉ LUIS"
-        None → None
-    """
-    if not name:
-        return None
-    return name.strip().upper()
