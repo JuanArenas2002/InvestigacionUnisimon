@@ -1039,6 +1039,209 @@ async def enrich_publication_by_doi(
     return await run_in_threadpool(_run)
 
 
+# ── POST /publications/{id}/enrich-all ───────────────────────────────────────
+
+@router.post(
+    "/{pub_id}/enrich-all",
+    response_model=dict,
+    summary="Pipeline completo: buscar en todas las fuentes, reconciliar y enriquecer",
+    tags=["Publicaciones"],
+)
+async def enrich_publication_all_sources(
+    pub_id: int = Path(..., description="ID de la publicación canónica"),
+    db: Session = Depends(get_db),
+):
+    """
+    Pipeline completo para una publicación específica:
+
+    1. Carga el canónico por `pub_id` y obtiene su DOI.
+    2. Busca en **todas las fuentes** que soportan búsqueda por DOI
+       (OpenAlex, Scopus, Web of Science).
+    3. Ingesta los registros nuevos encontrados (omite duplicados).
+    4. Reconcilia los pendientes y los vincula al canónico.
+    5. Enriquece el canónico: completa campos vacíos y actualiza
+       `citations_by_source` con los conteos de cada plataforma.
+    6. Retorna el canónico actualizado con registros externos y autores.
+
+    Diferencia con `/{pub_id}/fetch-all`: este endpoint además ejecuta
+    el paso de enriquecimiento (`enrich_canonical`) y devuelve la
+    publicación completa con todos sus datos actualizados.
+    """
+    from starlette.concurrency import run_in_threadpool
+    from extractors.scopus import ScopusExtractor, ScopusAPIError
+    from extractors.wos import WosExtractor
+    from extractors.openalex.extractor import OpenAlexExtractor
+    from reconciliation.engine import ReconciliationEngine
+    from extractors.base import normalize_doi as _norm_doi
+
+    pub = db.get(CanonicalPublication, pub_id)
+    if not pub:
+        raise HTTPException(404, "Publicación no encontrada")
+
+    if not pub.doi:
+        raise HTTPException(
+            400,
+            "La publicación no tiene DOI; no es posible buscarla en fuentes externas.",
+        )
+
+    ndoi = _norm_doi(pub.doi) or pub.doi
+
+    def _run():
+        platform_results = {}
+        records_to_ingest = []
+
+        # ── OpenAlex (sin cuota, siempre primero) ──────────────────────────
+        try:
+            rec = OpenAlexExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["openalex"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["openalex"] = {"found": False}
+        except Exception as e:
+            platform_results["openalex"] = {"found": False, "error": str(e)}
+
+        # ── Scopus ─────────────────────────────────────────────────────────
+        try:
+            rec = ScopusExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["scopus"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["scopus"] = {"found": False}
+        except ScopusAPIError as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+        except Exception as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+
+        # ── Web of Science ─────────────────────────────────────────────────
+        try:
+            rec = WosExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["wos"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["wos"] = {"found": False}
+        except Exception as e:
+            platform_results["wos"] = {"found": False, "error": str(e)}
+
+        engine = ReconciliationEngine(session=db)
+
+        # ── Ingesta + reconciliación ───────────────────────────────────────
+        # Always reconcile: pre-existing pending records (ingested=0 on dedup)
+        # still need to be linked to the canonical before enrichment.
+        # We first reconcile any pending records that match this DOI across ALL
+        # source tables (they may have been ingested in a previous call), then
+        # run a general pass for anything newly ingested.
+        ingested = engine.ingest_records(records_to_ingest)
+
+        from db.models import SOURCE_MODELS
+        from config import RecordStatus
+        pending_for_doi = []
+        for model_cls in SOURCE_MODELS.values():
+            pending_for_doi.extend(
+                db.query(model_cls)
+                .filter(
+                    model_cls.doi == ndoi,
+                    model_cls.status == RecordStatus.PENDING,
+                )
+                .all()
+            )
+        engine._cache = engine._build_cache()
+        for rec in pending_for_doi:
+            try:
+                engine._reconcile_one(rec)
+            except Exception:
+                pass
+        if pending_for_doi or ingested > 0:
+            db.flush()
+
+        recon_stats = engine.reconcile_pending(batch_size=max(ingested + 20, 50))
+
+        # ── Enriquecimiento del canónico ───────────────────────────────────
+        enrich_result = engine.enrich_canonical(pub_id)
+        db.commit()
+        db.refresh(pub)
+
+        # ── Construir respuesta completa ───────────────────────────────────
+        from api.schemas.publications import PublicationDetail, ExternalRecordBrief
+        from db.models import get_all_source_records_for_canonical
+        from api.utils import get_clean_source_id
+
+        ext_records = get_all_source_records_for_canonical(db, pub_id)
+        ext_briefs = [
+            ExternalRecordBrief(
+                id=er.id, source_name=er.source_name, source_id=er.source_id,
+                doi=er.doi, status=er.status, match_type=er.match_type,
+                match_score=er.match_score,
+            ).model_dump()
+            for er in ext_records
+        ]
+        source_links = {
+            er.source_name: get_clean_source_id(er.source_name, er.source_id)
+            for er in ext_records
+            if get_clean_source_id(er.source_name, er.source_id)
+        }
+
+        pub_authors = (
+            db.query(PublicationAuthor, Author)
+            .join(Author, PublicationAuthor.author_id == Author.id)
+            .filter(PublicationAuthor.publication_id == pub_id)
+            .order_by(PublicationAuthor.author_position.asc().nullslast())
+            .all()
+        )
+        authors_out = [
+            {"id": a.id, "name": a.name, "orcid": a.orcid,
+             "position": pa.author_position}
+            for pa, a in pub_authors
+        ]
+
+        return {
+            "pub_id": pub_id,
+            "doi": ndoi,
+            "platforms": platform_results,
+            "records_ingested": ingested,
+            "reconciliation": recon_stats.to_dict() if recon_stats else None,
+            "enrichment": enrich_result,
+            "publication": {
+                "id": pub.id,
+                "doi": pub.doi,
+                "title": pub.title,
+                "publication_year": pub.publication_year,
+                "publication_type": pub.publication_type,
+                "language": pub.language,
+                "source_journal": pub.source_journal,
+                "issn": pub.issn,
+                "abstract": pub.abstract,
+                "keywords": pub.keywords,
+                "publisher": pub.publisher,
+                "is_open_access": pub.is_open_access,
+                "oa_status": pub.oa_status,
+                "citation_count": pub.citation_count,
+                "citations_by_source": pub.citations_by_source or {},
+                "sources_count": pub.sources_count,
+                "field_provenance": pub.field_provenance or {},
+                "external_records": ext_briefs,
+                "source_links": source_links,
+                "authors": authors_out,
+            },
+        }
+
+    return await run_in_threadpool(_run)
+
+
 # ── POST /publications/{id}/fetch-all ────────────────────────────────────────
 
 @router.post(
@@ -1180,6 +1383,94 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
         source_links=source_links,
         field_conflicts=pub.field_conflicts or {},
     )
+
+@router.get("/{pub_id}/source-links", summary="Links de acceso por fuente", tags=["Publicaciones"])
+def get_publication_source_links(pub_id: int, db: Session = Depends(get_db)):
+    """
+    Devuelve, para cada fuente donde está registrada la publicación, todos los
+    links de acceso disponibles: URL directa almacenada, URL canónica de la
+    plataforma (construida a partir del ID), link DOI, y para OpenAlex también
+    la URL open-access y el PDF si existen.
+
+    Útil para mostrar un panel de \"Ver en...\" en el frontend.
+    """
+    pub = db.get(CanonicalPublication, pub_id)
+    if not pub:
+        raise HTTPException(404, "Publicación no encontrada")
+
+    from project.infrastructure.persistence.source_registry import SOURCE_REGISTRY
+
+    def _openalex_profile_url(work_id: str) -> str:
+        if not work_id:
+            return None
+        wid = work_id.strip()
+        if wid.startswith("https://openalex.org/"):
+            return wid
+        return f"https://openalex.org/{wid}"
+
+    def _scopus_profile_url(record) -> str:
+        eid = getattr(record, "eid", None) or getattr(record, "scopus_doc_id", None)
+        if not eid:
+            return None
+        if str(eid).startswith("2-s2.0-"):
+            return f"https://www.scopus.com/record/display.uri?eid={eid}"
+        return f"https://www.scopus.com/inward/record.uri?partnerID=HzOxMe3b&scp={eid}"
+
+    def _wos_profile_url(wos_uid: str) -> str:
+        if not wos_uid:
+            return None
+        uid = wos_uid.strip()
+        if uid.startswith("WOS:"):
+            return f"https://www.webofscience.com/wos/woscc/full-record/{uid}"
+        return f"https://www.webofscience.com/wos/woscc/full-record/WOS:{uid}"
+
+    _BUILDERS = {
+        "openalex":      lambda r: _openalex_profile_url(r.source_id),
+        "scopus":        lambda r: _scopus_profile_url(r),
+        "wos":           lambda r: _wos_profile_url(r.source_id),
+        "cvlac":         lambda r: getattr(r, "url", None),
+        "datos_abiertos": lambda r: getattr(r, "url", None),
+        "gruplac":       lambda r: getattr(r, "url", None),
+    }
+
+    doi_url = f"https://doi.org/{pub.doi}" if pub.doi else None
+
+    sources_out = []
+    for src_def in SOURCE_REGISTRY.all():
+        model_cls = src_def.model_class
+        record = (
+            db.query(model_cls)
+            .filter_by(canonical_publication_id=pub_id)
+            .first()
+        )
+        if record is None:
+            continue
+
+        build_url = _BUILDERS.get(src_def.name, lambda r: getattr(r, "url", None))
+        profile_url = build_url(record)
+
+        entry = {
+            "source":      src_def.name,
+            "source_id":   record.source_id,
+            "profile_url": profile_url,
+            "stored_url":  getattr(record, "url", None),
+            "doi":         record.doi,
+            "status":      record.status,
+        }
+        if src_def.name == "openalex":
+            entry["oa_url"]  = getattr(record, "oa_url", None)
+            entry["pdf_url"] = getattr(record, "pdf_url", None)
+
+        sources_out.append(entry)
+
+    return {
+        "publication_id": pub_id,
+        "title":          pub.title,
+        "doi_url":        doi_url,
+        "sources_count":  len(sources_out),
+        "sources":        sources_out,
+    }
+
 
 @router.get("/{pub_id}/authors", response_model=List[PublicationAuthorRead], summary="Listar autores de una publicación")
 def list_publication_authors(pub_id: int, db: Session = Depends(get_db)):

@@ -101,6 +101,7 @@ class ReconciliationConfig:
     combined_threshold: float = field(default_factory=lambda: float(os.getenv("RECON_COMBINED_THRESHOLD", "85.0")))
     manual_review_threshold: float = field(default_factory=lambda: float(os.getenv("RECON_MANUAL_REVIEW_THRESHOLD", "70.0")))
     author_match_threshold: float = field(default_factory=lambda: float(os.getenv("RECON_AUTHOR_MATCH_THRESHOLD", "40.0")))
+    min_title_word_overlap: int = field(default_factory=lambda: int(os.getenv("RECON_MIN_TITLE_WORD_OVERLAP", "2")))
 
 
 @dataclass(frozen=True)
