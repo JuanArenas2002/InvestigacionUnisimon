@@ -80,7 +80,7 @@ class TestIngestEndpoint:
         from fastapi.testclient import TestClient
         from project.app.main import app
 
-        with patch("project.app.routes.ingest.build_source_registry") as mock_reg:
+        with patch("project.interfaces.api.routers.ingest.build_source_registry") as mock_reg:
             mock_registry = MagicMock()
             mock_registry.source_names = ["scopus", "openalex"]
             mock_reg.return_value = mock_registry
@@ -100,8 +100,8 @@ class TestIngestEndpoint:
         mock_result = make_pipeline_result_dict()
 
         with (
-            patch("project.app.routes.ingest.build_source_registry") as mock_reg,
-            patch("project.app.routes.ingest.build_pipeline") as mock_pipe,
+            patch("project.interfaces.api.routers.ingest.build_source_registry") as mock_reg,
+            patch("project.interfaces.api.routers.ingest.build_pipeline") as mock_pipe,
         ):
             mock_registry = MagicMock()
             mock_registry.source_names = ["mock"]
@@ -133,8 +133,8 @@ class TestIngestEndpoint:
         )
 
         with (
-            patch("project.app.routes.ingest.build_source_registry") as mock_reg,
-            patch("project.app.routes.ingest.build_pipeline") as mock_pipe,
+            patch("project.interfaces.api.routers.ingest.build_source_registry") as mock_reg,
+            patch("project.interfaces.api.routers.ingest.build_pipeline") as mock_pipe,
         ):
             mock_registry = MagicMock()
             mock_registry.source_names = ["mock"]
@@ -161,8 +161,8 @@ class TestIngestEndpoint:
         mock_result = make_pipeline_result_dict()
 
         with (
-            patch("project.app.routes.ingest.build_source_registry") as mock_reg,
-            patch("project.app.routes.ingest.build_pipeline") as mock_pipe,
+            patch("project.interfaces.api.routers.ingest.build_source_registry") as mock_reg,
+            patch("project.interfaces.api.routers.ingest.build_pipeline") as mock_pipe,
         ):
             mock_registry = MagicMock()
             mock_registry.source_names = ["scopus", "openalex", "wos"]
@@ -191,7 +191,7 @@ class TestPublicationsEndpoint:
         from fastapi.testclient import TestClient
         from project.app.main import app
 
-        with patch("project.app.routes.publications.build_repository") as mock_repo_builder:
+        with patch("project.interfaces.api.routers.publications.build_repository") as mock_repo_builder:
             mock_repo = MagicMock()
             mock_repo.list_publications.return_value = [
                 {"id": 1, "title": "Paper 1", "publication_year": 2022},
@@ -211,7 +211,7 @@ class TestPublicationsEndpoint:
         from fastapi.testclient import TestClient
         from project.app.main import app
 
-        with patch("project.app.routes.publications.build_repository") as mock_repo_builder:
+        with patch("project.interfaces.api.routers.publications.build_repository") as mock_repo_builder:
             mock_repo = MagicMock()
             mock_repo.list_publications.return_value = []
             mock_repo_builder.return_value = mock_repo
@@ -229,7 +229,7 @@ class TestPublicationsEndpoint:
         from fastapi.testclient import TestClient
         from project.app.main import app
 
-        with patch("project.app.routes.publications.build_repository"):
+        with patch("project.interfaces.api.routers.publications.build_repository"):
             client = TestClient(app)
             response = client.get("/publications?limit=9999")  # max es 500
 

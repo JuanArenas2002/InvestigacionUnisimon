@@ -11,6 +11,7 @@ from typing import List, Optional
 
 @dataclass(frozen=True)
 class DatabaseSettings:
+    database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL") or os.getenv("DB_URL", ""))
     host: str = field(default_factory=lambda: os.getenv("DB_HOST", "localhost"))
     port: int = field(default_factory=lambda: int(os.getenv("DB_PORT", "5432")))
     database: str = field(default_factory=lambda: os.getenv("DB_NAME", "reconciliacion_bibliografica"))
@@ -19,6 +20,10 @@ class DatabaseSettings:
 
     @property
     def url(self) -> str:
+        if self.database_url:
+            if self.database_url.startswith("postgres://"):
+                return "postgresql://" + self.database_url[len("postgres://"):]
+            return self.database_url
         return (
             f"postgresql://{self.user}:{self.password}"
             f"@{self.host}:{self.port}/{self.database}"

@@ -1,1 +1,1 @@
-"""Capa de entrada FastAPI."""
+# Backward-compatibility shim. New code: use project.interfaces.api

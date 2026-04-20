@@ -4,9 +4,9 @@ from typing import Dict, List, Optional
 
 from sqlalchemy import desc, func, or_, text
 
-from db.models import Author, AuthorAuditLog, AuthorConflict, CanonicalPublication, PublicationAuthor
-from db.session import get_session
-from db.source_registry import SOURCE_REGISTRY
+from project.infrastructure.persistence.models import Author, AuthorAuditLog, AuthorConflict, CanonicalPublication, PublicationAuthor
+from project.infrastructure.persistence.session import get_session
+from project.infrastructure.persistence.source_registry import SOURCE_REGISTRY
 from shared.normalizers import normalize_author_name, normalize_text
 
 from project.domain.models.publication import Publication

@@ -385,9 +385,9 @@ from api.routers import (
     researcher_portal,
 )
 from api.routers.sources import router as sources_router
-from project.app.routes.ingest import router as hex_ingest_router
-from project.app.routes.publications import router as hex_publications_router
-from project.app.routes.author_profile import router as hex_author_profile_router
+from project.interfaces.api.routers.ingest import router as hex_ingest_router
+from project.interfaces.api.routers.publications import router as hex_publications_router
+from project.interfaces.api.routers.author_profile import router as hex_author_profile_router
 
 # ── FASE 1: fuentes independientes ───────────────────────────
 app.include_router(sources_router, prefix="/api")

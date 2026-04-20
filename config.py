@@ -72,6 +72,7 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class DatabaseConfig:
+    database_url: str = field(default_factory=lambda: os.getenv("DATABASE_URL") or os.getenv("DB_URL", ""))
     host: str = field(default_factory=lambda: os.getenv("DB_HOST", "localhost"))
     port: int = field(default_factory=lambda: int(os.getenv("DB_PORT", "5432")))
     database: str = field(default_factory=lambda: os.getenv("DB_NAME", "reconciliacion_bibliografica"))
@@ -81,6 +82,11 @@ class DatabaseConfig:
 
     @property
     def url(self) -> str:
+        if self.database_url:
+            # Compatibilidad con URLs heredadas tipo postgres://
+            if self.database_url.startswith("postgres://"):
+                return "postgresql://" + self.database_url[len("postgres://"):]
+            return self.database_url
         auth = f"{self.user}:{self.password}@" if self.password else f"{self.user}@"
         return f"postgresql://{auth}{self.host}:{self.port}/{self.database}"
 

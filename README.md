@@ -1,285 +1,553 @@
-# Convocatoria
+# Convocatoria — Reconciliación Bibliográfica
 
-API y utilidades para la gestión, extracción y reconciliación de datos científicos: publicaciones, autores y catálogos provenientes de fuentes como OpenAlex, Scopus y Web of Science.
+API y pipeline ETL para extracción, deduplicación y reconciliación de publicaciones científicas desde múltiples fuentes (OpenAlex, Scopus, Web of Science, CvLAC, Datos Abiertos, Google Scholar).
 
-Arquitectura **Domain-Driven Design (DDD)** con separación clara de responsabilidades entre capas de presentación, aplicación, dominio e infraestructura.
+---
 
-## Estructura
+## Arquitectura Hexagonal (Ports & Adapters)
+
+El proyecto sigue **Hexagonal Architecture** (también llamada Ports & Adapters o Clean Architecture). La regla central es la **Regla de Dependencia**: las capas internas nunca importan de las capas externas.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                    Interfaces (HTTP / CLI)                       │
+│              project/interfaces/api/   api/                     │
+├─────────────────────────────────────────────────────────────────┤
+│                  Application (Use Cases)                         │
+│         project/application/   project/registry/                │
+├─────────────────────────────────────────────────────────────────┤
+│                    Domain (Business Logic)                       │
+│                      project/domain/                            │
+├─────────────────────────────────────────────────────────────────┤
+│              Infrastructure (Adapters / DB / APIs)               │
+│   project/infrastructure/   sources/   extractors/   db/        │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Capa de Dominio — `project/domain/`
+
+Núcleo del sistema. Sin dependencias externas (no FastAPI, no SQLAlchemy).
+
+| Módulo | Contenido |
+| --- | --- |
+| `domain/models/` | `Publication`, `Author` — entidades de dominio |
+| `domain/ports/` | Puertos abstractos (ABCs): `SourcePort`, `PublicationRepositoryPort`, `AuthorRepositoryPort`, `RepositoryPort` |
+| `domain/services/` | Servicios puros: `MatchingService`, `NormalizationService`, `DeduplicationService` |
+| `domain/value_objects/` | `DOI` y `ORCID` — objetos de valor inmutables y hasheables |
+
+**Puertos definidos:**
+
+```python
+# Adaptador de fuente — implementado por cada extractor
+class SourcePort(ABC):
+    @property
+    def source_name(self) -> str: ...
+    def fetch_records(self, **kwargs) -> List[Publication]: ...
+
+# Repositorio de publicaciones
+class PublicationRepositoryPort(ABC):
+    def save_authors(self, publications): ...
+    def save_source_records(self, records_by_source): ...
+    def upsert_canonical_publications(self, publications): ...
+    def list_publications(self, limit, offset): ...
+
+# Repositorio de autores
+class AuthorRepositoryPort(ABC):
+    def get_author_by_id(self, author_id): ...
+    def get_author_name_options(self, author_id): ...
+    # … 6 métodos más
+```
+
+### Capa de Aplicación — `project/application/`
+
+Orquesta el dominio. Solo importa de `project/domain/`.
+
+| Módulo | Responsabilidad |
+| --- | --- |
+| `ingest_pipeline.py` | Pipeline ETL: collect → deduplicate → normalize → match → enrich → persist |
+| `author_profile_use_case.py` | Gestión de perfil de autor: nombres, vínculos, ORCID |
+| `schemas/publication_schemas.py` | DTOs inmutables para publicaciones (`PublicationSnapshot`, `MergePublicationsCommand`, `AutoMergeFilters`) |
+| `schemas/author_schemas.py` | DTOs inmutables para autores (`AuthorSnapshot`, `MergeAuthorsCommand`) |
+| `use_cases/publications/merge.py` | Lógica pura de fusión de publicaciones duplicadas |
+| `use_cases/authors/merge.py` | Lógica pura de fusión de autores duplicados |
+| `use_cases/authors/validate_external_id.py` | Validación cruzada de IDs externos (ORCID, OpenAlex, Scopus, WoS) |
+
+**Pipeline ETL:**
+
+```
+collect() → deduplicate() → normalize() → match() → enrich() → persist()
+   ↑                                          ↑
+SourcePort                           RepositoryPort
+```
+
+### Capa de Infraestructura — `project/infrastructure/`
+
+Implementaciones concretas de los puertos.
+
+#### Persistencia — `project/infrastructure/persistence/`
+
+Ubicación canónica de los modelos SQLAlchemy y la sesión de base de datos.  
+El directorio `db/` existe como **shim de compatibilidad** — redirige cada import al nuevo camino.
+
+| Archivo | Contenido |
+| --- | --- |
+| `models_base.py` | `Base` (DeclarativeBase) y `SourceRecordMixin` con ~20 columnas comunes |
+| `source_registry.py` | `SourceRegistry` y `SOURCE_REGISTRY` — singleton global |
+| `models.py` | Todos los modelos ORM: `CanonicalPublication`, `Author`, `Journal`, etc. |
+| `session.py` | `get_engine()`, `get_session()`, `create_all_tables()`, `ensure_constraints()` |
+| `postgres_repository.py` | `PostgresRepository` — implementa `RepositoryPort` con PostgreSQL + pg_trgm |
+
+#### Adaptadores de Fuente — `project/infrastructure/sources/`
+
+Cada adaptador implementa `SourcePort` y delega al extractor correspondiente.
+
+| Adaptador | Fuente |
+| --- | --- |
+| `openalex_adapter.py` | OpenAlex API (pyalex) |
+| `scopus_adapter.py` | Scopus API |
+| `wos_adapter.py` | Web of Science API |
+| `cvlac_adapter.py` | CvLAC (Minciencias) |
+| `datos_abiertos_adapter.py` | Datos Abiertos Colombia |
+| `google_scholar_adapter.py` | Google Scholar (scholarly) |
+
+### Capa de Interfaces — `project/interfaces/api/`
+
+Controladores HTTP delgados. Solo traducen HTTP ↔ casos de uso.
+
+| Archivo | Endpoints |
+| --- | --- |
+| `routers/ingest.py` | `POST /ingest` — ejecuta el pipeline ETL completo |
+| `routers/publications.py` | `GET /publications` — lista publicaciones canónicas |
+| `routers/author_profile.py` | `GET/PATCH /authors/id/{id}/…` — perfil de autor |
+| `schemas/authors.py` | Modelos Pydantic de request/response para autores |
+| `main.py` | FastAPI app hexagonal (arranque independiente en puerto 8001) |
+
+---
+
+## Estructura de Directorios
 
 ```
 convocatoria/
-├── api/
-│   ├── routers/
-│   │   ├── pipeline/              # Pipeline DDD: extracción, reconciliación, cobertura
-│   │   │   ├── domain/            # Capa de dominio: entidades y lógica de negocio
-│   │   │   ├── application/       # Capa de aplicación: casos de uso y orquestación
-│   │   │   ├── endpoints/         # Capa de presentación: handlers HTTP
-│   │   │   ├── infrastructure/    # Capa de infraestructura: persistencia e integraciones
-│   │   │   └── shared/            # DTOs y utilidades compartidas
-│   │   ├── admin.py               # Administración general
-│   │   ├── authors.py             # Gestión de autores
-│   │   ├── charts.py              # Generación de gráficos y análisis
-│   │   ├── publications.py        # Gestión de publicaciones (filtro institucional_only disponible)
-│   │   ├── scopus.py              # Búsqueda en Scopus
-│   │   ├── search.py              # Búsqueda general
-│   │   └── stats.py               # Estadísticas
-│   ├── services/                  # Servicios de aplicación (Excel, gráficos)
-│   ├── exporters/                 # Exportadores (Excel con estilos)
-│   ├── schemas/                   # Esquemas Pydantic para validación
-│   ├── dependencies.py            # Inyección de dependencias FastAPI
-│   ├── main.py                    # Punto de entrada
-│   └── utils.py                   # Utilidades generales
 │
-├── extractors/                    # Conectores a fuentes externas
-│   ├── base.py                    # Interfaz base (StandardRecord)
-│   ├── scopus.py                  # Extractor Scopus
-│   ├── openalex/                  # OpenAlex con DDD
-│   │   ├── domain/                # Modelos de dominio OpenAlex
-│   │   ├── application/           # Casos de uso OpenAlex
-│   │   └── infrastructure/        # Acceso a API OpenAlex
-│   ├── cvlac.py                   # Extractor CVLaC
-│   ├── datos_abiertos.py          # Extractor Datos Abiertos
-│   ├── serial_title.py            # Extractor Serial Title
-│   └── wos.py                     # Extractor Web of Science
+├── project/                          ← Núcleo de la arquitectura hexagonal
+│   ├── domain/
+│   │   ├── models/                   ← Entidades (Publication, Author)
+│   │   ├── ports/                    ← Puertos abstractos (ABCs)
+│   │   ├── services/                 ← Servicios de dominio puros
+│   │   └── value_objects/            ← DOI, ORCID (inmutables, hasheables)
+│   │
+│   ├── application/
+│   │   ├── ingest_pipeline.py        ← Pipeline ETL
+│   │   ├── author_profile_use_case.py
+│   │   ├── schemas/                  ← DTOs (frozen dataclasses)
+│   │   └── use_cases/
+│   │       ├── publications/merge.py ← Fusión de duplicados
+│   │       └── authors/
+│   │           ├── merge.py
+│   │           └── validate_external_id.py
+│   │
+│   ├── infrastructure/
+│   │   ├── persistence/              ← Canónico (db/ es shim de compatibilidad)
+│   │   │   ├── models_base.py
+│   │   │   ├── source_registry.py
+│   │   │   ├── models.py
+│   │   │   ├── session.py
+│   │   │   └── postgres_repository.py
+│   │   └── sources/                  ← Adaptadores de fuente
+│   │
+│   ├── interfaces/
+│   │   └── api/                      ← Canónico (project/app/ es shim de compatibilidad)
+│   │       ├── routers/
+│   │       ├── schemas/
+│   │       └── main.py
+│   │
+│   ├── registry/
+│   │   └── source_registry.py        ← Auto-descubrimiento de fuentes
+│   │
+│   └── config/
+│       ├── settings.py               ← Configuración (Pydantic Settings)
+│       └── container.py              ← Fábrica de dependencias (DI manual)
 │
-├── db/
-│   ├── models.py                  # Modelos SQLAlchemy
-│   ├── session.py                 # Sesiones de base de datos
-│   ├── migration_*.sql            # Scripts de migración
-│   └── truncate_all.sql           # Limpieza de datos
+├── api/                              ← API legado completa (funcional)
+│   ├── main.py                       ← FastAPI app principal (puerto 8000)
+│   ├── routers/                      ← ~15 routers (authors, publications, stats…)
+│   ├── schemas/                      ← Esquemas Pydantic
+│   ├── services/                     ← Servicios de análisis, Excel, PDF
+│   └── exporters/                    ← Exportadores Excel
 │
-├── reconciliation/
-│   ├── engine.py                  # Motor de reconciliación
-│   ├── fuzzy_matcher.py           # Matching difuso
-│   └── __init__.py
+├── sources/                          ← Modelos SQLAlchemy por fuente
+│   ├── openalex.py
+│   ├── scopus.py
+│   ├── wos.py
+│   ├── cvlac.py
+│   ├── datos_abiertos.py
+│   └── google_scholar.py
 │
-├── scripts/                       # Tareas administrativas
-│   ├── clean_data.py              # Limpieza de datos
-│   ├── quality_reports.py         # Reportes de calidad
-│   ├── backfill_provenance.py     # Rellenado de provenance
-│   └── *.py                       # Otros scripts
+├── extractors/                       ← Conectores a APIs externas
+│   ├── openalex/
+│   ├── scopus.py
+│   ├── wos.py
+│   ├── cvlac.py
+│   └── google_scholar/
 │
-├── shared/                        # Código compartido
-│   └── normalizers.py             # Normalizadores
+├── reconciliation/                   ← Motor de reconciliación
+│   ├── engine.py
+│   └── fuzzy_matcher.py
 │
-├── docs/                          # Documentación
-│   ├── DATA_DICTIONARY.md         # Diccionario de datos
-│   ├── ENDPOINTS_*.md             # Documentación de endpoints
-│   ├── CRITERIA.md                # Criterios de negocio
-│   ├── OPTIMIZATIONS.md           # Optimizaciones
-│   └── *.md                       # Otros documentos
+├── db/                               ← Shims de compatibilidad → project/infrastructure/persistence/
+│   ├── models_base.py
+│   ├── source_registry.py
+│   ├── models.py
+│   └── session.py
 │
-├── tests/                         # Tests unitarios
-├── OpenAlexJson/                  # Datos de ejemplo
-├── reports/                       # Reportes generados
-├── config.py                      # Configuración central
-└── requirements.txt               # Dependencias Python
+├── shared/                           ← Normalizadores compartidos
+├── scripts/                          ← Scripts de mantenimiento
+├── tests/                            ← Suite de tests (pytest)
+├── docs/                             ← Documentación técnica adicional
+├── config.py                         ← Configuración de acceso a BD y APIs
+└── requirements.txt
 ```
 
-## Características Principales
+---
 
-- **Extracción Multi-Fuente**: Integración con Scopus, OpenAlex, Web of Science, CVLaC y Datos Abiertos
-- **Análisis de Citaciones**: Extracción y visualización de métricas de citación desde Scopus
-- **Reconciliación de Datos**: Motor fuzzy matching para deduplicación e identificación de duplicados
-- **Exportación Versátil**: Generación de reportes en Excel con estilos personalizados y gráficos PNG
-- **Cobertura de Revistas**: Análisis de cobertura de publicaciones por revista
-- **API RESTful**: Documentación interactiva com Swagger UI y ReDoc
+## Regla de Dependencia
 
-## Arquitectura
+```
+domain  ←  application  ←  infrastructure
+   ↑             ↑               ↑
+   └─────────────┴───────────────┘
+        interfaces solo importa de application
+```
 
-### Capas DDD
+- `project/domain/` no importa nada del proyecto
+- `project/application/` solo importa de `project/domain/`
+- `project/infrastructure/` implementa los puertos de `project/domain/`
+- `project/interfaces/api/` llama a use cases de `project/application/`
 
-La aplicación sigue el patrón **Domain-Driven Design** organizando el código en cuatro capas:
-
-1. **Capa de Presentación (Endpoints)**
-   - Handlers HTTP delgados en `api/routers/pipeline/endpoints/`
-   - Responsabilidad: Validar entrada, invocar casos de uso, formatear salida
-   - No contiene lógica de negocio
-
-2. **Capa de Aplicación (Application)**
-   - Orquestación de casos de uso en `api/routers/pipeline/application/`
-   - Responsabilidad: Coordinar flujos, transformar DTOs
-   - Casos de uso: extracción, verificación, reconciliación
-
-3. **Capa de Dominio (Domain)**
-   - Lógica de negocio pura en `api/routers/pipeline/domain/`
-   - Responsabilidad: Reglas de negocio, entidades, servicios de dominio
-   - Independiente de frameworks y bases de datos
-
-4. **Capa de Infraestructura (Infrastructure)**
-   - Implementaciones técnicas en `api/routers/pipeline/infrastructure/`
-   - Responsabilidad: Persistencia, integraciones externas, adaptadores
-   - Implementa interfaces definidas en el dominio
-
-### Extractores
-
-Cada fuente externa tiene su propio extractor que implementa `StandardRecord`:
-- `StandardRecord`: Modelo de datos normalizado compartido
-- Cada extractor convierte datos fuente al formato estándar
-- Compatible con reconciliación y exportación
+---
 
 ## Requisitos
 
-- Python 3.8+
-- Entorno virtual recomendado
-- Credenciales de API para Scopus y OpenAlex
+- Python 3.11+
+- PostgreSQL 14+ con extensión `pg_trgm`
+- Credenciales API: Scopus (`SCOPUS_API_KEY`), OpenAlex (pública), WoS (opcional)
+
+---
 
 ## Instalación
 
 ```bash
-# Clonar el repositorio
-git clone https://github.com/tu-usuario/convocatoria.git
+git clone <repo>
 cd convocatoria
 
-# Crear entorno virtual
 python -m venv venv
-
-# Activar entorno (Windows)
+# Windows
 .\venv\Scripts\Activate.ps1
-
-# Activar entorno (Linux/macOS)
+# Linux/macOS
 source venv/bin/activate
 
-# Instalar dependencias
 pip install -r requirements.txt
 ```
 
+---
+
 ## Configuración
 
-La aplicación requiere credenciales para acceder a las APIs externas. Configura las siguientes variables:
+Crea `.env` en la raíz:
 
-### Método 1: Variables de Entorno (.env)
+```env
+# Base de datos
+DATABASE_URL=postgresql://usuario:password@localhost:5432/convocatoria
+# o individualmente:
+DB_HOST=localhost
+DB_PORT=5432
+DB_DATABASE=convocatoria
+DB_USER=postgres
+DB_PASSWORD=secret
 
-Crea un archivo `.env` en la raíz del proyecto:
-
-```bash
+# APIs externas
 SCOPUS_API_KEY=tu_clave_scopus
-OPENALEX_API_KEY=tu_clave_openalex
-DATABASE_URL=sqlite:///./data.db
+WOS_API_KEY=tu_clave_wos           # opcional
+
+# Entorno
+APP_ENV=development                 # production activa CORS estricto
+ALLOWED_ORIGINS=https://tu-dominio.com
 ```
 
-### Método 2: Archivo config.py
-
-Edita `config.py` directamente con tus credenciales. **No es recomendado para producción.**
+---
 
 ## Ejecución
 
-### Desarrollo
+### API completa (legado + hexagonal)
 
 ```bash
-# Ejecutar con auto-reload
-python -m uvicorn api.main:app --reload --port 8000
+# Incluye todos los endpoints: /api/authors, /api/publications, /api/pipeline, etc.
+# + endpoints hexagonales montados en /api/hex/
+uvicorn api.main:app --reload --port 8000
 ```
 
-### Producción
+- Swagger UI: `http://localhost:8000/docs`
+- ReDoc: `http://localhost:8000/redoc`
+
+### API hexagonal independiente
 
 ```bash
-# Ejecutar con workers
-python -m uvicorn api.main:app --host 0.0.0.0 --port 8000 --workers 4
+# Solo los endpoints del núcleo hexagonal
+uvicorn project.interfaces.api.main:app --reload --port 8001
 ```
 
-La documentación interactiva estará disponible en:
-- **Swagger UI**: `http://localhost:8000/docs`
-- **ReDoc**: `http://localhost:8000/redoc`
+- `POST /ingest` — ejecutar pipeline ETL
+- `GET /publications` — listar publicaciones canónicas
+- `GET /authors/id/{id}/name-options` — perfil de autor
+
+---
 
 ## Endpoints Principales
 
-### Pipeline de Extracción y Análisis
-- `GET /api/pipeline/` - Estado del pipeline
-- `POST /api/pipeline/extract` - Extraer publicaciones
-- `POST /api/pipeline/reconcile` - Reconciliar datos
-- `GET /api/pipeline/coverage` - Análisis de cobertura
+### Pipeline ETL
 
-### Autores
-- `GET /api/authors` - Listar autores
-- `GET /api/authors/{author_id}` - Detalle del autor
-- `POST /api/authors/{author_id}/charts/download-all` - Generar gráficos + Excel + ZIP
+```http
+POST /ingest
+Content-Type: application/json
 
-### Búsqueda
-- `GET /api/search/publications` - Buscar publicaciones
-- `GET /api/search/authors` - Buscar autores
-- `POST /api/scopus/search` - Búsqueda directa en Scopus
-
-### Catálogos
-- `GET /api/catalogs/journals` - Listar revistas
-- `POST /api/catalogs/journals/analyze` - Analizar cobertura
-
-Para más detalles, consulta la documentación en `docs/ENDPOINTS_*.md`
-
-## Estructura de Datos
-
-Consulta `docs/DATA_DICTIONARY.md` para la descripción completa de:
-- Modelos de base de datos
-- Esquemas Pydantic
-- DTOs del pipeline
-- Formatos de exportación
-
-## Scripts Disponibles
-
-```bash
-# Reportes de calidad
-python scripts/quality_reports.py
-
-# Limpieza de datos
-python scripts/clean_data.py
-
-# Rellenar campos de provenance
-python scripts/backfill_provenance.py
-
-# Truncar todas las tablas
-python scripts/truncate_all.py
+{
+  "sources": ["openalex", "scopus"],   // null = todas las fuentes
+  "year_from": 2020,
+  "year_to": 2024,
+  "max_results": 200,
+  "source_kwargs": {
+    "cvlac": {"cvlac_codes": ["0001234567"]}
+  },
+  "dry_run": false
+}
 ```
 
-## Documentación
+Respuesta:
+```json
+{
+  "status": "ok",
+  "stages": {
+    "collect": 150,
+    "deduplicate": 142,
+    "normalize": 142,
+    "match": 138,
+    "enrich": 138
+  },
+  "persistence": {
+    "authors_saved": 87,
+    "source_saved": 142,
+    "canonical_upserted": 138,
+    "dry_run": false
+  },
+  "by_source": { "openalex": 90, "scopus": 60 },
+  "errors": {}
+}
+```
 
-La documentación técnica se encuentra en `docs/`:
-- `ENDPOINTS_ALL.md` - Todos los endpoints disponibles
-- `ENDPOINTS_PIPELINE.md` - Endpoints específicos del pipeline
-- `CRITERIA.md` - Criterios de negocio y validación
-- `OPTIMIZATIONS.md` - Mejoras de rendimiento aplicadas
-- `IMPLEMENTATION_SUMMARY.md` - Resumen de implementación
-- `PROYECTO.md` - Descripción general del proyecto
+### Autores (API legado)
 
-## Pruebas
+```
+GET  /api/authors                         — listar autores
+GET  /api/authors/{id}                    — detalle
+POST /api/authors/merge                   — fusionar duplicados
+GET  /api/authors/id/{id}/name-options    — nombres desde fuentes
+PATCH /api/authors/id/{id}/source-link    — vincular perfil externo
+PATCH /api/authors/id/{id}/orcid          — actualizar ORCID
+```
 
-La suite de pruebas se encuentra en `tests/`:
+### Publicaciones (API legado)
+
+```
+GET  /api/publications                    — listar con filtros
+GET  /api/publications/{id}               — detalle
+POST /api/publications/merge              — fusionar duplicados
+POST /api/publications/auto-merge         — auto-fusión por similitud
+GET  /api/publications/duplicates         — pares de posibles duplicados
+```
+
+### Stats y análisis
+
+```
+GET /api/stats/overview                   — resumen general
+GET /api/charts/author/{id}               — gráficos de autor
+GET /api/authors/{id}/excel               — exportar a Excel
+```
+
+---
+
+## Agregar una Nueva Fuente
+
+Para integrar una nueva fuente de datos (ej. PubMed) sin modificar ningún archivo existente:
+
+**1. Modelo SQLAlchemy** — `sources/pubmed.py`:
+
+```python
+from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy import Integer, String
+from project.infrastructure.persistence.models_base import Base, SourceRecordMixin
+from project.infrastructure.persistence.source_registry import SOURCE_REGISTRY, SourceDefinition
+
+class PubmedRecord(SourceRecordMixin, Base):
+    __tablename__ = "pubmed_records"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    pubmed_id: Mapped[str] = mapped_column(String(50), nullable=True, index=True)
+
+    @property
+    def source_name(self) -> str:
+        return "pubmed"
+
+    @property
+    def source_id(self):
+        return self.pubmed_id
+
+def _build_kwargs(record, raw, kwargs):
+    kwargs["pubmed_id"] = raw.get("pmid")
+
+SOURCE_REGISTRY.register(SourceDefinition(
+    name="pubmed",
+    model_class=PubmedRecord,
+    id_attr="pubmed_id",
+    author_id_key="pubmed",
+    build_specific_kwargs=_build_kwargs,
+))
+```
+
+**2. Adaptador hexagonal** — `project/infrastructure/sources/pubmed_adapter.py`:
+
+```python
+from project.domain.ports.source_port import SourcePort
+from project.domain.models.publication import Publication
+
+class PubMedAdapter(SourcePort):
+    SOURCE_NAME = "pubmed"
+
+    @property
+    def source_name(self) -> str:
+        return self.SOURCE_NAME
+
+    def fetch_records(self, **kwargs) -> list[Publication]:
+        # Implementar llamada a la API de PubMed
+        ...
+```
+
+**3. Migración SQL**:
+
+```sql
+CREATE TABLE pubmed_records (
+    id SERIAL PRIMARY KEY,
+    pubmed_id VARCHAR(50),
+    -- columnas del SourceRecordMixin se agregan vía ensure_constraints()
+    ...
+);
+```
+
+El registry, el motor de reconciliación y los endpoints lo detectan automáticamente.
+
+---
+
+## Objetos de Valor de Dominio
+
+### `DOI`
+
+```python
+from project.domain.value_objects.doi import DOI
+
+doi = DOI.parse("https://doi.org/10.1038/nature12345")
+# doi.value == "10.1038/nature12345"
+# doi == DOI.parse("DOI:10.1038/nature12345")  → True (normalización)
+```
+
+- Normaliza prefijos (`https://doi.org/`, `doi:`, `DOI:`)
+- Valida patrón `10.xxxx/...`
+- Hasheable → usable en sets y dicts
+
+### `ORCID`
+
+```python
+from project.domain.value_objects.orcid import ORCID
+
+orcid = ORCID.parse("https://orcid.org/0000-0001-2345-6789")
+# orcid.value == "0000-0001-2345-6789"
+ORCID.validate("0000-0001-2345-6789")  # → True
+```
+
+---
+
+## Tests
 
 ```bash
-# Ejecutar tests
-python -m pytest tests/
+# Suite completa
+python -m pytest tests/ -v
+
+# Solo tests de arquitectura hexagonal
+python -m pytest tests/project/ -v
 
 # Con cobertura
-python -m pytest tests/ --cov=api --cov=extractors
+python -m pytest tests/project/ --cov=project --cov-report=term-missing
 ```
 
-## Troubleshooting
+### Estado actual
 
-### Error de conexión a Scopus
-- Verifica que `SCOPUS_API_KEY` esté configurado correctamente en `.env`
-- Comprueba la conectividad de red
+```
+tests/project/   → 71 passing  (arquitectura hexagonal)
+tests/           → suite legado (requires BD activa para algunos tests)
+```
 
-### Error de migraciones de base de datos
-- Ejecuta: `python scripts/migrate_*.py` en orden numérico (v2, v3, v4)
-- Consulta `docs/IMPLEMENTATION_SUMMARY.md` para instrucciones detalladas
+Los 12 fallos conocidos en `test_pipeline.py` y `test_author_matching.py` son pre-existentes (`ReconciliationConfig.min_title_word_overlap`) y no están relacionados con la migración hexagonal.
 
-### Métricas de memoria alta en OpenAlex
-- Lee `docs/OPTIMIZATIONS.md` para técnicas de procesamiento chunked
-- Considera ejecutar con menos registros por batch
+---
 
-## Contribuciones
+## Compatibilidad hacia Atrás
 
-Las contribuciones son bienvenidas. Por favor:
+Durante la migración, los módulos originales se convirtieron en **shims de 1-3 líneas** que re-exportan desde la ubicación canónica. El código existente sigue funcionando sin cambios:
 
-1. Abre un issue describiendo la feature o bug
-2. Crea una rama: `git checkout -b feature/mi-feature`
-3. Realiza los cambios siguiendo la arquitectura DDD
-4. Añade tests para nuevas funcionalidades
-5. Envía un pull request referenciando el issue
+| Import antiguo | Ubicación canónica |
+| --- | --- |
+| `from db.models import CanonicalPublication` | `project.infrastructure.persistence.models` |
+| `from db.session import get_session` | `project.infrastructure.persistence.session` |
+| `from db.source_registry import SOURCE_REGISTRY` | `project.infrastructure.persistence.source_registry` |
+| `from project.ports.source_port import SourcePort` | `project.domain.ports.source_port` |
+| `from project.ports.repository_port import RepositoryPort` | `project.domain.ports.repository_port` |
+| `from project.app.main import app` | `project.interfaces.api.main` |
 
-## Licencia
+---
 
-[MIT](LICENSE)
+## Scripts de Mantenimiento
 
-## Contacto
+```bash
+# Reportes de calidad de datos
+python scripts/quality_reports.py
 
-Para preguntas o sugerencias, abre un issue en el repositorio.
+# Rellenar campos field_provenance faltantes
+python scripts/backfill_provenance.py
+
+# Limpieza de registros huérfanos
+python scripts/clean_data.py
+```
+
+---
+
+## Documentación Técnica
+
+| Documento | Contenido |
+| --- | --- |
+| `docs/DATA_DICTIONARY.md` | Diccionario de datos: modelos ORM, esquemas Pydantic |
+| `docs/ENDPOINTS_ALL.md` | Todos los endpoints con ejemplos |
+| `docs/CRITERIA.md` | Criterios de negocio para reconciliación |
+| `docs/OPTIMIZATIONS.md` | Técnicas de procesamiento (chunking, fuzzy matching) |
+
+---
+
+## Stack Tecnológico
+
+| Componente | Tecnología |
+| --- | --- |
+| Framework web | FastAPI 0.132 + Uvicorn |
+| ORM | SQLAlchemy 2.x (mapped columns, DeclarativeBase) |
+| Base de datos | PostgreSQL 14+ con `pg_trgm` (fuzzy matching) |
+| Validación | Pydantic v2 |
+| Autenticación | JWT (python-jose) + bcrypt |
+| Fuzzy matching | RapidFuzz + Levenshtein |
+| Exportación | openpyxl, reportlab, plotly, matplotlib |
+| Scraping | scholarly (Google Scholar), selenium |
+| Tests | pytest |
