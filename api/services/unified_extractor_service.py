@@ -1226,91 +1226,31 @@ class UnifiedExtractorService:
             
             logger.info(f"Reconciliando {len(all_records)} registros...")
             
-            # ─ PASO CRÍTICO: Separar registros por 2 categorías:
-            # 1. Que YA EXISTEN en BD (solo asignar)
-            # 2. Que SON NUEVOS (reconciliar + crear)
-            
-            records_already_exist = []
-            records_new = []
-            
-            for record in all_records:
-                existing_pub = self._find_existing_canonical(record)
-                if existing_pub:
-                    records_already_exist.append((record, existing_pub))
-                else:
-                    records_new.append(record)
-            
-            logger.info(
-                f"Análisis de duplicados:\n"
-                f"  - Ya existen en BD: {len(records_already_exist)}\n"
-                f"  - Son nuevos: {len(records_new)}"
-            )
-            
-            # ─ FASE 1: Para los que YA EXISTEN → solo asignar al autor
-            already_existed_count = 0
-            for record, canonical_pub in records_already_exist:
-                try:
-                    existing_link = self.db.query(PublicationAuthor).filter(
-                        PublicationAuthor.publication_id == canonical_pub.id,
-                        PublicationAuthor.author_id == author.id,
-                    ).first()
-                    
-                    if not existing_link:
-                        pub_author = PublicationAuthor(
-                            publication_id=canonical_pub.id,
-                            author_id=author.id,
-                            is_institutional=author.is_institutional,
-                        )
-                        self.db.add(pub_author)
-                        already_existed_count += 1
-                        logger.debug(
-                            f"✓ Asignada publicación existente: {canonical_pub.title[:50]}... "
-                            f"(ya estaba en BD, solo se vinculó al autor)"
-                        )
-                except Exception as e:
-                    logger.error(f"Error asignando publicación existente: {e}")
-            
-            self.db.commit()
-            
-            # ─ FASE 2: Para los NUEVOS → ejecutar reconciliación normal
-            stats = None
-            if records_new:
-                logger.info(f"Reconciliando {len(records_new)} publicaciones NUEVAS...")
-                engine = ReconciliationEngine(session=self.db)
-                stats = engine.reconcile_batch(records_new)
-                # CRÍTICO: Hacer flush para que las canónicas recién creadas sean visibles en queries posteriores
-                self.db.flush()
-            else:
-                # Si todos ya existían, crear stats dummy
-                from reconciliation.engine import ReconciliationStats
-                stats = ReconciliationStats(
-                    total_processed=len(records_already_exist),
-                    doi_exact_matches=0,
-                    fuzzy_high_matches=0,
-                    fuzzy_combined_matches=0,
-                    manual_review=0,
-                    new_canonical=0,
-                    errors=0,
-                )
+            # Reconciliar TODOS los registros a través del engine.
+            # El engine maneja dedup de source records, matching DOI/fuzzy, y llama
+            # _ingest_authors para TODOS los autores (no solo el principal).
+            engine = ReconciliationEngine(session=self.db)
+            stats = engine.reconcile_batch(all_records)
+            # Flush para que las canónicas recién creadas sean visibles en queries posteriores
+            self.db.flush()
 
             # Guardar estadísticas en el perfil
             profile.reconciliation_status = "completed"
             stats_dict = stats.to_dict()
-            stats_dict['already_existed'] = already_existed_count
             profile.reconciliation_stats = stats_dict
 
-            # ─ FASE 3: Vincular los registros NUEVOS creados (como antes)
-            logger.info(f"Vinculando {len(records_new)} publicaciones NUEVAS al autor...")
-            self._link_author_to_publications(author, records_new)
-            
+            # Vincular el autor principal a sus publicaciones (safety net — _ingest_authors
+            # ya lo hace, pero este paso cubre casos donde el record fue deduplicado/skipped)
+            logger.info(f"Vinculando autor principal a sus publicaciones...")
+            self._link_author_to_publications(author, all_records)
+
             logger.info(
-                f"✓ Reconciliación completada (RESPONSABLE & SEGURA):\n"
-                f"  - Publicaciones que YA EXISTÍAN y se asignaron: {already_existed_count}\n"
-                f"  - Publicaciones NUEVAS procesadas: {len(records_new)}\n"
+                f"✓ Reconciliación completada:\n"
+                f"  - Total registros: {len(all_records)}\n"
                 f"  - DOI exacto: {stats.doi_exact_matches}\n"
                 f"  - Fuzzy alto: {stats.fuzzy_high_matches}\n"
                 f"  - Nuevos canónicos: {stats.new_canonical}\n"
-                f"  - Total VINCULADAS al autor: {already_existed_count + len(records_new)}"
+                f"  - Revisión manual: {stats.manual_review}"
             )
             
         except Exception as e:

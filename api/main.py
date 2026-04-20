@@ -615,22 +615,16 @@ def extract_google_scholar(request: GoogleScholarExtractRequest):
     from project.config.container import build_pipeline
     
     try:
-        logger.info(f"Extrayendo de Google Scholar: {request.scholar_ids}")
-        print(f"\n[DEBUG ENDPOINT] Iniciando extracción de Google Scholar para: {request.scholar_ids}")
-        
-        # Validar entrada
+        logger.info("Extrayendo de Google Scholar: %s", request.scholar_ids)
+
         if not request.scholar_ids:
             return {
                 "status": "error",
                 "error": "scholar_ids vacío o no proporcionado",
                 "ejemplo": {"scholar_ids": ["V94aovUAAAAJ"]}
             }
-        
-        print(f"[DEBUG ENDPOINT] Construyendo pipeline...")
-        pipeline = build_pipeline(["google_scholar"])
-        print(f"[DEBUG ENDPOINT] Pipeline construido exitosamente")
 
-        print(f"[DEBUG ENDPOINT] Iniciando ejecución del pipeline...")
+        pipeline = build_pipeline(["google_scholar"])
         result = pipeline.run(
             year_from=request.year_from,
             year_to=request.year_to,
@@ -642,7 +636,6 @@ def extract_google_scholar(request: GoogleScholarExtractRequest):
                 }
             }
         )
-        print(f"[DEBUG ENDPOINT] Pipeline ejecutado. Resultados: {result.collected} recolectados, {result.source_saved if not request.dry_run else 0} guardados")
 
         return {
             "status": "success",
@@ -660,47 +653,10 @@ def extract_google_scholar(request: GoogleScholarExtractRequest):
         }
         
     except Exception as e:
-        logger.error(f"Error en Google Scholar extraction: {str(e)}")
-        print(f"[DEBUG ENDPOINT] ERROR: {str(e)}")
-        import traceback
-        logger.error(traceback.format_exc())
-        print(traceback.format_exc())
+        logger.error("Error en Google Scholar extraction: %s", e, exc_info=True)
         return {
             "status": "error",
             "error": str(e),
             "tipo": type(e).__name__,
         }
 
-
-# ─────────────────────────────────────────────────────────────
-# ROOT
-# ─────────────────────────────────────────────────────────────
-
-@app.get("/", tags=["General"], summary="Estado del servicio")
-def root():
-    """Retorna información básica del servicio y enlaces de navegación."""
-    return {
-        "servicio": "Reconciliación Bibliográfica API",
-        "version": "2.0.0",
-        "estado": "activo",
-        "enlaces": {
-            "documentacion_swagger": "/docs",
-            "documentacion_redoc":   "/redoc",
-            "health":                "/api/stats/health",
-            "estadisticas":          "/api/stats/summary",
-        },
-        "flujo": {
-            "fase_1_fuentes": {
-                "google_scholar": "/api/scholar/test",
-                "openalex":       "/api/sources/openalex/search/by-institution",
-                "scopus":         "/api/sources/scopus/search/by-institution",
-                "wos":            "/api/sources/wos/search/by-institution",
-                "cvlac":          "/api/sources/cvlac/search/by-author",
-                "datos_abiertos": "/api/sources/datos-abiertos/search/by-institution",
-            },
-            "fase_2_reconciliacion": "/api/pipeline/reconcile-all",
-            "publicaciones_canonicas": "/api/publications",
-            "hex_ingest": "/api/hex/ingest",
-            "hex_publications": "/api/hex/publications",
-        },
-    }

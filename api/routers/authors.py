@@ -56,6 +56,12 @@ from api.schemas.authors import (
     BatchImportRequest,
     BatchImportResponse,
     SimilarAuthorRead,
+    AuthorUpdateRequest,
+    AuthorUpdateResponse,
+    ExternalIdValidationResult,
+    SharedPublicationRead,
+    SharedPublicationsResponse,
+    SharedAuthorRead,
 )
 from db.models import (
     CanonicalPublication,
@@ -66,6 +72,17 @@ from db.models import (
     SOURCE_MODELS,
 )
 from db.source_registry import SOURCE_REGISTRY
+from project.application.use_cases.authors.merge import (
+    INHERITABLE_IDS,
+    compute_id_inheritance,
+    merge_field_provenance,
+    validate_merge_command as _validate_merge_cmd,
+)
+from project.application.use_cases.authors.validate_external_id import (
+    extract_id_from_url as _extract_id_from_url,
+    validate_external_id as _validate_external_id_uc,
+)
+from project.application.schemas.author_schemas import MergeAuthorsCommand
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/authors", tags=["Autores"])
@@ -354,8 +371,190 @@ def get_author_stats(db: Session = Depends(get_db)):
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-# GET /authors
+# GET /authors/shared-publications
 # ─────────────────────────────────────────────────────────────────────────────
+
+@router.get(
+    "/shared-publications",
+    response_model=SharedPublicationsResponse,
+    summary="Publicaciones compartidas por múltiples autores"
+)
+def get_shared_publications(
+    author_ids: str = Query(
+        ...,
+        description="Lista de IDs de autores separados por coma (ej: 1,2,3)",
+        examples={"example": {"value": "1,2,3"}},
+    ),
+    match_type: str = Query(
+        "all",
+        pattern="^(all|any)$",
+        description="'all' = todos los autores en la pub, 'any' = al menos uno",
+    ),
+    year_from: Optional[int] = Query(None, description="Año mínimo de publicación"),
+    year_to: Optional[int] = Query(None, description="Año máximo de publicación"),
+    publication_type: Optional[str] = Query(None, description="Filtrar por tipo de publicación"),
+    page: int = Query(1, ge=1, description="Página (default: 1)"),
+    page_size: int = Query(50, ge=1, le=200, description="Resultados por página (default: 50)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Retorna las publicaciones compartidas por dos o más autores.
+
+    **Parámetros:**
+    - `author_ids`: Lista de IDs separados por coma (ej: 1,2,3)
+    - `match_type`:
+      - `all`: publicaciones donde aparecen TODOS los autores especificados
+      - `any`: publicaciones donde aparece AL MENOS uno de los autores
+    - `year_from`, `year_to`: filtrar por rango de años
+    - `publication_type`: ej. "ARTICLE", "BOOK", "CONFERENCE"
+
+    **Respuesta:**
+    - `authors`: Todos los autores especificados que existen en BD
+    - `authors_not_found`: IDs de autores que no existen
+    - `total_shared_publications`: Total (sin paginación)
+    - `shared_publications`: Paginadas
+
+    **Ejemplos:**
+    ```
+    GET /authors/shared-publications?author_ids=1,2,3
+    GET /authors/shared-publications?author_ids=1,2&match_type=any&year_from=2020
+    GET /authors/shared-publications?author_ids=5,6,7&page=2&page_size=30
+    ```
+    """
+    # Parsear IDs
+    try:
+        ids_list = [int(x.strip()) for x in author_ids.split(",") if x.strip()]
+    except ValueError:
+        raise HTTPException(400, "author_ids debe ser una lista de números separados por coma")
+
+    if not ids_list:
+        raise HTTPException(400, "Necesitas proporcionar al menos un ID de autor")
+
+    if len(ids_list) < 2 and match_type == "all":
+        raise HTTPException(400, "Para match_type='all' necesitas al menos 2 autores")
+
+    # Validar que los autores existan
+    existing_authors = db.query(Author).filter(Author.id.in_(ids_list)).all()
+    existing_ids = {a.id for a in existing_authors}
+    missing_ids = set(ids_list) - existing_ids
+
+    # Query para encontrar publicaciones
+    if match_type == "all":
+        # Publicaciones que tienen TODOS los autores solicitados
+        shared_pub_ids = (
+            db.query(PublicationAuthor.publication_id)
+            .filter(PublicationAuthor.author_id.in_(ids_list))
+            .group_by(PublicationAuthor.publication_id)
+            .having(func.count(func.distinct(PublicationAuthor.author_id)) == len(ids_list))
+            .all()
+        )
+        shared_pub_ids = [row[0] for row in shared_pub_ids]
+    else:  # "any"
+        # Publicaciones que tienen AL MENOS uno de los autores
+        shared_pub_ids = (
+            db.query(PublicationAuthor.publication_id)
+            .filter(PublicationAuthor.author_id.in_(ids_list))
+            .distinct()
+            .all()
+        )
+        shared_pub_ids = [row[0] for row in shared_pub_ids]
+
+    logger.info(f"[shared-publications] match_type={match_type}, author_ids={ids_list}, found_pubs={len(shared_pub_ids)}")
+
+    # Query base de publicaciones
+    if not shared_pub_ids:
+        q = db.query(CanonicalPublication).filter(CanonicalPublication.id == -1)  # Sin resultados
+    else:
+        q = db.query(CanonicalPublication).filter(CanonicalPublication.id.in_(shared_pub_ids))
+
+    # Filtros opcionales
+    if year_from:
+        q = q.filter(CanonicalPublication.publication_year >= year_from)
+    if year_to:
+        q = q.filter(CanonicalPublication.publication_year <= year_to)
+    if publication_type:
+        normalized_type = normalize_publication_type(publication_type)
+        q = q.filter(CanonicalPublication.publication_type == normalized_type)
+
+    # Contar total
+    total = q.count()
+    total_pages = (total + page_size - 1) // page_size if page_size else 0
+
+    logger.info(f"[shared-publications] total_publications={total}, page={page}, page_size={page_size}")
+
+    # Paginar
+    pubs = (
+        q.order_by(CanonicalPublication.publication_year.desc().nullslast(), CanonicalPublication.id.desc())
+        .offset((page - 1) * page_size)
+        .limit(page_size)
+        .all()
+    )
+
+    logger.info(f"[shared-publications] pubs_in_page={len(pubs)}")
+
+    pub_ids = [p.id for p in pubs]
+
+    # BATCH: Cargar fuentes externas
+    sources_map, sources_list_map = _batch_source_records(db, pub_ids)
+
+    # BATCH: Cargar todos los autores de estas publicaciones
+    all_auth_rows = (
+        db.query(PublicationAuthor.publication_id, Author.id, Author.name, Author.is_institutional)
+        .join(Author, PublicationAuthor.author_id == Author.id)
+        .filter(PublicationAuthor.publication_id.in_(pub_ids))
+        .all()
+    )
+
+    logger.info(f"[shared-publications] total_author_records={len(all_auth_rows)}")
+
+    # Agrupar autores por publicación
+    from collections import defaultdict
+    authors_by_pub: dict = defaultdict(list)
+    for pub_id, auth_id, auth_name, is_inst in all_auth_rows:
+        authors_by_pub[pub_id].append({
+            "id": auth_id,
+            "name": auth_name,
+            "is_institutional": is_inst,
+        })
+
+    # Construir respuesta con publicaciones
+    shared_pubs = []
+    for p in pubs:
+        all_authors = authors_by_pub.get(p.id, [])
+        shared_authors = [a for a in all_authors if a["id"] in existing_ids]
+        other_count = len(all_authors) - len(shared_authors)
+
+        shared_pubs.append(SharedPublicationRead(
+            id=p.id,
+            title=p.title,
+            doi=p.doi,
+            publication_year=p.publication_year,
+            publication_type=p.publication_type,
+            source_journal=p.source_journal,
+            citation_count=p.citation_count or 0,
+            is_open_access=p.is_open_access,
+            shared_authors=[SharedAuthorRead(**a) for a in shared_authors],
+            other_coauthors_count=other_count,
+            sources=sorted(set(sources_list_map.get(p.id, []))),
+            source_links=sources_map.get(p.id, {}),
+        ))
+
+    # Serializar autores encontrados
+    author_reads = [AuthorRead.model_validate(a) for a in existing_authors]
+
+    return SharedPublicationsResponse(
+        authors=author_reads,
+        authors_not_found=list(missing_ids),
+        match_type=match_type,
+        total_shared_publications=total,
+        shared_publications=shared_pubs,
+        page=page,
+        page_size=page_size,
+        total_pages=total_pages,
+    )
+
+
+
 
 @router.get("", response_model=PaginatedResponse[AuthorRead], summary="Listar autores")
 def list_authors(
@@ -619,11 +818,15 @@ def merge_authors(body: MergeAuthorsRequest, db: Session = Depends(get_db)):
     from sqlalchemy import update, delete
     from db.models import AuthorInstitution
 
+    # Domain validation
+    try:
+        _validate_merge_cmd(MergeAuthorsCommand(keep_id=body.keep_id, merge_ids=list(body.merge_ids)))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
+
     keep = db.get(Author, body.keep_id)
     if not keep:
         raise HTTPException(404, f"Autor principal {body.keep_id} no encontrado")
-    if body.keep_id in body.merge_ids:
-        raise HTTPException(400, "keep_id no puede estar en merge_ids")
 
     to_merge = db.query(Author).filter(Author.id.in_(body.merge_ids)).all()
     found_ids = {a.id for a in to_merge}
@@ -723,22 +926,32 @@ def merge_authors(body: MergeAuthorsRequest, db: Session = Depends(get_db)):
         keep   = db.get(Author, keep_id)
         donor  = db.get(Author, donor_id)
 
-        # ── 3. Heredar IDs externos ──
-        for attr in ("orcid", "openalex_id", "scopus_id", "wos_id", "cvlac_id"):
-            donor_val = getattr(donor, attr)
-            if donor_val and not getattr(keep, attr):
-                setattr(keep, attr, donor_val)
-                ids_inherited[attr] = donor_val
-        if donor.is_institutional and not keep.is_institutional:
-            keep.is_institutional = True
-            ids_inherited["is_institutional"] = True
+        # ── 3. Heredar IDs externos (domain use case) ──
+        from project.application.schemas.author_schemas import AuthorSnapshot
+        keep_snap = AuthorSnapshot(
+            id=keep.id, name=keep.name,
+            orcid=keep.orcid, openalex_id=keep.openalex_id,
+            scopus_id=keep.scopus_id, wos_id=keep.wos_id, cvlac_id=keep.cvlac_id,
+            is_institutional=keep.is_institutional,
+            field_provenance=dict(keep.field_provenance or {}),
+        )
+        donor_snap = AuthorSnapshot(
+            id=donor.id, name=donor.name,
+            orcid=donor.orcid, openalex_id=donor.openalex_id,
+            scopus_id=donor.scopus_id, wos_id=donor.wos_id, cvlac_id=donor.cvlac_id,
+            is_institutional=donor.is_institutional,
+            field_provenance=dict(donor.field_provenance or {}),
+        )
+        inherited_batch = compute_id_inheritance(keep_snap, donor_snap)
+        for attr, val in inherited_batch.items():
+            setattr(keep, attr, val)
+            ids_inherited[attr] = val
 
-        # ── 3b. Fusionar field_provenance ──
-        donor_prov = dict(donor.field_provenance or {})
-        keep_prov  = dict(keep.field_provenance or {})
-        for field, source in donor_prov.items():
-            keep_prov.setdefault(field, source)
-        keep.field_provenance = keep_prov
+        # ── 3b. Fusionar field_provenance (domain use case) ──
+        keep.field_provenance = merge_field_provenance(
+            dict(keep.field_provenance or {}),
+            dict(donor.field_provenance or {}),
+        )
 
         # ── 4. Eliminar donor ──
         db.delete(donor)
@@ -1831,3 +2044,150 @@ def get_author_source_publications(
         "sources_summary":    source_counter,
         "publications":       products,
     }
+
+
+# ── PATCH /authors/id/{author_id} ────────────────────────────────────────────
+
+def _normalize_doi(doi: Optional[str]) -> Optional[str]:
+    from project.domain.value_objects.doi import DOI
+    vo = DOI.parse(doi or "")
+    return vo.value if vo else None
+
+
+def _validate_external_id(
+    source: str,
+    candidate_id: str,
+    author_dois: set,
+    max_results: int = 50,
+) -> ExternalIdValidationResult:
+    """Thin wrapper — delegates to application use case."""
+    uc_result = _validate_external_id_uc(source, candidate_id, author_dois, max_results)
+    return ExternalIdValidationResult(
+        source=uc_result.source,
+        candidate_id=uc_result.candidate_id,
+        matched=uc_result.matched,
+        total_from_source=uc_result.total_from_source,
+        author_pubs_in_db=uc_result.author_pubs_in_db,
+        match_rate=uc_result.match_rate,
+        validated=uc_result.validated,
+        message=uc_result.message,
+    )
+
+
+@router.patch(
+    "/id/{author_id}",
+    response_model=AuthorUpdateResponse,
+    summary="Editar perfil de autor con validación por plataforma",
+)
+async def update_author_profile(
+    author_id: int,
+    body: AuthorUpdateRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Actualiza campos del perfil de un autor a partir de las URLs de perfil
+    que el investigador proporciona.
+
+    El backend extrae el ID canónico de cada URL, consulta la plataforma y
+    calcula cuántas publicaciones de ese perfil coinciden con las que el autor
+    ya tiene en BD antes de guardar.
+
+    - Si `match_rate >= min_match_rate` → el campo se guarda automáticamente.
+    - Si no supera el umbral → el campo se rechaza y aparece en `skipped_fields`.
+    - `force=true` → guarda todos los campos ignorando el umbral.
+
+    CvLAC no tiene API de consulta; se acepta sin validación cruzada.
+    """
+    from starlette.concurrency import run_in_threadpool
+
+    author = db.get(Author, author_id)
+    if not author:
+        raise HTTPException(404, "Autor no encontrado")
+
+    # DOIs normalizados del autor en BD
+    pub_rows = (
+        db.query(CanonicalPublication.doi)
+        .join(PublicationAuthor, CanonicalPublication.id == PublicationAuthor.publication_id)
+        .filter(PublicationAuthor.author_id == author_id)
+        .filter(CanonicalPublication.doi.isnot(None))
+        .all()
+    )
+    author_dois = {_normalize_doi(row.doi) for row in pub_rows if row.doi}
+
+    # Parsear URLs → IDs canónicos: (source, candidate_id, db_attr)
+    url_map = [
+        ("orcid",    body.orcid_url,    "orcid"),
+        ("openalex", body.openalex_url, "openalex_id"),
+        ("scopus",   body.scopus_url,   "scopus_id"),
+        ("wos",      body.wos_url,      "wos_id"),
+        ("cvlac",    body.cvlac_url,    "cvlac_id"),
+    ]
+
+    id_targets = []
+    parse_errors = {}
+    for source, url, attr in url_map:
+        if url is None:
+            continue
+        extracted = _extract_id_from_url(source, url)
+        if not extracted:
+            parse_errors[attr] = {
+                "url": url,
+                "reason": f"No se pudo extraer el ID de la URL de {source}. Verifica que sea la URL correcta del perfil.",
+            }
+        else:
+            id_targets.append((source, extracted, attr))
+
+    # Validar contra plataformas externas
+    def _run_validations():
+        results = []
+        for source, candidate_id, _ in id_targets:
+            result = _validate_external_id(source, candidate_id, author_dois)
+            result.validated = body.force or (result.match_rate >= body.min_match_rate)
+            results.append(result)
+        return results
+
+    validation_results: List[ExternalIdValidationResult] = await run_in_threadpool(_run_validations)
+
+    val_map = {v.source: v for v in validation_results}
+
+    updated_fields = {}
+    skipped_fields = dict(parse_errors)  # URLs que no pudieron parsearse
+
+    # Nombre — sin validación externa
+    if body.name is not None:
+        author.name = body.name
+        updated_fields["name"] = body.name
+
+    # IDs externos
+    for source, candidate_id, attr in id_targets:
+        v = val_map[source]
+        if v.validated:
+            setattr(author, attr, candidate_id)
+            updated_fields[attr] = candidate_id
+        else:
+            skipped_fields[attr] = {
+                "candidate_id": candidate_id,
+                "match_rate": v.match_rate,
+                "reason": f"match_rate {v.match_rate:.1%} < umbral {body.min_match_rate:.1%}. Usa force=true para forzar.",
+            }
+
+    saved = bool(updated_fields)
+    if saved:
+        try:
+            db.commit()
+            db.refresh(author)
+        except Exception as e:
+            db.rollback()
+            raise HTTPException(500, f"Error guardando cambios: {e}")
+
+    return AuthorUpdateResponse(
+        author_id=author_id,
+        updated_fields=updated_fields,
+        skipped_fields=skipped_fields,
+        validation_results=validation_results,
+        saved=saved,
+        message=(
+            f"Guardados {len(updated_fields)} campo(s). "
+            + (f"Rechazados {len(skipped_fields)} campo(s) por baja coincidencia." if skipped_fields else "")
+        ).strip(),
+    )

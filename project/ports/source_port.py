@@ -1,23 +1,4 @@
-from abc import ABC, abstractmethod
-from typing import List, Optional
+# Backward-compatibility shim. New code: use project.domain.ports.source_port
+from project.domain.ports.source_port import SourcePort
 
-from project.domain.models.publication import Publication
-
-
-class SourcePort(ABC):
-    """Puerto de entrada para cualquier fuente bibliografica."""
-
-    @property
-    @abstractmethod
-    def source_name(self) -> str:
-        ...
-
-    @abstractmethod
-    def fetch_records(
-        self,
-        year_from: Optional[int] = None,
-        year_to: Optional[int] = None,
-        max_results: Optional[int] = None,
-        **kwargs,
-    ) -> List[Publication]:
-        ...
+__all__ = ["SourcePort"]

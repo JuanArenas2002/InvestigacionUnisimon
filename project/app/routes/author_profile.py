@@ -44,15 +44,30 @@ def _handle(fn, *args, **kwargs):
 @router.get(
     "/id/{author_id}/name-options",
     response_model=NameOptionsResponse,
-    summary="Nombres disponibles desde fuentes vinculadas",
+    summary="Nombres disponibles desde fuentes vinculadas (caché BD)",
     description=(
         "Retorna el nombre actual del autor y las opciones de nombre "
-        "extraídas de cada fuente vinculada (CvLAC, OpenAlex, Scopus, etc.). "
-        "El investigador puede seleccionar uno para actualizar su perfil."
+        "extraídas del raw_data ya almacenado para cada fuente vinculada. "
+        "Respuesta instantánea; sin llamadas a APIs externas."
     ),
 )
 def get_name_options(author_id: int):
     return _handle(_use_case.get_name_options, author_id)
+
+
+@router.get(
+    "/id/{author_id}/name-options/live",
+    response_model=NameOptionsResponse,
+    summary="Nombres en tiempo real desde APIs externas",
+    description=(
+        "Consulta cada plataforma externa vinculada al autor (CvLAC, OpenAlex, "
+        "Scopus, ORCID) para obtener el nombre tal como aparece allí **ahora**. "
+        "Las llamadas se ejecutan en paralelo; si una fuente no responde se omite. "
+        "Puede tardar varios segundos dependiendo de la latencia de cada API."
+    ),
+)
+def get_name_options_live(author_id: int):
+    return _handle(_use_case.get_name_options_live, author_id)
 
 
 # ── 2. Actualizar nombre ──────────────────────────────────────────────────────

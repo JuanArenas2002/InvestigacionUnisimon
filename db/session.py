@@ -202,6 +202,44 @@ def ensure_constraints(engine=None):
         # --- Índices para canonical_publications ---
         "CREATE INDEX IF NOT EXISTS ix_canon_journal ON canonical_publications (journal_id) WHERE journal_id IS NOT NULL;",
 
+        # --- v16: abstract, page_range, publisher en tablas de fuente ---
+        "ALTER TABLE openalex_records       ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE openalex_records       ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE openalex_records       ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+        "ALTER TABLE scopus_records         ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE scopus_records         ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE scopus_records         ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+        "ALTER TABLE wos_records            ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE wos_records            ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE wos_records            ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+        "ALTER TABLE cvlac_records          ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE cvlac_records          ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE cvlac_records          ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+        "ALTER TABLE datos_abiertos_records ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE datos_abiertos_records ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE datos_abiertos_records ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+        "ALTER TABLE google_scholar_records ADD COLUMN IF NOT EXISTS abstract   TEXT;",
+        "ALTER TABLE google_scholar_records ADD COLUMN IF NOT EXISTS page_range VARCHAR(100);",
+        "ALTER TABLE google_scholar_records ADD COLUMN IF NOT EXISTS publisher  VARCHAR(500);",
+
+        # --- v17: tabla de pares posiblemente duplicados ---
+        """
+        CREATE TABLE IF NOT EXISTS possible_duplicate_pairs (
+            id              SERIAL PRIMARY KEY,
+            canonical_id_1  INTEGER NOT NULL REFERENCES canonical_publications(id) ON DELETE CASCADE,
+            canonical_id_2  INTEGER NOT NULL REFERENCES canonical_publications(id) ON DELETE CASCADE,
+            similarity_score FLOAT  NOT NULL,
+            match_method    VARCHAR(50) NOT NULL DEFAULT 'title',
+            detected_at     TIMESTAMP WITH TIME ZONE NOT NULL DEFAULT NOW(),
+            status          VARCHAR(20) NOT NULL DEFAULT 'pending',
+            CONSTRAINT uq_dup_pair UNIQUE (canonical_id_1, canonical_id_2),
+            CONSTRAINT chk_dup_order CHECK (canonical_id_1 < canonical_id_2)
+        );
+        """,
+        "CREATE INDEX IF NOT EXISTS ix_dup_pairs_id1 ON possible_duplicate_pairs (canonical_id_1);",
+        "CREATE INDEX IF NOT EXISTS ix_dup_pairs_id2 ON possible_duplicate_pairs (canonical_id_2);",
+        "CREATE INDEX IF NOT EXISTS ix_dup_pairs_status ON possible_duplicate_pairs (status) WHERE status = 'pending';",
+
         # --- Índices GIN full-text ---
         "CREATE INDEX IF NOT EXISTS ix_canon_title_fts ON canonical_publications USING GIN (to_tsvector('spanish', coalesce(title, '')));",
         "CREATE INDEX IF NOT EXISTS ix_authors_name_fts ON authors USING GIN (to_tsvector('spanish', coalesce(name, '')));",

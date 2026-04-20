@@ -41,9 +41,6 @@ class GoogleScholarExtractor(BaseExtractor):
 
     Itera una lista de Scholar IDs, descarga el perfil de cada autor
     y extrae sus publicaciones.
-
-    Args:
-        (sin parámetros — scholarly gestiona la sesión HTTP internamente)
     """
 
     source_name = "google_scholar"
@@ -79,57 +76,39 @@ class GoogleScholarExtractor(BaseExtractor):
                 "Ejemplo: scholar_ids=['Ozm565YAAAAJ']"
             )
 
-        print(f"\n[DEBUG EXTRACTOR] Iniciando extracción de {len(scholar_ids)} perfiles")
-        
         records: List[StandardRecord] = []
         total_fetched = 0
 
         for idx, scholar_id in enumerate(scholar_ids):
             logger.info(
-                f"[GoogleScholar] Consultando perfil {scholar_id} "
-                f"({idx + 1}/{len(scholar_ids)})"
+                "[GoogleScholar] Consultando perfil %s (%d/%d)",
+                scholar_id, idx + 1, len(scholar_ids),
             )
-            print(f"\n[DEBUG EXTRACTOR] ========== Perfil {idx + 1}/{len(scholar_ids)}: {scholar_id} ==========")
-            
             remaining = (max_results - total_fetched) if max_results else None
             try:
-                print(f"[DEBUG EXTRACTOR] Llamando fetch_profile_publications() para {scholar_id}")
                 fields_list = profile_service.fetch_profile_publications(
                     scholar_id=scholar_id,
                     year_from=year_from,
                     year_to=year_to,
                     max_results=remaining,
                 )
-                print(f"[DEBUG EXTRACTOR] fetch_profile_publications retornó {len(fields_list)} registros")
-                
-                for idx_pub, fields in enumerate(fields_list):
-                    print(f"[DEBUG EXTRACTOR]   Parseando publicación {idx_pub + 1}/{len(fields_list)}")
+                for fields in fields_list:
                     records.append(self._parse_record(fields))
                     total_fetched += 1
                     if max_results and total_fetched >= max_results:
-                        print(f"[DEBUG EXTRACTOR] Límite de {max_results} registros alcanzado")
                         break
-                
-                print(f"[DEBUG EXTRACTOR] Perfil {scholar_id} completado. Total acumulado: {total_fetched}")
 
             except GoogleScholarError as e:
-                logger.warning(f"[GoogleScholar] Error con perfil {scholar_id}: {e}")
-                print(f"[DEBUG EXTRACTOR] ERROR GoogleScholarError: {e}")
+                logger.warning("[GoogleScholar] Error con perfil %s: %s", scholar_id, e)
                 continue
             except Exception as e:
-                logger.warning(
-                    f"[GoogleScholar] Error inesperado con perfil {scholar_id}: {e}"
-                )
-                print(f"[DEBUG EXTRACTOR] ERROR Inesperado: {e}")
-                import traceback
-                print(traceback.format_exc())
+                logger.warning("[GoogleScholar] Error inesperado con perfil %s: %s", scholar_id, e, exc_info=True)
                 continue
 
             if max_results and total_fetched >= max_results:
-                print(f"[DEBUG EXTRACTOR] Límite global alcanzado, saliendo del loop")
                 break
 
-        print(f"\n[DEBUG EXTRACTOR] Extracción completada. Total de registros: {len(records)}")
+        logger.info("[GoogleScholar] Extracción completada. Total registros: %d", len(records))
         return self._post_process(records)
 
     def _parse_record(self, fields: dict) -> StandardRecord:

@@ -184,7 +184,16 @@ class WosExtractor(BaseExtractor):
         # Fuente
         source_title = hit.get("source", {}).get("sourceTitle")
 
-        return StandardRecord(
+        source = hit.get("source") or {}
+        pages = source.get("pages") or {}
+
+        # Abstract
+        abstract = None
+        abstracts_items = (hit.get("abstracts") or {}).get("items") or []
+        if abstracts_items:
+            abstract = abstracts_items[0].get("value")
+
+        record = StandardRecord(
             source_name=self.source_name,
             source_id=wos_id,
             doi=doi,
@@ -194,8 +203,81 @@ class WosExtractor(BaseExtractor):
             source_journal=source_title,
             authors=authors,
             citation_count=hit.get("citations", [{}])[0].get("count", 0) if hit.get("citations") else 0,
+            abstract=abstract,
+            page_range=pages.get("range") or pages.get("compact"),
+            publisher=source.get("publisherName"),
             raw_data=hit,
         )
+        record.compute_normalized_fields()
+        return record
+
+    def extract_by_author(
+        self,
+        wos_author_id: str,
+        max_results: int = 50,
+    ) -> List[StandardRecord]:
+        """
+        Busca publicaciones de un autor en WoS por su Researcher ID (RI field).
+
+        Args:
+            wos_author_id: Researcher ID de WoS (ej. A-1234-2010)
+            max_results: Límite de resultados
+
+        Returns:
+            Lista de StandardRecords del autor.
+        """
+        if not self.api_key:
+            return []
+        clean_id = str(wos_author_id).strip()
+        params = {
+            "q": f'AI=("{clean_id}")',
+            "limit": min(max_results, self.config.max_per_page),
+            "page": 1,
+        }
+        records: List[StandardRecord] = []
+        try:
+            resp = self.session.get(
+                f"{self.config.base_url}/documents",
+                params=params,
+                timeout=self.config.timeout,
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("hits", [])
+            for hit in hits[:max_results]:
+                try:
+                    rec = self._parse_record(hit)
+                    rec.compute_normalized_fields()
+                    records.append(rec)
+                except Exception:
+                    pass
+        except Exception as e:
+            logger.debug(f"extract_by_author wos_id={clean_id!r}: {e}")
+        return records
+
+    def search_by_doi(self, doi: str) -> Optional[StandardRecord]:
+        """
+        Busca un documento en WoS Starter API por DOI.
+        Retorna StandardRecord o None si no encontrado / sin API key.
+        """
+        if not self.api_key:
+            return None
+        clean_doi = doi.strip().lstrip("https://doi.org/").lstrip("http://doi.org/")
+        params = {"q": f'DO="{clean_doi}"', "limit": 1, "page": 1}
+        try:
+            resp = self.session.get(
+                f"{self.config.base_url}/documents",
+                params=params,
+                timeout=self.config.timeout,
+            )
+            resp.raise_for_status()
+            hits = resp.json().get("hits", [])
+            if hits:
+                record = self._parse_record(hits[0])
+                record.compute_normalized_fields()
+                return record
+        except Exception as e:
+            logger.debug(f"WoS search_by_doi {clean_doi!r}: {e}")
+        return None
 
     # ---------------------------------------------------------
     # LÓGICA INTERNA

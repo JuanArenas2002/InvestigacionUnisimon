@@ -246,6 +246,50 @@ class CanonicalPublication(Base):
 
 
 # =============================================================
+# PARES DE PUBLICACIONES POSIBLEMENTE DUPLICADAS
+# =============================================================
+
+class PossibleDuplicatePair(Base):
+    """
+    Par de publicaciones canónicas detectadas como posiblemente duplicadas.
+    Persiste casos detectados durante reconciliación para consulta posterior.
+    canonical_id_1 < canonical_id_2 (invariante de unicidad).
+    """
+    __tablename__ = "possible_duplicate_pairs"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    canonical_id_1: Mapped[int] = mapped_column(
+        Integer, ForeignKey("canonical_publications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    canonical_id_2: Mapped[int] = mapped_column(
+        Integer, ForeignKey("canonical_publications.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    similarity_score: Mapped[float] = mapped_column(Float, nullable=False)
+    match_method: Mapped[str] = mapped_column(String(50), nullable=False, default="title")
+    detected_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+    status: Mapped[str] = mapped_column(
+        String(20), nullable=False, default="pending",
+        comment="pending | merged | dismissed",
+    )
+
+    __table_args__ = (
+        UniqueConstraint("canonical_id_1", "canonical_id_2", name="uq_dup_pair"),
+        CheckConstraint("canonical_id_1 < canonical_id_2", name="chk_dup_order"),
+    )
+
+    __mapper_args__ = {"confirm_deleted_rows": False}
+
+    def __repr__(self):
+        return (
+            f"<PossibleDuplicatePair(id={self.id}, "
+            f"{self.canonical_id_1}↔{self.canonical_id_2}, "
+            f"score={self.similarity_score:.1f}, status={self.status})>"
+        )
+
+
+# =============================================================
 # AUTORES
 # =============================================================
 

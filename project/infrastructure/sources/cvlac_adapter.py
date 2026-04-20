@@ -4,7 +4,7 @@ from extractors.cvlac.extractor import CvlacExtractor
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 
 
 class CvlacAdapter(SourcePort):

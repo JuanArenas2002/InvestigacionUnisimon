@@ -66,6 +66,11 @@ class StandardRecord:
     # --- URLs ---
     url: Optional[str] = None
 
+    # --- Campos enriquecidos ---
+    abstract: Optional[str] = None
+    page_range: Optional[str] = None
+    publisher: Optional[str] = None
+
     # --- Data cruda original ---
     raw_data: Optional[dict] = field(default_factory=dict)
 

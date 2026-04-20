@@ -4,7 +4,7 @@ from extractors.datos_abiertos.extractor import DatosAbiertosExtractor
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 
 
 class DatosAbiertosAdapter(SourcePort):

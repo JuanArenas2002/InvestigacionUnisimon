@@ -5,8 +5,8 @@ from project.domain.models.publication import Publication
 from project.domain.services.deduplication_service import DeduplicationService
 from project.domain.services.matching_service import MatchingService
 from project.domain.services.normalization_service import NormalizationService
-from project.ports.repository_port import RepositoryPort
-from project.ports.source_port import SourcePort
+from project.domain.ports.publication_repository import PublicationRepositoryPort
+from project.domain.ports.source_port import SourcePort
 
 
 @dataclass(slots=True)
@@ -29,7 +29,7 @@ class IngestPipeline:
     def __init__(
         self,
         sources: List[SourcePort],
-        repository: RepositoryPort,
+        repository: PublicationRepositoryPort,
         deduplication_service: DeduplicationService,
         normalization_service: NormalizationService,
         matching_service: MatchingService,
@@ -99,20 +99,16 @@ class IngestPipeline:
 
         for source in self.sources:
             kwargs = source_kwargs.get(source.source_name, {})
-            print(f"\n[DEBUG PIPELINE] Iniciando collect de fuente: {source.source_name}")
             try:
-                print(f"[DEBUG PIPELINE] Llamando fetch_records para {source.source_name} con kwargs: {kwargs}")
                 collected[source.source_name] = source.fetch_records(
                     year_from=year_from,
                     year_to=year_to,
                     max_results=max_results,
                     **kwargs,
                 )
-                print(f"[DEBUG PIPELINE] fetch_records completado para {source.source_name}. Registros obtenidos: {len(collected[source.source_name])}")
             except Exception as exc:
                 collected[source.source_name] = []
                 errors[source.source_name] = str(exc)
-                print(f"[DEBUG PIPELINE] ERROR en {source.source_name}: {str(exc)}")
         return collected, errors
 
     def deduplicate(self, publications: List[Publication]) -> List[Publication]:

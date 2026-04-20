@@ -1,15 +1,17 @@
 from typing import Iterable, List
 
-from shared.normalizers import normalize_doi, normalize_text, normalize_year
+from shared.normalizers import normalize_text, normalize_year
 
 from project.domain.models.publication import Publication
+from project.domain.value_objects.doi import DOI
 
 
 class NormalizationService:
     """Normaliza metadatos para comparacion y persistencia consistente."""
 
     def normalize_publication(self, publication: Publication) -> Publication:
-        publication.doi = normalize_doi(publication.doi) or None
+        doi_vo = DOI.parse(publication.doi)
+        publication.doi = doi_vo.value if doi_vo else None
         publication.publication_year = normalize_year(publication.publication_year)
         publication.normalized_title = normalize_text(publication.title or "") or None
 

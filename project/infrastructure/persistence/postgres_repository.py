@@ -10,7 +10,7 @@ from db.source_registry import SOURCE_REGISTRY
 from shared.normalizers import normalize_author_name, normalize_text
 
 from project.domain.models.publication import Publication
-from project.ports.repository_port import RepositoryPort
+from project.domain.ports.repository_port import RepositoryPort  # PublicationRepositoryPort + AuthorRepositoryPort
 
 logger = logging.getLogger(__name__)
 
@@ -591,13 +591,25 @@ class PostgresRepository(RepositoryPort):
                 if not ext_id:
                     continue
 
-                # Buscar registros de esta fuente vinculados a pubs del autor
-                records = (
-                    session.query(source_model)
-                    .filter(source_model.canonical_publication_id.in_(pub_ids))
-                    .limit(10)
-                    .all()
+                # Buscar registros de esta fuente vinculados a pubs del autor.
+                # Para CvLAC filtramos además por cvlac_code para evitar leer
+                # el nombre de un co-autor cuyo perfil también contiene la
+                # misma publicación (raw_data._investigador pertenece al
+                # investigador que generó el registro, no al autor buscado).
+                query = session.query(source_model).filter(
+                    source_model.canonical_publication_id.in_(pub_ids)
                 )
+                if source == "cvlac":
+                    # cvlac_code almacena la cédula del investigador dueño del
+                    # registro. Usar author.cedula (más confiable que ext_id,
+                    # que puede contener cod_rh en vez de cédula).
+                    cvlac_filter_val = author.cedula or ext_id
+                    if cvlac_filter_val:
+                        query = query.filter(
+                            source_model.cvlac_code == cvlac_filter_val
+                        )
+
+                records = query.limit(10).all()
 
                 for rec in records:
                     name = _extract_author_name_from_record(rec, source, ext_id)

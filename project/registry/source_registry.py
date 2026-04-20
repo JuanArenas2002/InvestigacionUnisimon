@@ -4,7 +4,7 @@ import pkgutil
 from types import ModuleType
 from typing import Dict, Iterable, List, Type
 
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 
 
 class SourceRegistry:

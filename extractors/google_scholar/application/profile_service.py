@@ -17,7 +17,6 @@ from extractors.google_scholar.domain import record_parser
 
 logger = logging.getLogger(__name__)
 
-# Delay entre perfiles para evitar bloqueos de Google
 _DELAY_BETWEEN_PROFILES = 3.0
 
 
@@ -52,34 +51,21 @@ def fetch_profile_publications(
         )
 
     try:
-        print(f"[DEBUG] Iniciando búsqueda de perfil: {scholar_id}")
-        logger.info(f"[DEBUG] Iniciando búsqueda de perfil: {scholar_id}")
-        
-        print(f"[DEBUG] Llamando a search_author_id({scholar_id})...")
+        logger.info("Iniciando búsqueda de perfil: %s", scholar_id)
         author = scholar_api.search_author_id(scholar_id)
-        print(f"[DEBUG] search_author_id completado. Author: {author.get('name', 'SIN NOMBRE')}")
-        
-        print(f"[DEBUG] Llamando a fill(author, sections=['publications'])...")
         author = scholar_api.fill(author, sections=["publications"])
-        print(f"[DEBUG] fill completado. Publicaciones encontradas: {len(author.get('publications', []))}")
     except Exception as e:
-        logger.error(f"[DEBUG] Error en extracción: {str(e)}")
-        print(f"[DEBUG] ERROR: {str(e)}")
+        logger.error("Error en extracción del perfil %s: %s", scholar_id, e)
         raise GoogleScholarError(
             f"Error al consultar perfil Google Scholar '{scholar_id}': {e}"
         )
 
     profile_name = author.get("name", "")
     raw_publications = author.get("publications", [])
+    logger.debug("Perfil %s: %d publicaciones encontradas", scholar_id, len(raw_publications))
 
-    print(f"[DEBUG] Nombre del perfil: {profile_name}")
-    print(f"[DEBUG] Total de publicaciones a procesar: {len(raw_publications)}")
-    
     fields_list = []
-    for idx, pub in enumerate(raw_publications):
-        print(f"[DEBUG] Procesando publicación {idx + 1}/{len(raw_publications)}...")
-        
-        # Aplicar filtro de año si está disponible en el bib
+    for pub in raw_publications:
         year = pub.get("bib", {}).get("pub_year") or pub.get("bib", {}).get("year")
         if year:
             try:
@@ -91,18 +77,15 @@ def fetch_profile_publications(
             except (ValueError, TypeError):
                 pass
 
-        print(f"[DEBUG] Parseando publicación {idx + 1}...")
         fields = record_parser.parse_publication(pub, scholar_id, profile_name)
         fields_list.append(fields)
-        print(f"[DEBUG] Publicación {idx + 1} parseada exitosamente. Total acumulado: {len(fields_list)}")
 
         if max_results and len(fields_list) >= max_results:
             break
 
-    print(f"[DEBUG] Procesamiento completado. Total extraídas: {len(fields_list)}")
     logger.info(
-        f"[GoogleScholar] Perfil {scholar_id} ({profile_name}): "
-        f"{len(fields_list)} publicaciones extraídas."
+        "[GoogleScholar] Perfil %s (%s): %d publicaciones extraídas.",
+        scholar_id, profile_name, len(fields_list),
     )
     time.sleep(_DELAY_BETWEEN_PROFILES)
     return fields_list

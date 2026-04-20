@@ -213,6 +213,15 @@ def parse_xml_entry(entry: ET.Element) -> Optional[dict]:
     # ── Autores ───────────────────────────────────────────────────────
     authors = extract_authors(entry)
 
+    # Abstract (dc:description en namespace dc)
+    abstract = entry.findtext("dc:description", namespaces=NS)
+
+    # Rango de páginas
+    page_range = entry.findtext("prism:pageRange", namespaces=NS)
+
+    # Editorial
+    publisher = entry.findtext("prism:publisher", namespaces=NS)
+
     return {
         "source_id":        scopus_id,
         "doi":              doi,
@@ -226,6 +235,9 @@ def parse_xml_entry(entry: ET.Element) -> Optional[dict]:
         "oa_status":        oa_status,
         "authors":          authors,
         "citation_count":   citedby_count,
+        "abstract":         abstract,
+        "page_range":       page_range,
+        "publisher":        publisher,
         # E-ISSN se guarda en raw_data para uso en cobertura de revistas
         "raw_data":         {"eissn": eissn} if eissn else {},
     }
@@ -297,5 +309,8 @@ def parse_json_entry(entry: dict) -> dict:
         "oa_status":        str(oa_raw) if oa_raw is not None else None,
         "authors":          authors,
         "citation_count":   int(entry.get("citedby-count", 0) or 0),
+        "abstract":         entry.get("dc:description") or entry.get("description"),
+        "page_range":       entry.get("prism:pageRange") or entry.get("pageRange"),
+        "publisher":        entry.get("dc:publisher") or entry.get("prism:publisher"),
         "raw_data":         {**entry, "eissn": eissn} if eissn else entry,
     }

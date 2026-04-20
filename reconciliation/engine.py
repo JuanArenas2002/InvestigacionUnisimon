@@ -27,7 +27,21 @@ Flujo en cascada:
   │    los canonical_publications                       │
   │      Score >= combined_threshold → VINCULAR         │
   │      Score >= manual_review → MARCAR REVISIÓN       │
-  │      Score < manual_review → ir a PASO 3            │
+  │      Score < manual_review → ir a PASO 2.3          │
+  │                                                     │
+  │  PASO 2.3: Fuzzy con título traducido al inglés     │
+  │    Si el título entrante no está en inglés,         │
+  │    traducirlo (deep-translator, caché in-memory)    │
+  │    y repetir fuzzy. Requiere author_score >= 40     │
+  │    como guard contra falsos positivos.              │
+  │      Match → VINCULAR como FUZZY_COMBINED           │
+  │      Manual review → MARCAR REVISIÓN                │
+  │      Sin match → ir a PASO 2.5                      │
+  │                                                     │
+  │  PASO 2.5: Match por IDs externos de autores        │
+  │    (solo registros sin DOI)                         │
+  │      ≥ 2 IDs compartidos → VINCULAR                 │
+  │      Sin match → ir a PASO 3                        │
   │                                                     │
   │  PASO 3: Crear nueva publicación canónica           │
   │    Insertar en canonical_publications               │
@@ -42,6 +56,14 @@ from collections import defaultdict
 from datetime import datetime, timezone
 from typing import List, Dict, Optional, Tuple, Any, Set
 
+# Fijar semilla de langdetect para resultados reproducibles
+try:
+    from langdetect import DetectorFactory as _DetectorFactory
+    _DetectorFactory.seed = 0
+except ImportError:
+    pass
+
+from sqlalchemy import func
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 
@@ -56,6 +78,7 @@ from db.models import (
     Author,
     PublicationAuthor,
     ReconciliationLog,
+    PossibleDuplicatePair,
     SOURCE_MODELS,
     find_record_by_doi_across_sources,
 )
@@ -132,6 +155,10 @@ class ReconciliationEngine:
         self.stats = ReconciliationStats()
         # Cache in-memory; se inicializa en reconcile_pending
         self._cache: Optional[Dict] = None
+        # Caché de traducciones: título_original → título_en_inglés (o None si ya era inglés)
+        self._translation_cache: Dict[str, Optional[str]] = {}
+        # Caché de detección de idioma: texto → código ISO (ej: 'es', 'en')
+        self._lang_cache: Dict[str, str] = {}
 
     # ---------------------------------------------------------
     # API PÚBLICA
@@ -318,8 +345,17 @@ class ReconciliationEngine:
 
                 # --- Insertar registro en la tabla de fuente ---
                 source_record = self._build_source_record(record, dedup)
-                self.session.add(source_record)
-                self.session.flush()
+                try:
+                    with self.session.begin_nested():
+                        self.session.add(source_record)
+                        self.session.flush()
+                except IntegrityError:
+                    skipped += 1
+                    logger.debug(
+                        f"Duplicado detectado por constraint DB: "
+                        f"{record.source_name}:{record.source_id}"
+                    )
+                    continue
 
                 # Actualizar sets para detectar duplicados dentro del mismo lote
                 ex.setdefault("hashes", set()).add(dedup)
@@ -336,17 +372,8 @@ class ReconciliationEngine:
 
                 inserted += 1
 
-            except IntegrityError:
-                self.session.rollback()
-                skipped += 1
-                logger.debug(
-                    f"Duplicado detectado por constraint DB: "
-                    f"{record.source_name}:{record.source_id}"
-                )
-                continue
             except Exception as e:
-                self.session.rollback()
-                logger.warning(f"Error insertando registro: {e}")
+                logger.warning(f"Error insertando registro {record.source_name}:{record.source_id}: {e}")
                 continue
 
         self.session.commit()
@@ -635,6 +662,79 @@ class ReconciliationEngine:
                     return
 
         # =====================================================
+        # PASO 2.3: Fuzzy matching con título traducido al inglés
+        # Cubre el caso de papers con título en otro idioma:
+        #   CvLAC/DatosAbiertos (español) vs Scopus/WoS/OpenAlex (inglés)
+        # Solo se activa si el PASO 2 no encontró ningún match.
+        # =====================================================
+        if rc_config.fuzzy_enabled:
+            trans_match, trans_result = self._find_translated_fuzzy_match(ext)
+            if trans_match and trans_result:
+                if trans_result.match_type in (
+                    MatchType.FUZZY_HIGH,
+                    MatchType.FUZZY_COMBINED,
+                ):
+                    # Guard: DOIs distintos → no fusionar, revisión manual
+                    if ext.doi and trans_match.doi:
+                        ndoi_ext = normalize_doi(ext.doi)
+                        if ndoi_ext and ndoi_ext != trans_match.doi:
+                            details = {
+                                **trans_result.to_dict(),
+                                "method": "translated_fuzzy",
+                                "translated_title": self._translation_cache.get(ext.title or ""),
+                                "doi_conflict": {
+                                    "incoming": ndoi_ext,
+                                    "canonical": trans_match.doi,
+                                },
+                            }
+                            self._flag_for_review(
+                                ext, trans_match,
+                                trans_result.combined_score, details, now
+                            )
+                            self.stats.manual_review += 1
+                            logger.info(
+                                f"  CONFLICTO DOI (traducción): match degradado a revisión — "
+                                f"incoming={ndoi_ext} canonical={trans_match.doi}"
+                            )
+                            return
+
+                    details = {
+                        **trans_result.to_dict(),
+                        "method": "translated_fuzzy",
+                        "original_title": ext.title,
+                        "translated_title": self._translation_cache.get(ext.title or ""),
+                    }
+                    self._link_to_canonical(
+                        ext, trans_match,
+                        MatchType.FUZZY_COMBINED,
+                        trans_result.combined_score,
+                        details,
+                        now,
+                    )
+                    self.stats.fuzzy_combined_matches += 1
+                    logger.info(
+                        f"  MATCH TRADUCIDO: '{(ext.title or '')[:50]}' → "
+                        f"canon={trans_match.id} "
+                        f"(score={trans_result.combined_score:.1f}, "
+                        f"authors={trans_result.author_score:.1f})"
+                    )
+                    return
+
+                elif trans_result.match_type == MatchType.MANUAL_REVIEW:
+                    details = {
+                        **trans_result.to_dict(),
+                        "method": "translated_fuzzy",
+                        "original_title": ext.title,
+                        "translated_title": self._translation_cache.get(ext.title or ""),
+                    }
+                    self._flag_for_review(
+                        ext, trans_match,
+                        trans_result.combined_score, details, now
+                    )
+                    self.stats.manual_review += 1
+                    return
+
+        # =====================================================
         # PASO 2.5: Match por solapamiento de IDs externos de autores
         # Cubre el caso de títulos en idiomas distintos (sin DOI)
         # donde el fuzzy de título falla pero los autores son los mismos.
@@ -658,10 +758,185 @@ class ReconciliationEngine:
                 return
 
         # =====================================================
+        # PASO 2.8: Guard de título-solo antes de crear nuevo canónico.
+        # Si el título es casi idéntico a un canónico existente (>= title_high_confidence)
+        # y el año coincide, es muy probable que sea el mismo paper con DOI diferente
+        # (ej: DOI de revista vs DOI de versión preprint, o error tipográfico en DOI).
+        # → Flaggear para revisión manual y NO crear nuevo canónico.
+        # → Guardar el par como posible duplicado para auditoría.
+        # =====================================================
+        title_only_match = self._find_title_only_match(ext)
+        if title_only_match is not None:
+            details = {
+                "method": "title_only_guard",
+                "title_score": rc_config.title_high_confidence,
+                "note": "Título casi idéntico a canónico existente; DOI diferente o ausente",
+            }
+            self._flag_for_review(ext, title_only_match, rc_config.title_high_confidence, details, now)
+            self.stats.manual_review += 1
+            logger.info(
+                f"  PASO 2.8: título idéntico a canonical_id={title_only_match.id}, "
+                f"no se crea nuevo canónico"
+            )
+            return
+
+        # =====================================================
         # PASO 3: Crear nueva publicación canónica
         # =====================================================
         self._create_new_canonical(ext, now)
         self.stats.new_canonical += 1
+
+    # ---------------------------------------------------------
+    # TRADUCCIÓN DE TÍTULOS (para matching multi-idioma)
+    # ---------------------------------------------------------
+
+    def _detect_language(self, text: str) -> str:
+        """
+        Detecta el idioma de un texto usando langdetect.
+        Retorna código ISO639-1 ('es', 'en', 'fr', ...) o 'unknown'.
+        Cachea resultados para no re-procesar el mismo título.
+        """
+        if not text or len(text.strip()) < 10:
+            return "unknown"
+
+        cache_key = text[:200]
+        if cache_key in self._lang_cache:
+            return self._lang_cache[cache_key]
+
+        try:
+            from langdetect import detect, LangDetectException
+            lang = detect(text)
+        except Exception:
+            lang = "unknown"
+
+        self._lang_cache[cache_key] = lang
+        return lang
+
+    def _translate_to_english(self, title: str) -> Optional[str]:
+        """
+        Traduce un título al inglés usando deep-translator (backend: Google Translate).
+
+        - Si el título ya está en inglés, retorna None (no hace API call).
+        - Cachea todas las traducciones en self._translation_cache para evitar
+          llamadas repetidas dentro del mismo lote.
+        - Si la traducción falla (red caída, cuota, etc.) retorna None
+          sin interrumpir el flujo de reconciliación.
+
+        Retorna la traducción en inglés, o None si no aplica / falla.
+        """
+        if not title or len(title.strip()) < 5:
+            return None
+
+        cache_key = title[:300]
+        if cache_key in self._translation_cache:
+            return self._translation_cache[cache_key]
+
+        # 1. Detectar idioma: si ya es inglés no hay nada que hacer
+        lang = self._detect_language(title)
+        if lang == "en":
+            self._translation_cache[cache_key] = None
+            return None
+
+        # 2. Traducir
+        try:
+            from deep_translator import GoogleTranslator
+            translated = GoogleTranslator(source="auto", target="en").translate(title)
+            if not translated:
+                self._translation_cache[cache_key] = None
+                return None
+            # Si la traducción es idéntica al original, no aporta nada
+            if translated.strip().lower() == title.strip().lower():
+                self._translation_cache[cache_key] = None
+                return None
+            self._translation_cache[cache_key] = translated
+            logger.debug(
+                f"  TRADUCCIÓN [{lang}→en]: '{title[:60]}' → '{translated[:60]}'"
+            )
+            return translated
+        except Exception as e:
+            logger.debug(f"  Error de traducción (ignorado): {e}")
+            self._translation_cache[cache_key] = None
+            return None
+
+    def _find_translated_fuzzy_match(
+        self, ext
+    ) -> Tuple[Optional[CanonicalPublication], Optional[FuzzyMatchResult]]:
+        """
+        Busca coincidencia fuzzy usando el título del registro entrante
+        TRADUCIDO al inglés.
+
+        Propósito: detectar el mismo paper publicado con título en dos idiomas
+        distintos (ej: CvLAC/DatosAbiertos en español vs Scopus/WoS en inglés).
+
+        Diseño:
+          - Solo se activa si el título entrante NO está en inglés.
+          - Traduce el título una sola vez (caché in-memory durante el lote).
+          - Usa la misma lógica de candidatos por año que _find_fuzzy_match.
+          - Safety guard: exige author_score >= 40 para aceptar un match por
+            traducción, ya que las traducciones automáticas pueden introducir
+            ruido léxico y un buen solapamiento de autores confirma que es el
+            mismo paper.
+
+        Retorna (canonical, result) o (None, None) si no hay match suficiente.
+        """
+        incoming_title = ext.title or ""
+        if not incoming_title:
+            return None, None
+
+        translated = self._translate_to_english(incoming_title)
+        if not translated:
+            # Título ya en inglés o traducción fallida → el fuzzy normal ya lo cubrió
+            return None, None
+
+        cache = self._cache
+        if not cache:
+            return None, None
+
+        canonicals = cache["canonicals"]
+
+        # Filtrar candidatos por año (idéntico a _find_fuzzy_match)
+        if ext.publication_year and rc_config.year_must_match:
+            tol = rc_config.year_tolerance
+            candidate_ids: List[int] = []
+            for yr in range(ext.publication_year - tol, ext.publication_year + tol + 1):
+                candidate_ids.extend(cache["by_year"].get(yr, []))
+        else:
+            candidate_ids = list(canonicals.keys())
+
+        if not candidate_ids:
+            return None, None
+
+        best_canonical = None
+        best_result = None
+        best_score = 0.0
+
+        for pub_id in candidate_ids:
+            canonical = canonicals.get(pub_id)
+            if not canonical:
+                continue
+
+            authors_b_text = cache["authors_text"].get(pub_id, "")
+
+            result = compare_records(
+                title_a=translated,
+                year_a=ext.publication_year,
+                authors_a=ext.authors_text or "",
+                title_b=canonical.title or "",
+                year_b=canonical.publication_year,
+                authors_b=authors_b_text,
+            )
+
+            # Safety guard: traducción automática puede ser imprecisa.
+            # Exigir solapamiento mínimo de autores como señal de confirmación.
+            if result.author_score < 40.0:
+                continue
+
+            if result.combined_score > best_score:
+                best_score = result.combined_score
+                best_canonical = canonical
+                best_result = result
+
+        return best_canonical, best_result
 
     # ---------------------------------------------------------
     # FUZZY MATCHING CONTRA CANÓNICAS
@@ -713,6 +988,63 @@ class ReconciliationEngine:
                 best_result = result
 
         return best_canonical, best_result
+
+    def _find_title_only_match(
+        self, ext
+    ) -> Optional[CanonicalPublication]:
+        """
+        Chequeo ligero de título-solo a alta confianza (>= title_high_confidence).
+        Usado en PASO 2.8 para evitar crear canonicals duplicados cuando el único
+        obstáculo fue el conflicto de DOI o la baja similitud de autores.
+
+        Retorna el canónico existente si hay match, None en caso contrario.
+        Solo considera candidatos del mismo año (tolerancia ±1) para reducir falsos positivos.
+        """
+        from reconciliation.fuzzy_matcher import compare_titles
+
+        incoming_title = ext.normalized_title or normalize_text(ext.title or "")
+        if not incoming_title or len(incoming_title) < 15:
+            return None
+
+        yr = ext.publication_year
+        year_filter = []
+        if yr:
+            year_filter = list(range(yr - 1, yr + 2))
+
+        incoming_type = normalize_publication_type(ext.publication_type or "") if ext.publication_type else None
+
+        q = self.session.query(
+            CanonicalPublication.id,
+            CanonicalPublication.normalized_title,
+            CanonicalPublication.doi,
+            CanonicalPublication.publication_type,
+        )
+        if year_filter:
+            q = q.filter(CanonicalPublication.publication_year.in_(year_filter))
+        q = q.filter(
+            CanonicalPublication.normalized_title.isnot(None),
+            func.length(CanonicalPublication.normalized_title) > 10,
+        )
+
+        best_id: Optional[int] = None
+        best_score: float = 0.0
+
+        for (canon_id, canon_title, _, canon_type) in q.all():
+            if not canon_title:
+                continue
+            # Si ambos tienen tipo definido y son distintos, no son el mismo producto
+            if incoming_type and canon_type:
+                if normalize_publication_type(canon_type) != incoming_type:
+                    continue
+            score = compare_titles(incoming_title, canon_title)
+            if score >= rc_config.title_high_confidence and score > best_score:
+                best_score = score
+                best_id = canon_id
+
+        if best_id is None:
+            return None
+
+        return self.session.get(CanonicalPublication, best_id)
 
     def _find_author_id_match(
         self, ext
@@ -821,6 +1153,60 @@ class ReconciliationEngine:
             f"({match_type}, score={score:.1f})"
         )
 
+    @staticmethod
+    def _extract_raw_field(raw: dict, source_name: str, field: str) -> Optional[str]:
+        """
+        Extrae abstract, page_range o publisher desde raw_data cuando no hay
+        columna tipada en el modelo de fuente.
+
+        Claves por fuente:
+          openalex  → abstract: abstract_inverted_index (reconstruido)
+                      publisher: primary_location.source.publisher_lineage_names[0]
+          scopus    → abstract: dc:description | description
+                      page_range: prism:pageRange | pageRange
+                      publisher: dc:publisher | prism:publisher
+          wos       → abstract: abstracts.items[0].value
+                      page_range: source.pages.range | source.pages.compact
+                      publisher: source.publisherName
+        """
+        if not raw:
+            return None
+
+        if field == "abstract":
+            if source_name == "openalex":
+                aii = raw.get("abstract_inverted_index") or {}
+                if aii:
+                    pos_word: Dict[int, str] = {}
+                    for word, positions in aii.items():
+                        for pos in (positions if isinstance(positions, list) else [positions]):
+                            pos_word[pos] = word
+                    return " ".join(pos_word[i] for i in sorted(pos_word)) or None
+            elif source_name == "scopus":
+                return raw.get("dc:description") or raw.get("description") or raw.get("abstract")
+            elif source_name == "wos":
+                items = (raw.get("abstracts") or {}).get("items") or []
+                return items[0].get("value") if items else None
+
+        elif field == "page_range":
+            if source_name == "scopus":
+                return raw.get("prism:pageRange") or raw.get("pageRange")
+            elif source_name == "wos":
+                pages = (raw.get("source") or {}).get("pages") or {}
+                return pages.get("range") or pages.get("compact")
+
+        elif field == "publisher":
+            if source_name == "openalex":
+                primary = raw.get("primary_location") or {}
+                source = primary.get("source") or {}
+                lineage = source.get("publisher_lineage_names") or []
+                return lineage[0] if lineage else None
+            elif source_name == "scopus":
+                return raw.get("dc:publisher") or raw.get("prism:publisher")
+            elif source_name == "wos":
+                return (raw.get("source") or {}).get("publisherName")
+
+        return None
+
     def _reject_source_record(self, ext, reason: str):
         """Marca un registro de fuente como rechazado sin crear canónica."""
         ext.status = RecordStatus.REJECTED
@@ -896,11 +1282,26 @@ class ReconciliationEngine:
         if ext.issn:
             provenance["issn"] = src
 
+        # Campos enriquecidos: extraer desde raw_data si no hay columna tipada
+        raw = ext.raw_data or {}
+        abstract_val = getattr(ext, "abstract", None) or self._extract_raw_field(raw, src, "abstract")
+        page_range_val = getattr(ext, "page_range", None) or self._extract_raw_field(raw, src, "page_range")
+        publisher_val = getattr(ext, "publisher", None) or self._extract_raw_field(raw, src, "publisher")
+        pmid_val = getattr(ext, "pmid", None)
+        pmcid_val = getattr(ext, "pmcid", None)
+
+        for field, val in [
+            ("abstract", abstract_val), ("page_range", page_range_val),
+            ("publisher", publisher_val), ("pmid", pmid_val), ("pmcid", pmcid_val),
+        ]:
+            if val:
+                provenance[field] = src
+
         initial_cites = ext.citation_count or 0
         canonical = CanonicalPublication(
             doi=ndoi,
             title=raw_title,
-            normalized_title=ext.normalized_title,
+            normalized_title=ext.normalized_title or (normalize_text(raw_title) if raw_title else None),
             publication_year=ext.publication_year,
             publication_date=ext.publication_date,
             publication_type=normalize_publication_type(ext.publication_type),
@@ -914,6 +1315,11 @@ class ReconciliationEngine:
             sources_count=1,
             field_provenance=provenance,
             field_conflicts={},
+            abstract=abstract_val,
+            page_range=page_range_val,
+            publisher=publisher_val,
+            pmid=pmid_val,
+            pmcid=pmcid_val,
         )
 
         try:
@@ -992,6 +1398,41 @@ class ReconciliationEngine:
             f"  REVISIÓN: {ext.source_name}:{ext.id}, posible_canon={candidate.id} "
             f"(score={score:.1f})"
         )
+
+    def _store_duplicate_pair(
+        self,
+        canonical_id_a: int,
+        canonical_id_b: int,
+        score: float,
+        method: str = "title",
+    ) -> None:
+        """
+        Persiste un par de publicaciones posiblemente duplicadas.
+        Idempotente: ignora si el par ya existe (ON CONFLICT DO NOTHING).
+        Ordena los IDs para cumplir el CHECK canonical_id_1 < canonical_id_2.
+        """
+        id1, id2 = (canonical_id_a, canonical_id_b) if canonical_id_a < canonical_id_b else (canonical_id_b, canonical_id_a)
+        try:
+            existing = (
+                self.session.query(PossibleDuplicatePair)
+                .filter_by(canonical_id_1=id1, canonical_id_2=id2)
+                .first()
+            )
+            if existing:
+                return
+            pair = PossibleDuplicatePair(
+                canonical_id_1=id1,
+                canonical_id_2=id2,
+                similarity_score=round(score, 2),
+                match_method=method,
+                status="pending",
+            )
+            self.session.add(pair)
+            logger.info(
+                f"  DUPLICATE_PAIR guardado: {id1}↔{id2} score={score:.1f} method={method}"
+            )
+        except Exception as exc:
+            logger.warning(f"  No se pudo guardar duplicate pair {id1}↔{id2}: {exc}")
 
     # ---------------------------------------------------------
     # ENRIQUECIMIENTO
@@ -1122,11 +1563,23 @@ class ReconciliationEngine:
 
         # ── Campos enriquecidos ───────────────────────────────────
 
-        # Abstract
-        if not canonical.abstract and hasattr(ext, "abstract") and ext.abstract:
-            canonical.abstract = ext.abstract
-            enriched_fields.append("abstract")
-            prov["abstract"] = src
+        # Normalized title — computar desde title si falta
+        if not canonical.normalized_title and canonical.title:
+            canonical.normalized_title = normalize_text(canonical.title)
+            enriched_fields.append("normalized_title")
+            prov["normalized_title"] = src
+
+        # Abstract — columna tipada si existe, si no extraer de raw_data
+        if not canonical.abstract:
+            raw_e = ext.raw_data or {}
+            abstract_val = (
+                getattr(ext, "abstract", None)
+                or self._extract_raw_field(raw_e, src, "abstract")
+            )
+            if abstract_val:
+                canonical.abstract = abstract_val
+                enriched_fields.append("abstract")
+                prov["abstract"] = src
 
         # Keywords
         if not canonical.keywords:
@@ -1145,17 +1598,43 @@ class ReconciliationEngine:
             enriched_fields.append("source_url")
             prov["source_url"] = src
 
-        # Rango de páginas
-        if not canonical.page_range and hasattr(ext, "page_range") and ext.page_range:
-            canonical.page_range = ext.page_range
-            enriched_fields.append("page_range")
-            prov["page_range"] = src
+        # Rango de páginas — columna tipada si existe, si no extraer de raw_data
+        if not canonical.page_range:
+            raw_e = ext.raw_data or {}
+            page_range_val = (
+                getattr(ext, "page_range", None)
+                or self._extract_raw_field(raw_e, src, "page_range")
+            )
+            if page_range_val:
+                canonical.page_range = page_range_val
+                enriched_fields.append("page_range")
+                prov["page_range"] = src
 
-        # Editorial / publisher
-        if not canonical.publisher and hasattr(ext, "publisher") and ext.publisher:
-            canonical.publisher = ext.publisher
-            enriched_fields.append("publisher")
-            prov["publisher"] = src
+        # Editorial / publisher — columna tipada si existe, si no extraer de raw_data
+        if not canonical.publisher:
+            raw_e = ext.raw_data or {}
+            publisher_val = (
+                getattr(ext, "publisher", None)
+                or self._extract_raw_field(raw_e, src, "publisher")
+            )
+            if publisher_val:
+                canonical.publisher = publisher_val
+                enriched_fields.append("publisher")
+                prov["publisher"] = src
+
+        # PMID / PMCID — solo disponible en registros de OpenAlex
+        if not canonical.pmid:
+            pmid_val = getattr(ext, "pmid", None)
+            if pmid_val:
+                canonical.pmid = pmid_val
+                enriched_fields.append("pmid")
+                prov["pmid"] = src
+        if not canonical.pmcid:
+            pmcid_val = getattr(ext, "pmcid", None)
+            if pmcid_val:
+                canonical.pmcid = pmcid_val
+                enriched_fields.append("pmcid")
+                prov["pmcid"] = src
 
         # Cobertura de revista
         if not canonical.journal_coverage:
@@ -1237,6 +1716,70 @@ class ReconciliationEngine:
                 f"  ENRIQUECIDO canon={canonical.id} con {src}: "
                 f"{', '.join(enriched_fields)}"
             )
+
+    def enrich_canonical(self, canonical_id: int) -> dict:
+        """
+        Enriquece UN canónico específico con los registros de fuente ya vinculados.
+        Llena campos vacíos, actualiza citations_by_source y retorna diff completo.
+        """
+        from db.source_registry import SOURCE_REGISTRY
+
+        _TRACKED = [
+            "doi", "title", "publication_year", "publication_date",
+            "publication_type", "language", "source_journal", "issn",
+            "abstract", "keywords", "source_url", "page_range", "publisher",
+            "journal_coverage", "knowledge_area", "cine_code",
+            "first_author", "corresponding_author", "coauthorships_count",
+            "is_open_access", "oa_status", "citation_count",
+            "citations_by_source",
+        ]
+
+        canonical = self.session.get(CanonicalPublication, canonical_id)
+        if not canonical:
+            return {"error": f"Canónico {canonical_id} no encontrado"}
+
+        # Snapshot antes
+        before = {f: getattr(canonical, f, None) for f in _TRACKED}
+        if isinstance(before.get("citations_by_source"), dict):
+            before["citations_by_source"] = dict(before["citations_by_source"])
+
+        sources_used: set = set()
+        for src_def in SOURCE_REGISTRY.all():
+            model = src_def.model_class
+            linked = (
+                self.session.query(model)
+                .filter(model.canonical_publication_id == canonical_id)
+                .all()
+            )
+            for ext in linked:
+                self._enrich_canonical(canonical, ext)
+                sources_used.add(ext.source_name)
+
+        self.session.flush()
+
+        # Snapshot después — detectar qué cambió
+        after = {f: getattr(canonical, f, None) for f in _TRACKED}
+        fields_filled   = []  # vacío → con valor
+        fields_updated  = []  # valor viejo → valor nuevo
+
+        for f in _TRACKED:
+            bv, av = before[f], after[f]
+            if bv == av:
+                continue
+            if not bv and av:
+                fields_filled.append(f)
+            elif bv and av and bv != av:
+                fields_updated.append(f)
+
+        return {
+            "canonical_id": canonical_id,
+            "sources_used": sorted(sources_used),
+            "fields_filled": fields_filled,
+            "fields_updated": fields_updated,
+            "total_changes": len(fields_filled) + len(fields_updated),
+            "citation_count": canonical.citation_count,
+            "citations_by_source": dict(canonical.citations_by_source or {}),
+        }
 
     # ---------------------------------------------------------
     # ENRIQUECIMIENTO MASIVO DE CANÓNICOS EXISTENTES
@@ -1640,10 +2183,11 @@ class ReconciliationEngine:
                 author.field_provenance = author_prov
 
                 try:
-                    self.session.add(author)
-                    self.session.flush()
+                    with self.session.begin_nested():
+                        self.session.add(author)
+                        self.session.flush()
                 except IntegrityError:
-                    self.session.rollback()
+                    author = None
                     if orcid:
                         author = self.session.query(Author).filter_by(orcid=orcid).first()
                     if not author:
@@ -1700,16 +2244,16 @@ class ReconciliationEngine:
             )
             if not existing_link:
                 try:
-                    link = PublicationAuthor(
-                        publication_id=canonical.id,
-                        author_id=author.id,
-                        is_institutional=is_inst,
-                        author_position=idx,
-                    )
-                    self.session.add(link)
-                    self.session.flush()
+                    with self.session.begin_nested():
+                        link = PublicationAuthor(
+                            publication_id=canonical.id,
+                            author_id=author.id,
+                            is_institutional=is_inst,
+                            author_position=idx,
+                        )
+                        self.session.add(link)
+                        self.session.flush()
                 except IntegrityError:
-                    self.session.rollback()
                     pass
 
             if is_inst:
@@ -1718,6 +2262,283 @@ class ReconciliationEngine:
         # Actualizar conteo solo si encontramos más que antes
         if institutional_count > (canonical.institutional_authors_count or 0):
             canonical.institutional_authors_count = institutional_count
+
+    # ---------------------------------------------------------
+    # BACKFILL: autores de publicaciones canónicas existentes
+    # ---------------------------------------------------------
+
+    def backfill_publication_authors(self, batch_size: int = 500) -> dict:
+        """
+        Recorre TODOS los registros de fuente ya reconciliados y llama
+        _ingest_authors() para cada uno, creando/vinculando todos los
+        co-autores a sus publicaciones canónicas.
+
+        Útil para poblar publication_authors en bases de datos existentes
+        donde las publicaciones se crearon sin procesar autores.
+
+        Returns:
+            dict con estadísticas: canonicals_processed, authors_linked,
+            authors_created, source_records_processed, errors.
+        """
+        processed = 0
+        authors_linked = 0
+        authors_created = 0
+        errors = 0
+
+        authors_before = self.session.query(Author).count()
+
+        for source_name, model_cls in SOURCE_MODELS.items():
+            offset = 0
+            while True:
+                batch = (
+                    self.session.query(model_cls)
+                    .filter(model_cls.canonical_publication_id.isnot(None))
+                    .order_by(model_cls.id)
+                    .offset(offset)
+                    .limit(batch_size)
+                    .all()
+                )
+                if not batch:
+                    break
+
+                for ext in batch:
+                    try:
+                        canonical = (
+                            self.session.query(CanonicalPublication)
+                            .get(ext.canonical_publication_id)
+                        )
+                        if not canonical:
+                            continue
+                        self._ingest_authors(canonical, ext)
+                        processed += 1
+                    except Exception as e:
+                        logger.error(
+                            f"Error en backfill_publication_authors "
+                            f"{source_name}:{ext.id}: {e}"
+                        )
+                        errors += 1
+
+                self.session.commit()
+                offset += batch_size
+                logger.info(
+                    f"  [{source_name}] procesados {offset} registros..."
+                )
+
+        authors_after = self.session.query(Author).count()
+        authors_created = authors_after - authors_before
+        authors_linked = (
+            self.session.query(PublicationAuthor).count()
+        )
+
+        logger.info(
+            f"backfill_publication_authors completado: "
+            f"{processed} source records, "
+            f"{authors_created} autores nuevos, "
+            f"{authors_linked} vínculos totales, "
+            f"{errors} errores"
+        )
+
+        return {
+            "source_records_processed": processed,
+            "authors_created": authors_created,
+            "total_publication_author_links": authors_linked,
+            "errors": errors,
+        }
+
+    # ---------------------------------------------------------
+    # BACKFILL: autores consultando fuentes externas por DOI
+    # ---------------------------------------------------------
+
+    def backfill_publication_authors_from_sources(
+        self,
+        batch_size: int = 100,
+        use_openalex: bool = True,
+        use_scopus: bool = True,
+        use_wos: bool = True,
+        scopus_delay: float = 0.3,
+    ) -> dict:
+        """
+        Para cada publicación canónica, re-extrae autores consultando las
+        fuentes externas en orden de prioridad:
+
+          1. authors_json del source record en BD  (sin API call)
+          2. OpenAlex search_by_doi               (gratis, sin cuota)
+          3. Scopus  search_by_doi                (cuota, delay configurable)
+          4. WoS     search_by_doi                (cuota)
+
+        Solo sube a la siguiente fuente si la anterior no devuelve autores.
+
+        Returns:
+            dict: estadísticas del proceso.
+        """
+        from extractors.openalex.extractor import OpenAlexExtractor
+        from extractors.scopus import ScopusExtractor
+        from extractors.wos import WosExtractor
+
+        # Inicializar extractores (solo si están habilitados)
+        oa_ext  = OpenAlexExtractor() if use_openalex else None
+        sc_ext  = ScopusExtractor()   if use_scopus  else None
+        wos_ext = WosExtractor()      if use_wos     else None
+
+        stats = {
+            "canonicals_processed": 0,
+            "authors_linked": 0,
+            "from_db": 0,
+            "from_openalex": 0,
+            "from_scopus": 0,
+            "from_wos": 0,
+            "no_authors_found": 0,
+            "errors": 0,
+        }
+
+        # Clase auxiliar para pasar un StandardRecord a _ingest_authors
+        # (que espera un objeto con .raw_data y .source_name)
+        class _FakeExt:
+            def __init__(self, record: StandardRecord):
+                raw = dict(record.raw_data or {})
+                raw["_parsed_authors"] = record.authors or []
+                raw["_parsed_institutional_authors"] = record.institutional_authors or []
+                self.raw_data = raw
+                self.source_name = record.source_name
+
+        # Función auxiliar: intentar obtener autores desde authors_json en BD
+        def _authors_from_db(canonical_id: int) -> Optional[tuple]:
+            """
+            Busca en los source records vinculados al canónico.
+            Retorna (lista_autores, source_name) o None.
+            """
+            for src_name, model_cls in SOURCE_MODELS.items():
+                rec = (
+                    self.session.query(model_cls)
+                    .filter(model_cls.canonical_publication_id == canonical_id)
+                    .first()
+                )
+                if rec is None:
+                    continue
+                # Intentar _parsed_authors en raw_data primero
+                raw = rec.raw_data or {}
+                authors = (
+                    raw.get("_parsed_authors")
+                    or raw.get("authors")
+                    or []
+                )
+                # Fallback a authorships (OpenAlex)
+                if not authors:
+                    for auth in raw.get("authorships", []):
+                        info = auth.get("author") or {}
+                        name = info.get("display_name", "")
+                        if name:
+                            authors.append({
+                                "name": name,
+                                "orcid": info.get("orcid"),
+                                "openalex_id": info.get("id"),
+                                "is_institutional": False,
+                            })
+                # Fallback a authors_json columna
+                if not authors and hasattr(rec, "authors_json"):
+                    authors = rec.authors_json or []
+                if authors:
+                    return (authors, src_name, rec)
+            return None
+
+        # Procesar en lotes
+        offset = 0
+        while True:
+            canonicals = (
+                self.session.query(CanonicalPublication)
+                .order_by(CanonicalPublication.id)
+                .offset(offset)
+                .limit(batch_size)
+                .all()
+            )
+            if not canonicals:
+                break
+
+            for canonical in canonicals:
+                try:
+                    record_used: Optional[StandardRecord] = None
+                    source_tag = None
+
+                    # ── Nivel 1: source records en BD ──────────────────────
+                    db_result = _authors_from_db(canonical.id)
+                    if db_result:
+                        authors_list, src_name, src_rec = db_result
+                        fake_raw = dict(src_rec.raw_data or {})
+                        fake_raw["_parsed_authors"] = authors_list
+                        fake_raw["_parsed_institutional_authors"] = (
+                            fake_raw.get("_parsed_institutional_authors") or []
+                        )
+                        import types as _types
+                        fake_ext = _types.SimpleNamespace(
+                            raw_data=fake_raw, source_name=src_name
+                        )
+                        self._ingest_authors(canonical, fake_ext)
+                        stats["from_db"] += 1
+                        source_tag = "db"
+
+                    # ── Nivel 2: OpenAlex por DOI ──────────────────────────
+                    if not source_tag and oa_ext and canonical.doi:
+                        try:
+                            record_used = oa_ext.search_by_doi(canonical.doi)
+                            if record_used and record_used.authors:
+                                self._ingest_authors(canonical, _FakeExt(record_used))
+                                stats["from_openalex"] += 1
+                                source_tag = "openalex"
+                        except Exception as e:
+                            logger.debug(f"OpenAlex DOI {canonical.doi}: {e}")
+
+                    # ── Nivel 3: Scopus por DOI ────────────────────────────
+                    if not source_tag and sc_ext and canonical.doi:
+                        try:
+                            record_used = sc_ext.search_by_doi(canonical.doi)
+                            if record_used and record_used.authors:
+                                self._ingest_authors(canonical, _FakeExt(record_used))
+                                stats["from_scopus"] += 1
+                                source_tag = "scopus"
+                            if scopus_delay > 0:
+                                import time as _time
+                                _time.sleep(scopus_delay)
+                        except Exception as e:
+                            logger.debug(f"Scopus DOI {canonical.doi}: {e}")
+
+                    # ── Nivel 4: WoS por DOI ───────────────────────────────
+                    if not source_tag and wos_ext and canonical.doi:
+                        try:
+                            record_used = wos_ext.search_by_doi(canonical.doi)
+                            if record_used and record_used.authors:
+                                self._ingest_authors(canonical, _FakeExt(record_used))
+                                stats["from_wos"] += 1
+                                source_tag = "wos"
+                        except Exception as e:
+                            logger.debug(f"WoS DOI {canonical.doi}: {e}")
+
+                    if not source_tag:
+                        stats["no_authors_found"] += 1
+                        logger.debug(
+                            f"Sin autores para canonical {canonical.id} "
+                            f"'{(canonical.title or '')[:60]}'"
+                        )
+
+                    stats["canonicals_processed"] += 1
+
+                except Exception as e:
+                    logger.error(
+                        f"Error procesando canonical {canonical.id}: {e}",
+                        exc_info=True,
+                    )
+                    stats["errors"] += 1
+
+            self.session.commit()
+            offset += batch_size
+            logger.info(
+                f"[backfill_from_sources] procesados {offset} canónicos... "
+                f"({stats['from_db']} BD / {stats['from_openalex']} OA / "
+                f"{stats['from_scopus']} Scopus / {stats['from_wos']} WoS)"
+            )
+
+        stats["authors_linked"] = self.session.query(PublicationAuthor).count()
+        logger.info(f"backfill_from_sources completado: {stats}")
+        return stats
 
     # ---------------------------------------------------------
     # BACKFILL: completar IDs de autores desde raw_data

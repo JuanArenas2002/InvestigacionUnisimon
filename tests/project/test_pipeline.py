@@ -22,8 +22,8 @@ from project.domain.models.publication import Publication
 from project.domain.services.deduplication_service import DeduplicationService
 from project.domain.services.matching_service import MatchingService
 from project.domain.services.normalization_service import NormalizationService
-from project.ports.repository_port import RepositoryPort
-from project.ports.source_port import SourcePort
+from project.domain.ports.publication_repository import PublicationRepositoryPort
+from project.domain.ports.source_port import SourcePort
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -70,7 +70,7 @@ class FailingSource(SourcePort):
         raise ConnectionError("Fuente no disponible")
 
 
-class MockRepository(RepositoryPort):
+class MockRepository(PublicationRepositoryPort):
     """Repositorio en memoria para tests."""
 
     def __init__(self) -> None:

@@ -326,6 +326,10 @@ class ScopusExtractor(BaseExtractor):
                                 "is_institutional": False,
                             })
 
+                    abstract = entry.findtext('dc:description', default=None, namespaces=ns)
+                    page_range = entry.findtext('prism:pageRange', default=None, namespaces=ns)
+                    publisher = entry.findtext('dc:publisher', default=None, namespaces=ns) or entry.findtext('prism:publisher', default=None, namespaces=ns)
+
                     record = StandardRecord(
                         source_name=self.source_name,
                         source_id=scopus_id,
@@ -337,12 +341,15 @@ class ScopusExtractor(BaseExtractor):
                         source_journal=source_journal,
                         issn=issn,
                         is_open_access=is_oa,
-                        oa_status=oa_status,  # Guardar el string original también
+                        oa_status=oa_status,
                         authors=authors,
                         citation_count=citedby_count,
-                        citations_by_year={},  # No disponible desde Scopus API
+                        citations_by_year={},
                         url=None,
-                        raw_data={"eissn": eissn} if eissn else None,  # Guardar E-ISSN en raw_data
+                        abstract=abstract,
+                        page_range=page_range,
+                        publisher=publisher,
+                        raw_data={"eissn": eissn} if eissn else None,
                     )
                     record.compute_normalized_fields()
                     records.append(record)
@@ -508,8 +515,11 @@ class ScopusExtractor(BaseExtractor):
             oa_status=oa_status,
             authors=authors,
             citation_count=int(entry.get("citedby-count", 0)),
-            url=None,  # Se puede obtener del link
-            raw_data={**entry, "eissn": eissn} if eissn else entry,  # Guardar E-ISSN en raw_data
+            url=None,
+            abstract=entry.get("dc:description") or entry.get("description"),
+            page_range=entry.get("prism:pageRange") or entry.get("pageRange"),
+            publisher=entry.get("dc:publisher") or entry.get("prism:publisher"),
+            raw_data={**entry, "eissn": eissn} if eissn else entry,
         )
 
     # ---------------------------------------------------------
@@ -572,6 +582,29 @@ class ScopusExtractor(BaseExtractor):
         except Exception as e:
             logger.warning(f"Error parseando resultado Scopus para DOI {clean_doi}: {e}")
             return None
+
+    def extract_by_author(
+        self,
+        scopus_author_id: str,
+        max_results: int = 50,
+    ) -> List[StandardRecord]:
+        """
+        Busca publicaciones de un autor en Scopus por su Scopus Author ID.
+
+        Args:
+            scopus_author_id: ID de autor en Scopus (solo dígitos o con prefijo AU-ID)
+            max_results: Límite de resultados
+
+        Returns:
+            Lista de StandardRecords del autor.
+        """
+        clean_id = str(scopus_author_id).strip().lstrip("AU-ID(").rstrip(")")
+        query = f"AU-ID({clean_id})"
+        try:
+            return self.extract(query=query, max_results=max_results)
+        except Exception as e:
+            logger.debug(f"extract_by_author scopus_id={clean_id!r}: {e}")
+            return []
 
     def search_by_dois(
         self, dois: List[str], delay: float = 0.25

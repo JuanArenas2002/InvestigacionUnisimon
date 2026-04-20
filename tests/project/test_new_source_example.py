@@ -17,7 +17,7 @@ from typing import List, Optional
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 from project.registry.source_registry import SourceRegistry
 from project.application.ingest_pipeline import IngestPipeline
 from project.domain.services.deduplication_service import DeduplicationService

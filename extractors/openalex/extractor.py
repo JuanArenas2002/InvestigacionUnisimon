@@ -271,6 +271,25 @@ class OpenAlexExtractor(BaseExtractor):
             or work.get("id")
         )
 
+        # Abstract: OpenAlex usa abstract_inverted_index (índice invertido)
+        abstract = None
+        aii = work.get("abstract_inverted_index") or {}
+        if aii:
+            try:
+                pos_word = {}
+                for word, positions in aii.items():
+                    for pos in (positions if isinstance(positions, list) else [positions]):
+                        pos_word[pos] = word
+                abstract = " ".join(pos_word[i] for i in sorted(pos_word)) or None
+            except Exception:
+                abstract = None
+
+        # Publisher: primer elemento de publisher_lineage_names
+        publisher = None
+        lineage = source_data.get("publisher_lineage_names") or []
+        if lineage:
+            publisher = lineage[0]
+
         return StandardRecord(
             source_name=self.source_name,
             source_id=work.get("id"),
@@ -290,6 +309,8 @@ class OpenAlexExtractor(BaseExtractor):
             institutional_authors=institutional_authors,
             citation_count=work.get("cited_by_count", 0),
             url=url,
+            abstract=abstract,
+            publisher=publisher,
             raw_data=work,
         )
 

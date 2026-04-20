@@ -16,7 +16,7 @@ from typing import List, Optional
 import pytest
 
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 from project.registry.source_registry import SourceRegistry
 
 

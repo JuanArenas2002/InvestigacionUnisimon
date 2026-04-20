@@ -28,12 +28,15 @@ from api.schemas.publications import (
     DuplicatePublicationsSummary,
     MergePublicationsRequest,
     MergePublicationsResponse,
+    AutoMergeDuplicatesRequest,
+    AutoMergeDuplicatesResponse,
     EstadoPublicacion,
 )
 from db.models import (
     CanonicalPublication,
     Author,
     PublicationAuthor,
+    PossibleDuplicatePair,
     SOURCE_MODELS,
     get_all_source_records_for_canonical,
     find_record_by_doi_across_sources,
@@ -41,6 +44,18 @@ from db.models import (
 from extractors.base import normalize_text, normalize_doi
 from shared.normalizers import normalize_publication_type
 from api.routers.publications_duplicates import find_possible_duplicates
+from project.application.use_cases.publications.merge import (
+    MERGE_FIELDS,
+    compute_field_inheritance,
+    pick_keeper as _domain_pick_keeper,
+    should_skip_pair,
+    validate_merge_command,
+)
+from project.application.schemas.publication_schemas import (
+    AutoMergeFilters,
+    MergePublicationsCommand,
+    PublicationSnapshot,
+)
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/publications", tags=["Publicaciones"])
@@ -305,23 +320,30 @@ def detect_duplicate_publications(
     year: Optional[int] = Query(None, description="Filtrar solo publicaciones de este año"),
     publication_type: Optional[str] = Query(None, description="Filtrar por tipo de publicación (ej. journal-article, book-chapter)"),
     limit: int = Query(100, ge=1, le=1000, description="Máximo de pares a retornar"),
+    detect_translated: bool = Query(True, description="Detectar duplicados cross-idioma traduciendo títulos al inglés"),
     db: Session = Depends(get_db),
 ):
     """
     Detecta publicaciones canónicas que podrían ser duplicadas usando
-    **rapidfuzz** en Python (sin restricción de año).
+    **rapidfuzz** en Python.
 
-    Estrategia:
+    **Fases de detección:**
 
-    1. Carga todas las publicaciones con título normalizado > 10 chars.
-    2. Usa `rapidfuzz.process.extract` con `token_sort_ratio` (C optimizado)
-       para comparar cada título contra todos los demás con `score_cutoff`.
-    3. Detecta pares con mismo DOI normalizado (prioridad máxima).
+    1. Carga publicaciones con título normalizado > 10 chars.
+    2. Fuzzy `token_sort_ratio` agrupado por año ±1 (títulos en mismo idioma).
+    3. DOI duplicados con distinto ID canónico (prioridad máxima).
+    4. **Cross-language**: traduce títulos no-ingleses al inglés y compara
+       contra publicaciones en inglés del mismo año ±2. Detecta el caso
+       CvLAC/DatosAbiertos (español) ≡ Scopus/WoS/OpenAlex (inglés).
+       Se puede desactivar con `detect_translated=false`.
 
-    Clasifica cada par:
-    - **Alta** (≥95 % o mismo DOI): Recomendación = merge
-    - **Media** (85-95 %): Recomendación = review
-    - **Baja** (< 85 %): Recomendación = keep_both
+    **Clasificación por par:**
+    - **Alta** (≥95 % o mismo DOI): `merge`
+    - **Media** (85-95 %): `review`
+    - **Baja** (< 85 %): `keep_both`
+
+    Los pares cross-language tienen `match_method = "translated_title"` e
+    incluyen `translated_title_1`/`translated_title_2` para auditoría.
     """
     from rapidfuzz import fuzz as rfuzz, process as rprocess
 
@@ -336,6 +358,7 @@ def detect_duplicate_publications(
         CanonicalPublication.normalized_title,
         CanonicalPublication.publication_type,
         CanonicalPublication.publication_year,
+        CanonicalPublication.language,
     ).filter(
         CanonicalPublication.normalized_title.isnot(None),
         func.length(CanonicalPublication.normalized_title) > 10,
@@ -349,10 +372,24 @@ def detect_duplicate_publications(
     n = len(all_pubs)
     logger.info(f"Duplicados: analizando {n} publicaciones")
 
+    # --- 1.5. Pre-cargar autores de TODAS las publicaciones (una sola query) ---
+    # Se usa tanto para cross-language (FASE 3.5) como para la respuesta (FASE 7).
+    all_pub_ids = [p.id for p in all_pubs]
+    _all_pa_rows = (
+        db.query(PublicationAuthor.publication_id, PublicationAuthor.author_id)
+        .filter(PublicationAuthor.publication_id.in_(all_pub_ids))
+        .all()
+    )
+    # pub_id → frozenset de author_ids
+    _authors_sets: dict = defaultdict(set)
+    for pub_id, author_id in _all_pa_rows:
+        _authors_sets[pub_id].add(author_id)
+    authors_sets: dict = {pid: frozenset(s) for pid, s in _authors_sets.items()}
+
     if n == 0:
         return DuplicatePublicationsSummary(
             total_pairs=0, high_confidence=0, medium_confidence=0,
-            low_confidence=0, same_doi_different_id=0, pairs=[],
+            low_confidence=0, same_doi_different_id=0, translation_matches=0, pairs=[],
         )
 
     # --- 2. Comparación fuzzy agrupada por año (F5 optimization) ---
@@ -449,6 +486,92 @@ def detect_duplicate_publications(
                 )
                 raw_pairs.append((p1, p2, max(score, 100.0)))
 
+    # --- 3.5. Cross-language: detectar duplicados por solapamiento de autores ---
+    # Estrategia: sin llamadas a APIs externas.
+    # Si dos publicaciones en idiomas distintos (español vs inglés) comparten
+    # autores y tienen año cercano, son casi con certeza el mismo paper.
+    #
+    # Señal: Jaccard de author_ids >= 0.25 (al menos 1 de cada 4 autores compartido).
+    # Velocidad: O(k²) por bucket de año — todo en memoria con los datos ya cargados.
+    translated_pair_keys: set = set()
+
+    if detect_translated:
+        _ENGLISH_CODES = {"en", "eng"}
+
+        def _is_english(pub) -> bool:
+            lang = (pub.language or "").lower().strip()
+            if lang in _ENGLISH_CODES:
+                return True
+            if lang and lang not in ("", "unknown"):
+                return False
+            try:
+                from langdetect import detect
+                return detect(pub.normalized_title or "") == "en"
+            except Exception:
+                return True  # asumir inglés si no se puede detectar
+
+        non_english = [p for p in all_pubs if not _is_english(p)]
+        english_pubs  = [p for p in all_pubs if _is_english(p)]
+
+        if non_english and english_pubs:
+            # Índice de pubs en inglés por año para lookup O(1)
+            en_by_year: dict = defaultdict(list)
+            for ep in english_pubs:
+                en_by_year[ep.publication_year].append(ep)
+
+            cross_found = 0
+            for ne_pub in non_english:
+                yr = ne_pub.publication_year
+                if yr is None:
+                    continue
+
+                ne_authors = authors_sets.get(ne_pub.id, frozenset())
+                if not ne_authors:
+                    continue
+
+                # Candidatos en inglés: año ±2
+                en_candidates = []
+                for delta in range(-2, 3):
+                    en_candidates.extend(en_by_year.get(yr + delta, []))
+
+                for en_pub in en_candidates:
+                    pair_key = (min(ne_pub.id, en_pub.id), max(ne_pub.id, en_pub.id))
+                    if pair_key in seen_pairs:
+                        continue
+
+                    en_authors = authors_sets.get(en_pub.id, frozenset())
+                    if not en_authors:
+                        continue
+
+                    shared = len(ne_authors & en_authors)
+                    if shared == 0:
+                        continue
+
+                    union = len(ne_authors | en_authors)
+                    jaccard = shared / union if union else 0.0
+                    if jaccard < 0.25:
+                        continue
+
+                    # Score: combinar jaccard de autores con similitud de título
+                    # (aunque sean idiomas distintos, pueden compartir palabras
+                    # técnicas, acrónimos y nombres propios)
+                    title_sim = rfuzz.token_sort_ratio(
+                        ne_pub.normalized_title or "",
+                        en_pub.normalized_title or "",
+                    )
+                    # Score final: 60% autores + 40% título (los títulos son distintos
+                    # por definición, pero el solapamiento léxico ayuda a calibrar)
+                    score = jaccard * 60 + title_sim * 0.40
+                    if score < min_score:
+                        continue
+
+                    seen_pairs.add(pair_key)
+                    translated_pair_keys.add(pair_key)
+                    raw_pairs.append((ne_pub, en_pub, score))
+                    cross_found += 1
+
+            logger.info(f"Duplicados cross-language (por autores): {cross_found} pares")
+
     # --- 4. Ordenar por score desc y limitar ---
     raw_pairs.sort(key=lambda x: -x[2])
     raw_pairs = raw_pairs[:limit]
@@ -499,6 +622,7 @@ def detect_duplicate_publications(
     medium = 0
     low = 0
     same_doi_count = 0
+    translation_match_count = 0
 
     for p1, p2, score in raw_pairs:
         sim = round(score / 100.0, 4)
@@ -510,14 +634,28 @@ def detect_duplicate_publications(
             p1.publication_year and p2.publication_year
             and p1.publication_year == p2.publication_year
         )
+        pair_key = (min(p1.id, p2.id), max(p1.id, p2.id))
+        is_translated = pair_key in translated_pair_keys
 
         if same_doi:
             same_doi_count += 1
+            match_method = "doi"
+        elif is_translated:
+            match_method = "cross_language"
+            translation_match_count += 1
+        else:
+            match_method = "title"
 
-        if sim >= 0.95 or same_doi:
+        # Pares cross-language detectados por solapamiento de autores:
+        # recomendación "review" siempre (requieren confirmación humana
+        # ya que los títulos son en idiomas distintos).
+        if same_doi:
             recommendation = "merge"
             high += 1
-        elif sim >= 0.85:
+        elif sim >= 0.95 and not is_translated:
+            recommendation = "merge"
+            high += 1
+        elif sim >= 0.85 or (is_translated and sim >= 0.80):
             recommendation = "review"
             medium += 1
         else:
@@ -571,12 +709,154 @@ def detect_duplicate_publications(
                 PublicationAuthorRead.from_pa_author(pa, a)
                 for pa, a in authors_by_pub.get(p2.id, [])
             ],
+            match_method=match_method,
+            translated_title_1=None,
+            translated_title_2=None,
         ))
 
     elapsed = round(time.perf_counter() - t0, 2)
+
+    # --- 8. Persistir pares encontrados en possible_duplicate_pairs ---
+    # Upsert: insertar solo si no existe ya (status != merged/dismissed se respeta).
+    seen_stored_keys: set = set()
+    for pair in pairs:
+        id1 = min(pair.canonical_id_1, pair.canonical_id_2)
+        id2 = max(pair.canonical_id_1, pair.canonical_id_2)
+        key = (id1, id2)
+        if key in seen_stored_keys:
+            continue
+        seen_stored_keys.add(key)
+        existing = (
+            db.query(PossibleDuplicatePair)
+            .filter_by(canonical_id_1=id1, canonical_id_2=id2)
+            .first()
+        )
+        if not existing:
+            try:
+                db.add(PossibleDuplicatePair(
+                    canonical_id_1=id1,
+                    canonical_id_2=id2,
+                    similarity_score=round(pair.similarity_score * 100, 2),
+                    match_method=pair.match_method,
+                    status="pending",
+                ))
+            except Exception:
+                pass  # no romper la respuesta si falla el upsert
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+
+    # --- 9. Incluir pares almacenados del motor que no aparecieron on-the-fly ---
+    stored_pairs = (
+        db.query(PossibleDuplicatePair)
+        .filter(PossibleDuplicatePair.status == "pending")
+        .all()
+    )
+    fly_keys = {(min(p.canonical_id_1, p.canonical_id_2), max(p.canonical_id_1, p.canonical_id_2)) for p in pairs}
+    engine_only_ids: set = set()
+    for sp in stored_pairs:
+        key = (sp.canonical_id_1, sp.canonical_id_2)
+        if key not in fly_keys:
+            engine_only_ids.add(sp.canonical_id_1)
+            engine_only_ids.add(sp.canonical_id_2)
+
+    if engine_only_ids:
+        # Cargar datos de esos canónicos y construir pares sintéticos
+        engine_pubs = {
+            p.id: p
+            for p in db.query(CanonicalPublication).filter(CanonicalPublication.id.in_(engine_only_ids)).all()
+        }
+        # Cargar autores en batch
+        engine_pa_rows = (
+            db.query(PublicationAuthor, Author)
+            .join(Author, PublicationAuthor.author_id == Author.id)
+            .filter(PublicationAuthor.publication_id.in_(engine_only_ids))
+            .order_by(PublicationAuthor.publication_id, PublicationAuthor.author_position.asc().nullslast())
+            .all()
+        )
+        engine_authors_by_pub: dict = defaultdict(list)
+        for pa, a in engine_pa_rows:
+            engine_authors_by_pub[pa.publication_id].append((pa, a))
+        # Cargar sources
+        engine_sources_map: dict = {}
+        for source_name, model_cls in SOURCE_MODELS.items():
+            rows = (
+                db.query(model_cls.canonical_publication_id)
+                .filter(model_cls.canonical_publication_id.in_(engine_only_ids))
+                .distinct().all()
+            )
+            for (cpid,) in rows:
+                if cpid not in engine_sources_map:
+                    engine_sources_map[cpid] = []
+                if source_name not in engine_sources_map[cpid]:
+                    engine_sources_map[cpid].append(source_name)
+
+        for sp in stored_pairs:
+            key = (sp.canonical_id_1, sp.canonical_id_2)
+            if key in fly_keys:
+                continue
+            p1 = engine_pubs.get(sp.canonical_id_1)
+            p2 = engine_pubs.get(sp.canonical_id_2)
+            if not p1 or not p2:
+                continue
+            sim = round(sp.similarity_score / 100.0, 4) if sp.similarity_score > 1.0 else round(sp.similarity_score, 4)
+            same_doi = bool(p1.doi and p2.doi and normalize_doi(p1.doi) == normalize_doi(p2.doi))
+            same_year = bool(p1.publication_year and p2.publication_year and p1.publication_year == p2.publication_year)
+            if same_doi or sim >= 0.95:
+                recommendation = "merge"
+                high += 1
+            elif sim >= 0.85:
+                recommendation = "review"
+                medium += 1
+            else:
+                recommendation = "keep_both"
+                low += 1
+
+            a1 = {a.id for _, a in engine_authors_by_pub.get(p1.id, [])}
+            a2 = {a.id for _, a in engine_authors_by_pub.get(p2.id, [])}
+            if a1 or a2:
+                union_a = a1 | a2
+                author_similarity = round(len(a1 & a2) / len(union_a), 3) if union_a else 0.0
+                author_diff_1 = list(a1 - a2)
+                author_diff_2 = list(a2 - a1)
+            else:
+                author_similarity = None
+                author_diff_1 = []
+                author_diff_2 = []
+
+            pairs.append(DuplicatePublicationPair(
+                canonical_id_1=p1.id,
+                canonical_id_2=p2.id,
+                doi_1=p1.doi,
+                doi_2=p2.doi,
+                title_1=p1.title,
+                title_2=p2.title,
+                type_1=p1.publication_type,
+                type_2=p2.publication_type,
+                year_1=p1.publication_year,
+                year_2=p2.publication_year,
+                sources_1=sorted(engine_sources_map.get(p1.id, [])),
+                sources_2=sorted(engine_sources_map.get(p2.id, [])),
+                similarity_score=sim,
+                same_doi=same_doi,
+                same_year=same_year,
+                recommendation=recommendation,
+                author_similarity=author_similarity,
+                author_diff_1=author_diff_1,
+                author_diff_2=author_diff_2,
+                authors_1=[PublicationAuthorRead.from_pa_author(pa, a) for pa, a in engine_authors_by_pub.get(p1.id, [])],
+                authors_2=[PublicationAuthorRead.from_pa_author(pa, a) for pa, a in engine_authors_by_pub.get(p2.id, [])],
+                match_method=sp.match_method,
+                translated_title_1=None,
+                translated_title_2=None,
+            ))
+
     logger.info(
         f"Duplicados: {len(pairs)} pares en {elapsed}s "
-        f"(alta={high}, media={medium}, baja={low}, doi_dup={same_doi_count})"
+        f"(alta={high}, media={medium}, baja={low}, "
+        f"doi_dup={same_doi_count}, traduccion={translation_match_count}, "
+        f"motor={len(engine_only_ids) // 2 if engine_only_ids else 0})"
     )
 
     return DuplicatePublicationsSummary(
@@ -585,8 +865,274 @@ def detect_duplicate_publications(
         medium_confidence=medium,
         low_confidence=low,
         same_doi_different_id=same_doi_count,
+        translation_matches=translation_match_count,
         pairs=pairs,
     )
+
+
+# ── POST /publications/enrich-by-doi ─────────────────────────────────────────
+
+@router.post(
+    "/enrich-by-doi",
+    response_model=dict,
+    summary="Alimentar una publicación canónica desde todos los extractores usando su DOI",
+    tags=["Publicaciones"],
+)
+async def enrich_publication_by_doi(
+    doi: str = Body(..., embed=True, description="DOI de la publicación (ej: 10.1016/j.xxx.2020.01.001)"),
+    db: Session = Depends(get_db),
+):
+    """
+    Dado un DOI, consulta **todos los extractores** que soportan búsqueda por DOI
+    (OpenAlex, Scopus, Web of Science), ingesta los registros encontrados,
+    los reconcilia contra el canónico correspondiente y actualiza `citations_by_source`.
+
+    Flujo:
+    1. Normaliza el DOI.
+    2. Busca el canónico existente por DOI (o lo crea si la reconciliación genera uno nuevo).
+    3. Consulta en paralelo: OpenAlex → Scopus → WoS.
+    4. Ingesta los registros nuevos (omite duplicados ya existentes).
+    5. Reconcilia los pendientes contra el canónico.
+    6. Fuerza enriquecimiento del canónico: completa campos vacíos y actualiza
+       `citations_by_source` con los valores reportados por cada plataforma.
+    7. Retorna el canónico actualizado con el desglose de citas por fuente.
+
+    Útil para alimentar una publicación específica sin tener que correr el
+    pipeline completo de todas las fuentes.
+    """
+    from starlette.concurrency import run_in_threadpool
+    from extractors.scopus import ScopusExtractor, ScopusAPIError
+    from extractors.wos import WosExtractor
+    from extractors.openalex.extractor import OpenAlexExtractor
+    from reconciliation.engine import ReconciliationEngine
+    from extractors.base import normalize_doi as _norm_doi
+
+    ndoi = _norm_doi(doi)
+    if not ndoi:
+        raise HTTPException(400, f"DOI inválido: '{doi}'")
+
+    def _run():
+        platform_results = {}
+        records_to_ingest = []
+
+        # ── OpenAlex (sin cuota, primero) ──
+        try:
+            rec = OpenAlexExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["openalex"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["openalex"] = {"found": False}
+        except Exception as e:
+            platform_results["openalex"] = {"found": False, "error": str(e)}
+
+        # ── Scopus ──
+        try:
+            rec = ScopusExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["scopus"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["scopus"] = {"found": False}
+        except ScopusAPIError as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+        except Exception as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+
+        # ── WoS ──
+        try:
+            rec = WosExtractor().search_by_doi(ndoi)
+            if rec:
+                records_to_ingest.append(rec)
+                platform_results["wos"] = {
+                    "found": True,
+                    "source_id": rec.source_id,
+                    "citations": rec.citation_count,
+                }
+            else:
+                platform_results["wos"] = {"found": False}
+        except Exception as e:
+            platform_results["wos"] = {"found": False, "error": str(e)}
+
+        engine = ReconciliationEngine(session=db)
+
+        # Ingestar + reconciliar
+        ingested = engine.ingest_records(records_to_ingest)
+        recon_stats = None
+        if ingested > 0:
+            recon_stats = engine.reconcile_pending(batch_size=ingested + 10)
+
+        # Encontrar el canónico resultante (por DOI normalizado)
+        canonical = (
+            db.query(CanonicalPublication)
+            .filter(CanonicalPublication.doi == ndoi)
+            .first()
+        )
+
+        enrich_result = {}
+        if canonical:
+            enrich_result = engine.enrich_canonical(canonical.id)
+            db.commit()
+            db.refresh(canonical)
+
+        pub_data = None
+        if canonical:
+            from api.schemas.publications import PublicationDetail, ExternalRecordBrief
+            from db.models import get_all_source_records_for_canonical
+            from api.utils import get_clean_source_id
+
+            ext_records = get_all_source_records_for_canonical(db, canonical.id)
+            ext_briefs = [
+                ExternalRecordBrief(
+                    id=er.id, source_name=er.source_name, source_id=er.source_id,
+                    doi=er.doi, status=er.status, match_type=er.match_type,
+                    match_score=er.match_score,
+                ).model_dump()
+                for er in ext_records
+            ]
+            source_links = {
+                er.source_name: get_clean_source_id(er.source_name, er.source_id)
+                for er in ext_records
+                if get_clean_source_id(er.source_name, er.source_id)
+            }
+            pub_data = {
+                "id": canonical.id,
+                "doi": canonical.doi,
+                "title": canonical.title,
+                "publication_year": canonical.publication_year,
+                "publication_type": canonical.publication_type,
+                "language": canonical.language,
+                "source_journal": canonical.source_journal,
+                "issn": canonical.issn,
+                "abstract": canonical.abstract,
+                "keywords": canonical.keywords,
+                "page_range": canonical.page_range,
+                "publisher": canonical.publisher,
+                "is_open_access": canonical.is_open_access,
+                "oa_status": canonical.oa_status,
+                "citation_count": canonical.citation_count,
+                "citations_by_source": canonical.citations_by_source or {},
+                "sources_count": canonical.sources_count,
+                "field_provenance": canonical.field_provenance or {},
+                "external_records": ext_briefs,
+                "source_links": source_links,
+            }
+
+        return {
+            "doi": ndoi,
+            "canonical_id": canonical.id if canonical else None,
+            "platforms": platform_results,
+            "records_ingested": ingested,
+            "reconciliation": recon_stats.to_dict() if recon_stats else None,
+            "enrichment": enrich_result,
+            "publication": pub_data,
+        }
+
+    return await run_in_threadpool(_run)
+
+
+# ── POST /publications/{id}/fetch-all ────────────────────────────────────────
+
+@router.post(
+    "/{pub_id}/fetch-all",
+    response_model=dict,
+    summary="Buscar e ingestar publicación en todas las plataformas",
+    tags=["Publicaciones"],
+)
+async def fetch_publication_all_sources(
+    pub_id: int = Path(..., description="ID de la publicación canónica"),
+    db: Session = Depends(get_db),
+):
+    """
+    Busca la publicación en **todas las plataformas externas** (Scopus, WoS, OpenAlex)
+    usando su DOI, ingesta los registros encontrados y los reconcilia contra el canónico.
+
+    Flujo:
+    1. Obtiene la publicación canónica por ID.
+    2. Usa el DOI para buscar en Scopus, WoS y OpenAlex.
+    3. Ingesta los registros nuevos (deduplicación automática).
+    4. Ejecuta reconciliación sobre los pendientes.
+
+    Respuesta: resultados por plataforma + estadísticas de reconciliación.
+    """
+    from starlette.concurrency import run_in_threadpool
+    from extractors.scopus import ScopusExtractor, ScopusAPIError
+    from extractors.wos import WosExtractor
+    from extractors.openalex.extractor import OpenAlexExtractor
+    from reconciliation.engine import ReconciliationEngine
+
+    pub = db.get(CanonicalPublication, pub_id)
+    if not pub:
+        raise HTTPException(404, "Publicación no encontrada")
+
+    doi = pub.doi
+    if not doi:
+        raise HTTPException(400, "La publicación no tiene DOI; no se puede buscar en fuentes externas")
+
+    def _fetch_and_ingest():
+        platform_results = {}
+        records_to_ingest = []
+
+        # ── Scopus ──
+        try:
+            scopus = ScopusExtractor()
+            record = scopus.search_by_doi(doi)
+            if record:
+                records_to_ingest.append(record)
+                platform_results["scopus"] = {"found": True, "source_id": record.source_id}
+            else:
+                platform_results["scopus"] = {"found": False}
+        except ScopusAPIError as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+        except Exception as e:
+            platform_results["scopus"] = {"found": False, "error": str(e)}
+
+        # ── WoS ──
+        try:
+            wos = WosExtractor()
+            record = wos.search_by_doi(doi)
+            if record:
+                records_to_ingest.append(record)
+                platform_results["wos"] = {"found": True, "source_id": record.source_id}
+            else:
+                platform_results["wos"] = {"found": False}
+        except Exception as e:
+            platform_results["wos"] = {"found": False, "error": str(e)}
+
+        # ── OpenAlex ──
+        try:
+            openalex = OpenAlexExtractor()
+            record = openalex.search_by_doi(doi)
+            if record:
+                records_to_ingest.append(record)
+                platform_results["openalex"] = {"found": True, "source_id": record.source_id}
+            else:
+                platform_results["openalex"] = {"found": False}
+        except Exception as e:
+            platform_results["openalex"] = {"found": False, "error": str(e)}
+
+        # ── Ingesta + reconciliación ──
+        engine = ReconciliationEngine(session=db)
+        ingested = engine.ingest_records(records_to_ingest)
+        recon_stats = engine.reconcile_pending(batch_size=len(records_to_ingest) + 10) if ingested > 0 else None
+
+        return {
+            "pub_id": pub_id,
+            "doi": doi,
+            "platforms": platform_results,
+            "records_ingested": ingested,
+            "reconciliation": recon_stats.to_dict() if recon_stats else None,
+        }
+
+    return await run_in_threadpool(_fetch_and_ingest)
 
 
 # ── GET /publications/{id} (DEBE ir al final para no capturar rutas fijas) ──
@@ -633,7 +1179,6 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
         authors=authors_out,
         source_links=source_links,
         field_conflicts=pub.field_conflicts or {},
-        citations_by_source=pub.citations_by_source or {},
     )
 
 @router.get("/{pub_id}/authors", response_model=List[PublicationAuthorRead], summary="Listar autores de una publicación")
@@ -738,20 +1283,16 @@ def merge_publications(body: MergePublicationsRequest, db: Session = Depends(get
             db.add(record)
 
     # --- Enriquecer campos nulos del keeper con datos del removable ---
-    _MERGE_FIELDS = [
-        "title", "normalized_title", "publication_year", "publication_date",
-        "publication_type", "language", "source_journal", "issn", "abstract",
-        "keywords", "source_url", "page_range", "publisher", "journal_coverage",
-        "knowledge_area", "cine_code", "first_author", "corresponding_author",
-        "is_open_access", "oa_status", "citation_count", "doi", "pmid", "pmcid",
-    ]
-    prov = dict(keeper.field_provenance or {})
-    rem_prov = dict(removable.field_provenance or {})
-    for f in _MERGE_FIELDS:
-        if not getattr(keeper, f, None) and getattr(removable, f, None):
-            setattr(keeper, f, getattr(removable, f))
-            prov[f] = rem_prov.get(f, "merged")
-    keeper.field_provenance = prov
+    keeper_data = {f: getattr(keeper, f, None) for f in MERGE_FIELDS}
+    removable_data = {f: getattr(removable, f, None) for f in MERGE_FIELDS}
+    updates, _ = compute_field_inheritance(
+        keeper_data, removable_data,
+        dict(keeper.field_provenance or {}),
+        dict(removable.field_provenance or {}),
+        merge_label="merged",
+    )
+    for attr, val in updates.items():
+        setattr(keeper, attr, val)
 
     # --- Actualizar sources_count ---
     keeper.sources_count = (keeper.sources_count or 1) + (removable.sources_count or 1)
@@ -769,5 +1310,201 @@ def merge_publications(body: MergePublicationsRequest, db: Session = Depends(get
         kept_publication_id=keeper.id,
         merged_publication_id=removable.id,
         message=f"Publicación #{removable.id} fusionada en #{keeper.id} correctamente."
+    )
+
+
+# ── POST /publications/auto-merge-duplicates ─────────────────────────────────
+
+
+def _do_merge(db: Session, keeper: CanonicalPublication, removable: CanonicalPublication) -> None:
+    """Fusiona removable en keeper: autores, source records, campos vacíos, sources_count."""
+    keeper_author_ids = {
+        row[0] for row in
+        db.query(PublicationAuthor.author_id)
+        .filter(PublicationAuthor.publication_id == keeper.id).all()
+    }
+    for link in db.query(PublicationAuthor).filter(PublicationAuthor.publication_id == removable.id).all():
+        if link.author_id in keeper_author_ids:
+            db.delete(link)
+        else:
+            link.publication_id = keeper.id
+            db.add(link)
+
+    for model_cls in SOURCE_MODELS.values():
+        for rec in db.query(model_cls).filter(model_cls.canonical_publication_id == removable.id).all():
+            rec.canonical_publication_id = keeper.id
+            db.add(rec)
+
+    keeper_data = {f: getattr(keeper, f, None) for f in MERGE_FIELDS}
+    removable_data = {f: getattr(removable, f, None) for f in MERGE_FIELDS}
+    updates, _ = compute_field_inheritance(
+        keeper_data, removable_data,
+        dict(keeper.field_provenance or {}),
+        dict(removable.field_provenance or {}),
+        merge_label="auto_merged",
+    )
+    for attr, val in updates.items():
+        setattr(keeper, attr, val)
+    keeper.sources_count = (keeper.sources_count or 1) + (removable.sources_count or 1)
+    db.delete(removable)
+
+
+def _pick_keeper(p1: CanonicalPublication, p2: CanonicalPublication) -> tuple:
+    """Delegates to domain use case."""
+    snap1 = PublicationSnapshot(
+        id=p1.id, title=p1.title, doi=p1.doi,
+        publication_year=p1.publication_year,
+        publication_type=p1.publication_type,
+        sources_count=p1.sources_count or 0,
+        field_provenance=dict(p1.field_provenance or {}),
+    )
+    snap2 = PublicationSnapshot(
+        id=p2.id, title=p2.title, doi=p2.doi,
+        publication_year=p2.publication_year,
+        publication_type=p2.publication_type,
+        sources_count=p2.sources_count or 0,
+        field_provenance=dict(p2.field_provenance or {}),
+    )
+    keeper_snap, removable_snap = _domain_pick_keeper(snap1, snap2)
+    return (p1, p2) if keeper_snap.id == p1.id else (p2, p1)
+
+
+@router.post(
+    "/auto-merge-duplicates",
+    response_model=AutoMergeDuplicatesResponse,
+    summary="Fusionar automáticamente pares duplicados con alta similitud",
+)
+def auto_merge_duplicates(
+    body: AutoMergeDuplicatesRequest,
+    db: Session = Depends(get_db),
+):
+    """
+    Recorre la tabla `possible_duplicate_pairs` con `status='pending'`,
+    aplica los filtros del body y fusiona los pares que cumplan las condiciones.
+
+    **Criterio de selección del keeper:**
+    1. Más `sources_count` (más fuentes vinculadas).
+    2. Más campos rellenos.
+    3. ID menor (más antiguo) como tie-break.
+
+    **Herencia de campos:** todos los campos nulos del keeper se completan
+    con los valores del removable (título, DOI, abstract, keywords, etc.).
+    Los autores y registros fuente del removable se reasignan al keeper.
+
+    **dry_run=true:** reporta qué se haría sin modificar la BD.
+    """
+    # Umbral en escala 0-100 (como está guardado en la tabla)
+    min_score_db = body.min_similarity * 100.0
+
+    pending_pairs = (
+        db.query(PossibleDuplicatePair)
+        .filter(
+            PossibleDuplicatePair.status == "pending",
+            PossibleDuplicatePair.similarity_score >= min_score_db,
+        )
+        .order_by(PossibleDuplicatePair.similarity_score.desc())
+        .all()
+    )
+
+    merged_pairs = []
+    skipped_pairs = []
+
+    for sp in pending_pairs:
+        p1 = db.get(CanonicalPublication, sp.canonical_id_1)
+        p2 = db.get(CanonicalPublication, sp.canonical_id_2)
+
+        if not p1 or not p2:
+            skipped_pairs.append({
+                "canonical_id_1": sp.canonical_id_1,
+                "canonical_id_2": sp.canonical_id_2,
+                "reason": "uno o ambos canónicos ya no existen",
+            })
+            if not body.dry_run:
+                # El canónico ya no existe → par huérfano, borrar directo
+                db.delete(sp)
+            continue
+
+        skip_reason = should_skip_pair(
+            p1_doi=p1.doi, p2_doi=p2.doi,
+            p1_type=p1.publication_type, p2_type=p2.publication_type,
+            p1_year=p1.publication_year, p2_year=p2.publication_year,
+            filters=AutoMergeFilters(
+                only_same_year=body.only_same_year,
+                skip_doi_conflicts=body.skip_doi_conflicts,
+                skip_type_conflicts=body.skip_type_conflicts,
+            ),
+        )
+        if skip_reason:
+            skipped_pairs.append({
+                "canonical_id_1": p1.id, "canonical_id_2": p2.id,
+                "title_1": p1.title, "title_2": p2.title,
+                "reason": skip_reason,
+                "similarity_score": sp.similarity_score,
+            })
+            continue
+
+        # Guard: al menos 1 autor institucional compartido
+        if body.require_shared_author:
+            authors1 = {
+                row[0] for row in
+                db.query(PublicationAuthor.author_id)
+                .filter(PublicationAuthor.publication_id == p1.id).all()
+            }
+            authors2 = {
+                row[0] for row in
+                db.query(PublicationAuthor.author_id)
+                .filter(PublicationAuthor.publication_id == p2.id).all()
+            }
+            if not (authors1 & authors2):
+                skipped_pairs.append({
+                    "canonical_id_1": p1.id, "canonical_id_2": p2.id,
+                    "title_1": p1.title, "title_2": p2.title,
+                    "reason": "ningún autor institucional compartido",
+                    "similarity_score": sp.similarity_score,
+                })
+                continue
+
+        keeper, removable = _pick_keeper(p1, p2)
+
+        merged_pairs.append({
+            "kept_id": keeper.id,
+            "merged_id": removable.id,
+            "kept_title": keeper.title,
+            "merged_title": removable.title,
+            "similarity_score": sp.similarity_score,
+            "match_method": sp.match_method,
+            "keeper_sources": keeper.sources_count,
+            "removable_sources": removable.sources_count,
+        })
+
+        if not body.dry_run:
+            try:
+                # Guardar datos del par antes de expunge (para log de error si falla)
+                sp_id1, sp_id2 = sp.canonical_id_1, sp.canonical_id_2
+                # Detach del par de la sesión ANTES del merge:
+                # _do_merge borra removable → ON DELETE CASCADE borra el par en la BD.
+                # Si sp sigue trackeado, SQLAlchemy intenta UPDATE sobre la fila ya
+                # eliminada → StaleDataError. Expunge lo evita.
+                db.expunge(sp)
+                _do_merge(db, keeper, removable)
+            except Exception as exc:
+                db.rollback()
+                merged_pairs[-1]["error"] = str(exc)
+                logger.error(f"Error fusionando {p1.id}↔{p2.id}: {exc}")
+
+    if not body.dry_run:
+        try:
+            db.commit()
+        except IntegrityError as e:
+            db.rollback()
+            raise HTTPException(500, f"Error en auto-merge: {e}")
+
+    return AutoMergeDuplicatesResponse(
+        dry_run=body.dry_run,
+        pairs_evaluated=len(pending_pairs),
+        pairs_merged=len(merged_pairs),
+        pairs_skipped=len(skipped_pairs),
+        merged_pairs=merged_pairs,
+        skipped_pairs=skipped_pairs,
     )
 

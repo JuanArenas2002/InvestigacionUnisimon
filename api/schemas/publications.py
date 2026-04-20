@@ -48,6 +48,11 @@ class PublicationBase(BaseModel):
     is_open_access: Optional[bool] = None
     oa_status: Optional[str] = None
     citation_count: int = 0
+    citations_by_source: Optional[dict] = Field(
+        None,
+        description="Citas por plataforma. Ej: {'openalex': 45, 'scopus': 52, 'wos': 38}. "
+                    "citation_count = max de este dict.",
+    )
     institutional_authors_count: int = 0
     sources_count: int = 1
     field_provenance: Optional[dict] = Field(
@@ -80,10 +85,6 @@ class PublicationDetail(PublicationRead):
     field_conflicts: Optional[dict] = Field(
         None,
         description="Conflictos entre fuentes. Ej: {'is_open_access': {'openalex': 'true', 'scopus': 'false'}}",
-    )
-    citations_by_source: Optional[dict] = Field(
-        None,
-        description="Citas reportadas por cada fuente. Ej: {'openalex': 45, 'scopus': 52}.",
     )
     estado: Optional[EstadoPublicacion] = None
 
@@ -203,6 +204,19 @@ class DuplicatePublicationPair(BaseModel):
     author_diff_2: List[int] = Field(default_factory=list, description="IDs de autores que están en la publicación 2 pero no en la 1")
     authors_1: List[PublicationAuthorRead] = Field(default_factory=list, description="Autores de la publicación 1")
     authors_2: List[PublicationAuthorRead] = Field(default_factory=list, description="Autores de la publicación 2")
+    # Campos de detección multi-idioma
+    match_method: str = Field(
+        "title",
+        description="Método de detección: 'title' (fuzzy normal), 'doi' (DOI duplicado), 'translated_title' (título traducido)",
+    )
+    translated_title_1: Optional[str] = Field(
+        None,
+        description="Traducción al inglés del título 1 (solo presente si match_method='translated_title')",
+    )
+    translated_title_2: Optional[str] = Field(
+        None,
+        description="Traducción al inglés del título 2 (solo presente si match_method='translated_title')",
+    )
 
 
 class DuplicatePublicationsSummary(BaseModel):
@@ -212,7 +226,54 @@ class DuplicatePublicationsSummary(BaseModel):
     medium_confidence: int = Field(0, description="Pares con similitud 0.85-0.95")
     low_confidence: int = Field(0, description="Pares con similitud 0.80-0.85")
     same_doi_different_id: int = Field(0, description="Pares con mismo DOI pero diferente ID canónico")
+    translation_matches: int = Field(0, description="Pares detectados únicamente por título traducido (cross-language)")
     pairs: List[DuplicatePublicationPair] = []
+
+
+class AutoMergeDuplicatesRequest(BaseModel):
+    min_similarity: float = Field(
+        0.95, ge=0.5, le=1.0,
+        description="Similitud mínima para hacer merge automático (0-1). Default 0.95.",
+    )
+    dry_run: bool = Field(
+        False,
+        description="Si True, simula el merge y retorna qué se haría sin modificar la BD.",
+    )
+    only_same_year: bool = Field(
+        True,
+        description="Si True, solo fusiona pares del mismo año de publicación.",
+    )
+    skip_doi_conflicts: bool = Field(
+        True,
+        description=(
+            "Si True (default), omite pares donde ambos tienen DOI y son distintos. "
+            "DOIs distintos casi siempre indican papers distintos."
+        ),
+    )
+    require_shared_author: bool = Field(
+        False,
+        description=(
+            "Si True, solo fusiona pares que comparten al menos 1 autor institucional. "
+            "Recomendado para mayor seguridad."
+        ),
+    )
+    skip_type_conflicts: bool = Field(
+        True,
+        description=(
+            "Si True (default), omite pares donde ambos tienen tipo de publicación "
+            "definido y son distintos. Ej: ARTICLE vs REVIEW son productos distintos "
+            "aunque el título sea idéntico."
+        ),
+    )
+
+
+class AutoMergeDuplicatesResponse(BaseModel):
+    dry_run: bool
+    pairs_evaluated: int = 0
+    pairs_merged: int = 0
+    pairs_skipped: int = 0
+    merged_pairs: List[dict] = Field(default_factory=list)
+    skipped_pairs: List[dict] = Field(default_factory=list)
 
 
 # --- Rebuild modelos anidados para Pydantic v2 ---

@@ -307,7 +307,7 @@ class SimilarAuthorRead(BaseModel):
 
 class NameOption(BaseModel):
     """Nombre disponible desde una fuente vinculada."""
-    source: str = Field(..., description="cvlac | openalex | scopus | wos | google_scholar")
+    source: str = Field(..., description="cvlac | openalex | scopus | wos | google_scholar | orcid")
     name: str
     profile_url: Optional[str] = None
 
@@ -342,3 +342,110 @@ class UpdateSourceLinkRequest(BaseModel):
 
 class UpdateOrcidRequest(BaseModel):
     orcid: str = Field(..., description="ORCID en formato 0000-0001-2345-6789")
+
+
+# ── Edición de perfil con validación por plataforma ──────────
+
+class ExternalIdValidationResult(BaseModel):
+    """Resultado de validar un ID externo contra su plataforma de origen."""
+    source: str = Field(..., description="orcid | openalex | scopus | wos | cvlac")
+    candidate_id: str
+    matched: int = Field(0, description="Publicaciones encontradas en plataforma que coinciden con las del autor en BD")
+    total_from_source: int = Field(0, description="Total publicaciones encontradas en la plataforma para ese ID")
+    author_pubs_in_db: int = Field(0, description="Total publicaciones del autor en BD con DOI")
+    match_rate: float = Field(0.0, description="matched / author_pubs_in_db (capped to 1.0)")
+    validated: bool = Field(False, description="True si match_rate >= umbral mínimo")
+    message: str = ""
+
+
+class AuthorUpdateRequest(BaseModel):
+    """
+    Actualización del perfil de un autor.
+
+    Cada plataforma externa se pasa como URL de perfil (la que el investigador
+    copia desde su navegador).  El backend extrae el ID canónico de la URL,
+    consulta la plataforma y valida el solapamiento con las publicaciones del
+    autor en BD antes de guardar.
+
+    Ejemplos de URLs aceptadas
+    --------------------------
+    orcid_url:      https://orcid.org/0000-0001-2345-6789
+    openalex_url:   https://openalex.org/A5026071269
+    scopus_url:     https://www.scopus.com/authid/detail.uri?authorId=12345678
+    wos_url:        https://www.webofscience.com/wos/author/record/A-1234-2010
+    cvlac_url:      https://scienti.minciencias.gov.co/cvlac/visualizador/generarCurriculoCv.do?cod_rh=0001234567
+    """
+    name: Optional[str] = Field(None, min_length=2, max_length=300)
+    orcid_url: Optional[str] = Field(None, description="URL del perfil ORCID del investigador")
+    openalex_url: Optional[str] = Field(None, description="URL del perfil OpenAlex del investigador")
+    scopus_url: Optional[str] = Field(None, description="URL del perfil Scopus del investigador")
+    wos_url: Optional[str] = Field(None, description="URL del perfil Web of Science del investigador")
+    cvlac_url: Optional[str] = Field(None, description="URL del perfil CvLAC del investigador")
+    force: bool = Field(False, description="Guardar aunque la validación no pase el umbral")
+    min_match_rate: float = Field(
+        0.2,
+        ge=0.0,
+        le=1.0,
+        description="Tasa mínima de coincidencia para aprobar un ID automáticamente (default 0.2)",
+    )
+
+
+class AuthorUpdateResponse(BaseModel):
+    """Resultado del PATCH de perfil de autor."""
+    author_id: int
+    updated_fields: dict = Field(default_factory=dict, description="Campos efectivamente guardados")
+    skipped_fields: dict = Field(default_factory=dict, description="Campos no guardados por no pasar validación")
+    validation_results: List[ExternalIdValidationResult] = []
+    saved: bool = False
+    message: str = ""
+
+
+# ── Publicaciones compartidas ────────────────────────────────
+
+class SharedAuthorRead(BaseModel):
+    """Autor que aparece en una publicación compartida."""
+    id: int
+    name: str
+    is_institutional: bool
+
+
+class SharedPublicationRead(BaseModel):
+    """Publicación compartida por múltiples autores."""
+    id: int
+    title: str
+    doi: Optional[str] = None
+    publication_year: Optional[int] = None
+    publication_type: Optional[str] = None
+    source_journal: Optional[str] = None
+    citation_count: int = 0
+    is_open_access: Optional[bool] = None
+    shared_authors: List[SharedAuthorRead] = Field(
+        default_factory=list,
+        description="Autores solicitados que aparecen en esta publicación",
+    )
+    other_coauthors_count: int = 0
+    sources: List[str] = Field(default_factory=list, description="Nombres de las fuentes")
+    source_links: dict = Field(
+        default_factory=dict,
+        description="ID por fuente: {openalex: id, scopus: id, ...}",
+    )
+
+    model_config = {"from_attributes": True}
+
+
+class SharedPublicationsResponse(BaseModel):
+    """Respuesta con publicaciones compartidas por múltiples autores."""
+    authors: List[AuthorRead] = Field(description="Autores solicitados (que existen en BD)")
+    authors_not_found: List[int] = Field(
+        default_factory=list,
+        description="IDs de autores que no se encontraron",
+    )
+    match_type: str = Field(description="'all' o 'any' según el tipo de coincidencia")
+    total_shared_publications: int = Field(description="Total de publicaciones compartidas")
+    shared_publications: List[SharedPublicationRead] = Field(
+        default_factory=list,
+        description="Publicaciones con los autores solicitados",
+    )
+    page: int = 1
+    page_size: int = 50
+    total_pages: int = 0

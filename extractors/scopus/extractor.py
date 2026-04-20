@@ -181,6 +181,9 @@ class ScopusExtractor(BaseExtractor):
             oa_status=fields["oa_status"],
             authors=fields["authors"],
             citation_count=fields["citation_count"],
+            abstract=fields.get("abstract"),
+            page_range=fields.get("page_range"),
+            publisher=fields.get("publisher"),
             raw_data=fields.get("raw_data") or {},
         )
 
@@ -217,6 +220,30 @@ class ScopusExtractor(BaseExtractor):
         except Exception as e:
             logger.warning(f"[Scopus] Error construyendo registro para DOI {doi}: {e}")
             return None
+
+    def extract_by_author(
+        self,
+        scopus_author_id: str,
+        max_results: int = 50,
+    ) -> List[StandardRecord]:
+        """
+        Busca publicaciones de un autor en Scopus por su Scopus Author ID.
+
+        Args:
+            scopus_author_id: AU-ID de Scopus (solo dígitos)
+            max_results: Límite de resultados
+
+        Returns:
+            Lista de StandardRecords del autor.
+        """
+        clean_id = str(scopus_author_id).strip().lstrip("AU-ID(").rstrip(")")
+        query = f"AU-ID({clean_id})"
+        try:
+            return self.extract(query=query, max_results=max_results)
+        except Exception as e:
+            import logging
+            logging.getLogger(__name__).debug(f"extract_by_author scopus_id={clean_id!r}: {e}")
+            return []
 
     def search_by_dois(
         self,

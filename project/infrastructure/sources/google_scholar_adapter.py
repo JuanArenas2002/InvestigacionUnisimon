@@ -5,7 +5,7 @@ from extractors.google_scholar.extractor import GoogleScholarExtractor
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 
 logger = logging.getLogger(__name__)
 
@@ -41,35 +41,20 @@ class GoogleScholarAdapter(SourcePort):
         scholar_ids = kwargs.get("scholar_ids") or []
         if not scholar_ids:
             logger.warning("[GoogleScholarAdapter] No scholar_ids provided")
-            print(f"[DEBUG ADAPTER] No scholar_ids provided")
             return []
 
         try:
-            print(f"[DEBUG ADAPTER] Iniciando GoogleScholarExtractor para: {scholar_ids}")
             extractor = GoogleScholarExtractor()
-            print(f"[DEBUG ADAPTER] GoogleScholarExtractor creado")
-            
-            print(f"[DEBUG ADAPTER] Llamando extractor.extract() con scholar_ids={scholar_ids}")
             records = extractor.extract(
                 year_from=year_from,
                 year_to=year_to,
                 max_results=max_results,
                 scholar_ids=scholar_ids,
             )
-            print(f"[DEBUG ADAPTER] extractor.extract() completado. Total registros: {len(records)}")
-            
-            logger.info(f"[GoogleScholarAdapter] Extracted {len(records)} records")
-            print(f"[DEBUG ADAPTER] Convirtiendo {len(records)} registros a Publication objects...")
-            
-            result = [self._to_publication(record) for record in records]
-            print(f"[DEBUG ADAPTER] Conversión completada. Total Publications: {len(result)}")
-            return result
-            
+            logger.info("[GoogleScholarAdapter] Extracted %d records", len(records))
+            return [self._to_publication(record) for record in records]
         except Exception as e:
-            logger.error(f"[GoogleScholarAdapter] Error fetching records: {e}")
-            print(f"[DEBUG ADAPTER] ERROR: {e}")
-            import traceback
-            print(traceback.format_exc())
+            logger.error("[GoogleScholarAdapter] Error fetching records: %s", e)
             return []
 
     @staticmethod

@@ -4,7 +4,7 @@ from extractors.openalex.extractor import OpenAlexExtractor
 
 from project.domain.models.author import Author
 from project.domain.models.publication import Publication
-from project.ports.source_port import SourcePort
+from project.domain.ports.source_port import SourcePort
 
 
 class OpenAlexAdapter(SourcePort):
