@@ -13,6 +13,7 @@ from db.models import Author, CanonicalPublication, PublicationAuthor, Journal
 from api.schemas.author_metrics import (
     AuthorGeneralMetricsResponse,
     GeneralMetrics,
+    PlatformMetrics,
     YearMetrics,
     PublicationTypeDistribution,
     JournalMetrics,
@@ -101,20 +102,22 @@ class AuthorMetricsService:
         logger.info(f"Autor {author.name} tiene {total_pubs} publicaciones")
         
         # 3. Calcular métricas
+        platform_metrics = AuthorMetricsService._calculate_platform_metrics(publications)
         general_metrics = AuthorMetricsService._calculate_general_metrics(publications)
         publications_by_year = AuthorMetricsService._calculate_publications_by_year(publications)
         publication_types = AuthorMetricsService._calculate_publication_types(publications)
         top_journals = AuthorMetricsService._calculate_top_journals(publications, db)
         open_access = AuthorMetricsService._calculate_open_access(publications)
         languages = AuthorMetricsService._calculate_languages(publications)
-        
+
         institutional_pubs = sum(1 for p in publications if p.institutional_authors_count > 0)
-        
+
         # 4. Construir respuesta
         response = AuthorGeneralMetricsResponse(
             author_id=author_id,
             author_name=author.name,
             orcid=author.orcid,
+            platforms=platform_metrics,
             general_metrics=general_metrics,
             publications_by_year=publications_by_year,
             publication_types=publication_types,
@@ -263,10 +266,46 @@ class AuthorMetricsService:
     @staticmethod
     def _calculate_languages(publications: List) -> Dict[str, int]:
         """Calcula distribución de idiomas"""
-        
+
         languages = {}
         for pub in publications:
             lang = pub.language or "unknown"
             languages[lang] = languages.get(lang, 0) + 1
-        
+
         return languages
+
+    @staticmethod
+    def _calculate_platform_metrics(publications: List) -> List[PlatformMetrics]:
+        """Calcula métricas por plataforma usando citations_by_source."""
+
+        # Recolectar plataformas presentes en las publicaciones del autor
+        all_platforms: set = set()
+        for pub in publications:
+            if pub.citations_by_source:
+                all_platforms.update(pub.citations_by_source.keys())
+
+        result = []
+        for platform in sorted(all_platforms):
+            platform_pubs = [
+                p for p in publications
+                if p.citations_by_source and platform in p.citations_by_source
+            ]
+            if not platform_pubs:
+                continue
+
+            total_pubs = len(platform_pubs)
+            cit_list = [platform_pubs[i].citations_by_source[platform] or 0 for i in range(total_pubs)]
+            total_citations = sum(cit_list)
+            sorted_cits = sorted(cit_list, reverse=True)
+            h_index = sum(1 for i, c in enumerate(sorted_cits, 1) if c >= i)
+            cpp = round(total_citations / total_pubs, 2) if total_pubs > 0 else 0
+
+            result.append(PlatformMetrics(
+                platform=platform,
+                total_publications=total_pubs,
+                total_citations=total_citations,
+                h_index=h_index,
+                cpp=cpp,
+            ))
+
+        return result

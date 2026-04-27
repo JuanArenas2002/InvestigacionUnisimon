@@ -7,7 +7,7 @@ import logging
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, Session
 
-from config import db_config
+from config import db_config, datos_abiertos_db_config
 from project.infrastructure.persistence.models import Base, SOURCE_MODELS, SOURCE_TABLE_NAMES
 from project.infrastructure.persistence.source_registry import SOURCE_REGISTRY
 
@@ -20,6 +20,10 @@ logger = logging.getLogger(__name__)
 
 _engine = None
 _SessionFactory = None
+
+# Segunda conexión: BD datos_abiertos
+_da_engine = None
+_da_SessionFactory = None
 
 
 def get_engine(echo: bool = None):
@@ -47,6 +51,54 @@ def get_session_factory() -> sessionmaker:
 def get_session() -> Session:
     factory = get_session_factory()
     return factory()
+
+
+# =============================================================
+# CONEXIÓN SECUNDARIA: datos_abiertos
+# =============================================================
+
+def get_da_engine(echo: bool = None):
+    global _da_engine
+    if _da_engine is None:
+        echo_sql = echo if echo is not None else datos_abiertos_db_config.echo_sql
+        _da_engine = create_engine(
+            datos_abiertos_db_config.url,
+            echo=echo_sql,
+            pool_size=5,
+            max_overflow=10,
+            pool_pre_ping=True,
+        )
+        logger.info(
+            "Engine datos_abiertos creado para: %s:%s/%s",
+            datos_abiertos_db_config.host,
+            datos_abiertos_db_config.port,
+            datos_abiertos_db_config.database,
+        )
+    return _da_engine
+
+
+def get_da_session_factory() -> sessionmaker:
+    global _da_SessionFactory
+    if _da_SessionFactory is None:
+        _da_SessionFactory = sessionmaker(bind=get_da_engine(), expire_on_commit=False)
+    return _da_SessionFactory
+
+
+def get_da_session() -> Session:
+    """Retorna una sesión hacia la BD datos_abiertos."""
+    return get_da_session_factory()()
+
+
+def check_da_connection() -> bool:
+    """Verifica conectividad con la BD datos_abiertos."""
+    try:
+        with get_da_engine().connect() as conn:
+            conn.execute(text("SELECT 1"))
+        logger.info("Conexión a datos_abiertos verificada correctamente.")
+        return True
+    except Exception as e:
+        logger.error("Error de conexión a datos_abiertos: %s", e)
+        return False
 
 
 # =============================================================

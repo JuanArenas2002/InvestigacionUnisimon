@@ -62,6 +62,173 @@ def enrich_canonicals(
         raise HTTPException(500, f"Error en enriquecimiento: {e}")
 
 
+# ── POST /pipeline/full-enrich ────────────────────────────────────────────────
+
+@router.post(
+    "/full-enrich",
+    response_model=dict,
+    summary="Pipeline completo para todas las publicaciones: buscar en fuentes, vincular y enriquecer",
+)
+async def full_enrich_all(
+    batch_size: int = 50,
+    use_openalex: bool = True,
+    use_scopus: bool = True,
+    use_wos: bool = True,
+    scopus_delay: float = 0.5,
+    db: Session = Depends(get_db),
+):
+    """
+    Recorre **todos** los canónicos con DOI y ejecuta el pipeline completo:
+
+    1. Consulta fuentes externas (OpenAlex, Scopus, WoS) por DOI.
+    2. Ingesta registros nuevos encontrados.
+    3. Vincula source records no enlazados (`canonical_publication_id IS NULL`)
+       sin importar su status (PENDING, MANUAL_REVIEW, etc.).
+    4. Aplica datos frescos de la API al canónico (abstract, citas, keywords…).
+    5. Enriquece con todos los source records vinculados en BD.
+    6. Extrae autores de cada fuente.
+
+    Parámetros:
+    - `batch_size`: canónicos procesados por lote antes de commit (default 50)
+    - `use_openalex` / `use_scopus` / `use_wos`: habilitar/deshabilitar fuentes
+    - `scopus_delay`: segundos entre llamadas a Scopus (default 0.5)
+
+    Respuesta:
+    - `canonicals_processed`: total recorridos
+    - `canonicals_enriched`: cuántos recibieron al menos un campo nuevo o autor
+    - `records_ingested`: source records nuevos insertados en total
+    - `records_linked`: source records vinculados a su canónico
+    - `errors`: canónicos que fallaron (se omiten y se continúa)
+    """
+    from starlette.concurrency import run_in_threadpool
+    from extractors.openalex.extractor import OpenAlexExtractor
+    from extractors.scopus import ScopusExtractor, ScopusAPIError
+    from extractors.wos import WosExtractor
+    from db.models import SOURCE_MODELS, CanonicalPublication
+    from extractors.base import normalize_doi as _norm_doi
+    import time
+
+    def _run():
+        engine = ReconciliationEngine(session=db)
+
+        oa_ext  = OpenAlexExtractor() if use_openalex else None
+        sc_ext  = ScopusExtractor()   if use_scopus   else None
+        wos_ext = WosExtractor()      if use_wos      else None
+
+        stats = {
+            "canonicals_processed": 0,
+            "canonicals_enriched": 0,
+            "records_ingested": 0,
+            "records_linked": 0,
+            "errors": 0,
+        }
+
+        offset = 0
+        while True:
+            batch = (
+                db.query(CanonicalPublication)
+                .filter(CanonicalPublication.doi.isnot(None))
+                .order_by(CanonicalPublication.id)
+                .offset(offset)
+                .limit(batch_size)
+                .all()
+            )
+            if not batch:
+                break
+
+            for canonical in batch:
+                try:
+                    ndoi = _norm_doi(canonical.doi) or canonical.doi
+                    records_to_ingest = []
+
+                    if oa_ext:
+                        try:
+                            rec = oa_ext.search_by_doi(ndoi)
+                            if rec:
+                                records_to_ingest.append(rec)
+                        except Exception as e:
+                            logger.debug(f"OpenAlex DOI {ndoi}: {e}")
+
+                    if sc_ext:
+                        try:
+                            rec = sc_ext.search_by_doi(ndoi)
+                            if rec:
+                                records_to_ingest.append(rec)
+                            if scopus_delay > 0:
+                                time.sleep(scopus_delay)
+                        except ScopusAPIError as e:
+                            logger.debug(f"Scopus DOI {ndoi}: {e}")
+                        except Exception as e:
+                            logger.debug(f"Scopus DOI {ndoi}: {e}")
+
+                    if wos_ext:
+                        try:
+                            rec = wos_ext.search_by_doi(ndoi)
+                            if rec:
+                                records_to_ingest.append(rec)
+                        except Exception as e:
+                            logger.debug(f"WoS DOI {ndoi}: {e}")
+
+                    # Ingestar registros nuevos
+                    ingested = engine.ingest_records(records_to_ingest)
+                    stats["records_ingested"] += ingested
+
+                    # Vincular source records sin enlazar para este DOI
+                    unlinked = []
+                    for model_cls in SOURCE_MODELS.values():
+                        unlinked.extend(
+                            db.query(model_cls)
+                            .filter(
+                                model_cls.doi == ndoi,
+                                model_cls.canonical_publication_id.is_(None),
+                            )
+                            .all()
+                        )
+
+                    if unlinked:
+                        engine._cache = engine._build_cache()
+                        for rec in unlinked:
+                            try:
+                                engine._reconcile_one(rec)
+                                stats["records_linked"] += 1
+                            except Exception as exc:
+                                logger.debug(f"Reconcile {rec}: {exc}")
+                        db.flush()
+
+                    # Aplicar datos frescos al canónico
+                    changed = False
+                    for fresh_rec in records_to_ingest:
+                        before_abstract = canonical.abstract
+                        engine._enrich_canonical(canonical, fresh_rec)
+                        engine._ingest_authors(canonical, fresh_rec)
+                        if canonical.abstract != before_abstract:
+                            changed = True
+
+                    # Enriquecer desde todos los source records vinculados en BD
+                    enrich_result = engine.enrich_canonical(canonical.id)
+                    if enrich_result.get("total_changes", 0) > 0 or changed or unlinked:
+                        stats["canonicals_enriched"] += 1
+
+                    stats["canonicals_processed"] += 1
+
+                except Exception as e:
+                    logger.error(f"full-enrich: error en canonical={canonical.id}: {e}", exc_info=True)
+                    stats["errors"] += 1
+
+            db.commit()
+            offset += batch_size
+            logger.info(
+                f"full-enrich lote {offset}: "
+                f"procesados={stats['canonicals_processed']}, "
+                f"enriquecidos={stats['canonicals_enriched']}, "
+                f"vinculados={stats['records_linked']}"
+            )
+
+        return stats
+
+    return await run_in_threadpool(_run)
+
+
 # ── POST /pipeline/reconcile ──────────────────────────────────────────────
 
 @router.post(

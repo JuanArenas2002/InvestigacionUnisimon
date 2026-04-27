@@ -180,6 +180,11 @@ def should_skip_pair(pub1: CanonicalPublication, pub2: CanonicalPublication) -> 
             # DOIs diferentes = No duplicados (a menos que sea error de reconciliación)
             return False  # Continuar (podría ser error, pero poco probable)
     
+    # Si los tipos son distintos, no son duplicados
+    if pub1.publication_type and pub2.publication_type:
+        if pub1.publication_type.lower() != pub2.publication_type.lower():
+            return True
+
     # Si los años están más de 3 años alejados, descartamos
     if pub1.publication_year and pub2.publication_year:
         year_diff = abs(pub1.publication_year - pub2.publication_year)

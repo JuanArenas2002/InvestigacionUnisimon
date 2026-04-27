@@ -45,6 +45,11 @@ class PublicationBase(BaseModel):
     journal_id: Optional[int] = None
     source_journal: Optional[str] = None
     issn: Optional[str] = None
+    abstract: Optional[str] = None
+    keywords: Optional[str] = None
+    publisher: Optional[str] = None
+    page_range: Optional[str] = None
+    source_url: Optional[str] = None
     is_open_access: Optional[bool] = None
     oa_status: Optional[str] = None
     citation_count: int = 0
@@ -61,13 +66,41 @@ class PublicationBase(BaseModel):
     )
 
 
+class CategoriaMinciencias(BaseModel):
+    nme_clase_pd: Optional[str] = None
+    nme_tipo_medicion_pd: Optional[str] = None
+    nme_tipologia_pd: Optional[str] = None
+    cod_grupo_gr: Optional[str] = None
+    nme_grupo_gr: Optional[str] = None
+    nme_convocatoria: Optional[str] = None
+
+
 class PublicationRead(PublicationBase):
     id: int
     created_at: datetime
     updated_at: datetime
     estado: Optional[EstadoPublicacion] = None
+    categoria_minciencias: Optional[CategoriaMinciencias] = Field(
+        None,
+        description="Categoría Minciencias del artículo según datos abiertos (grupo institucional).",
+    )
 
     model_config = {"from_attributes": True}
+
+
+class DatosAbiertosInfo(BaseModel):
+    """Vínculo con datos abiertos de Minciencias."""
+    open_data_record_id: Optional[int] = None
+    id_producto_pd: Optional[str] = None
+    nme_clase_pd: Optional[str] = None
+    nme_tipo_medicion_pd: Optional[str] = None
+    nme_tipologia_pd: Optional[str] = None
+    cod_grupo_gr: Optional[str] = None
+    nme_grupo_gr: Optional[str] = None
+    nme_convocatoria: Optional[str] = None
+    ano_convo: Optional[str] = None
+    match_score: float
+    match_method: str
 
 
 class PublicationDetail(PublicationRead):
@@ -87,6 +120,10 @@ class PublicationDetail(PublicationRead):
         description="Conflictos entre fuentes. Ej: {'is_open_access': {'openalex': 'true', 'scopus': 'false'}}",
     )
     estado: Optional[EstadoPublicacion] = None
+    datos_abiertos: List[DatosAbiertosInfo] = Field(
+        default_factory=list,
+        description="Vínculos con productos registrados en Minciencias (datos abiertos).",
+    )
 
 
 class PublicationAuthorRead(BaseModel):

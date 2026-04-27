@@ -134,6 +134,26 @@ class WosExtractor(BaseExtractor):
         # 4. Post-procesar: calcular campos normalizados (normalized_title, etc.)
         return self._post_process(records)
 
+    def search_by_doi(self, doi: str) -> Optional[StandardRecord]:
+        """Busca un documento en WoS por DOI. Retorna StandardRecord o None."""
+        if not self.api_key:
+            return None
+        clean_doi = doi.strip().lstrip("https://doi.org/").lstrip("http://doi.org/")
+        try:
+            hits = search_service.paginated_search(
+                session=self.session,
+                config=self.config,
+                query=f'DO="{clean_doi}"',
+                max_results=1,
+            )
+            if hits:
+                record = self._parse_record(hits[0])
+                record.compute_normalized_fields()
+                return record
+        except Exception as e:
+            logger.debug(f"WoS search_by_doi {clean_doi!r}: {e}")
+        return None
+
     def _parse_record(self, hit: dict) -> StandardRecord:
         """
         Convierte un hit crudo de la WoS Starter API a un StandardRecord.

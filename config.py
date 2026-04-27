@@ -50,7 +50,7 @@ class MatchType(str, Enum):
 class RecordStatus(str, Enum):
     PENDING = "pending"
     MATCHED = "matched"
-    REVIEW = "review"
+    REVIEW = "manual_review"
     REJECTED = "rejected"
     NEW_CANONICAL = "new_canonical"
 
@@ -102,6 +102,9 @@ class ReconciliationConfig:
     manual_review_threshold: float = field(default_factory=lambda: float(os.getenv("RECON_MANUAL_REVIEW_THRESHOLD", "70.0")))
     author_match_threshold: float = field(default_factory=lambda: float(os.getenv("RECON_AUTHOR_MATCH_THRESHOLD", "40.0")))
     min_title_word_overlap: int = field(default_factory=lambda: int(os.getenv("RECON_MIN_TITLE_WORD_OVERLAP", "2")))
+    weight_title: float = field(default_factory=lambda: float(os.getenv("RECON_WEIGHT_TITLE", "0.6")))
+    weight_year: float = field(default_factory=lambda: float(os.getenv("RECON_WEIGHT_YEAR", "0.2")))
+    weight_authors: float = field(default_factory=lambda: float(os.getenv("RECON_WEIGHT_AUTHORS", "0.2")))
 
 
 @dataclass(frozen=True)
@@ -129,6 +132,7 @@ class ScopusConfig:
     api_key: str = field(default_factory=lambda: os.getenv("SCOPUS_API_KEY", ""))
     inst_token: str = field(default_factory=lambda: os.getenv("SCOPUS_INST_TOKEN", ""))
     affiliation_ids: List[str] = field(default_factory=lambda: _env_list("SCOPUS_AFFILIATION_IDS"))
+    max_per_page: int = field(default_factory=lambda: int(os.getenv("SCOPUS_MAX_PER_PAGE", "25")))
     max_retries: int = field(default_factory=lambda: int(os.getenv("SCOPUS_MAX_RETRIES", "3")))
     timeout: int = field(default_factory=lambda: int(os.getenv("SCOPUS_TIMEOUT", "30")))
 
@@ -141,6 +145,7 @@ class OpenAlexConfig:
     max_retries: int = field(default_factory=lambda: int(os.getenv("OPENALEX_MAX_RETRIES", "3")))
     timeout: int = field(default_factory=lambda: int(os.getenv("OPENALEX_TIMEOUT", "30")))
     ror_id: str = field(default_factory=lambda: os.getenv("OPENALEX_ROR_ID", ""))
+    max_per_page: int = field(default_factory=lambda: int(os.getenv("OPENALEX_MAX_PER_PAGE", "200")))
 
 
 @dataclass(frozen=True)
@@ -167,6 +172,27 @@ class DatosAbiertosConfig:
     timeout: int = field(default_factory=lambda: int(os.getenv("DATOS_ABIERTOS_TIMEOUT", "30")))
 
 
+@dataclass(frozen=True)
+class DatosAbiertosDbConfig:
+    """Conexión a la BD local datos_abiertos (segunda base de datos PostgreSQL)."""
+    database_url: str = field(default_factory=lambda: os.getenv("DA_DATABASE_URL", ""))
+    host: str = field(default_factory=lambda: os.getenv("DA_DB_HOST", "localhost"))
+    port: int = field(default_factory=lambda: int(os.getenv("DA_DB_PORT", "5432")))
+    database: str = field(default_factory=lambda: os.getenv("DA_DB_NAME", "datos_abiertos"))
+    user: str = field(default_factory=lambda: os.getenv("DA_DB_USER", "postgres"))
+    password: str = field(default_factory=lambda: os.getenv("DA_DB_PASSWORD", ""))
+    echo_sql: bool = field(default_factory=lambda: _env_bool("DA_DB_ECHO_SQL", False))
+
+    @property
+    def url(self) -> str:
+        if self.database_url:
+            if self.database_url.startswith("postgres://"):
+                return "postgresql://" + self.database_url[len("postgres://"):]
+            return self.database_url
+        auth = f"{self.user}:{self.password}@" if self.password else f"{self.user}@"
+        return f"postgresql://{auth}{self.host}:{self.port}/{self.database}"
+
+
 app_config = AppConfig()
 db_config = DatabaseConfig()
 reconciliation_config = ReconciliationConfig()
@@ -177,6 +203,7 @@ openalex_config = OpenAlexConfig()
 wos_config = WosConfig()
 cvlac_config = CvlacConfig()
 datos_abiertos_config = DatosAbiertosConfig()
+datos_abiertos_db_config = DatosAbiertosDbConfig()
 
 DATABASE_URL = db_config.url
 DATA_DIR = os.getenv("DATA_DIR", str(Path(__file__).resolve().parent / "reports" / "test_output"))
@@ -189,6 +216,7 @@ __all__ = [
     "DATABASE_URL",
     "DATA_DIR",
     "DatosAbiertosConfig",
+    "DatosAbiertosDbConfig",
     "DatabaseConfig",
     "InstitutionConfig",
     "MatchType",
@@ -203,6 +231,7 @@ __all__ = [
     "cvlac_config",
     "db_config",
     "datos_abiertos_config",
+    "datos_abiertos_db_config",
     "institution",
     "openalex_config",
     "reconciliation_config",

@@ -1744,6 +1744,7 @@ class ReconciliationEngine:
             before["citations_by_source"] = dict(before["citations_by_source"])
 
         sources_used: set = set()
+        linked_count = 0
         for src_def in SOURCE_REGISTRY.all():
             model = src_def.model_class
             linked = (
@@ -1753,7 +1754,12 @@ class ReconciliationEngine:
             )
             for ext in linked:
                 self._enrich_canonical(canonical, ext)
+                self._ingest_authors(canonical, ext)
                 sources_used.add(ext.source_name)
+                linked_count += 1
+
+        if linked_count != (canonical.sources_count or 0):
+            canonical.sources_count = linked_count
 
         self.session.flush()
 
@@ -1817,6 +1823,8 @@ class ReconciliationEngine:
         total_with_changes = 0
         total_errors = 0
 
+        authors_before = self.session.query(func.count(PublicationAuthor.id)).scalar() or 0
+
         # campo → cuántos canónicos lo recibieron por primera vez
         filled_by_field: dict  = defaultdict(int)
         # campo → cuántos canónicos lo actualizaron (ya tenía valor, cambió)
@@ -1845,6 +1853,8 @@ class ReconciliationEngine:
                     prov_before = dict(canonical.field_provenance or {})
 
                     # Enriquecer con todos los registros vinculados de todas las fuentes
+                    # y extraer autores + actualizar sources_count
+                    linked_sources_count = 0
                     for src_def in SOURCE_REGISTRY.all():
                         model = src_def.model_class
                         linked = (
@@ -1854,6 +1864,12 @@ class ReconciliationEngine:
                         )
                         for ext in linked:
                             self._enrich_canonical(canonical, ext)
+                            self._ingest_authors(canonical, ext)
+                            linked_sources_count += 1
+
+                    # Sincronizar sources_count con el conteo real de registros vinculados
+                    if linked_sources_count != (canonical.sources_count or 0):
+                        canonical.sources_count = linked_sources_count
 
                     # Snapshot después
                     after  = {f: getattr(canonical, f, None) for f in _ENRICHABLE_FIELDS}
@@ -1904,6 +1920,8 @@ class ReconciliationEngine:
 
         total_filled  = sum(filled_by_field.values())
         total_updated = sum(updated_by_field.values())
+        authors_after = self.session.query(func.count(PublicationAuthor.id)).scalar() or 0
+        total_authors_linked = authors_after - authors_before
 
         return {
             "resumen": {
@@ -1912,6 +1930,7 @@ class ReconciliationEngine:
                 "canonicals_sin_cambios":     total_processed - total_with_changes,
                 "campos_completados_total":   total_filled,
                 "campos_actualizados_total":  total_updated,
+                "autores_vinculados":         total_authors_linked,
                 "errores":                    total_errors,
                 "promedio_cambios_por_canonico": (
                     round((total_filled + total_updated) / total_with_changes, 1)

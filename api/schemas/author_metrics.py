@@ -38,6 +38,15 @@ class OpenAccessMetrics(BaseModel):
     oa_status_distribution: Dict[str, int] = Field(..., description="Distribución por estado OA")
 
 
+class PlatformMetrics(BaseModel):
+    """Métricas por plataforma de indexación"""
+    platform: str = Field(..., description="Nombre de la plataforma (scopus, openalex, wos, etc.)")
+    total_publications: int = Field(..., description="Publicaciones indexadas en esta plataforma")
+    total_citations: int = Field(..., description="Citas según esta plataforma")
+    h_index: int = Field(..., description="Índice H según esta plataforma")
+    cpp: float = Field(..., description="Citas por publicación según esta plataforma")
+
+
 class GeneralMetrics(BaseModel):
     """Métricas generales de productividad"""
     total_publications: int = Field(..., description="Total de publicaciones")
@@ -46,21 +55,22 @@ class GeneralMetrics(BaseModel):
     years_active_to: Optional[int] = Field(..., description="Año de última publicación")
     years_active_count: Optional[int] = Field(..., description="Años con actividad")
     avg_publications_per_year: float = Field(..., description="Promedio de pubs por año")
-    h_index: int = Field(..., description="Índice H (publicaciones con al menos H citas)")
+    h_index: int = Field(..., description="Índice H general (citas máximas entre fuentes)")
     cpp: float = Field(..., description="Citas por publicación")
     most_cited_pub_count: int = Field(..., description="Máximo de citas en una publicación")
 
 
 class AuthorGeneralMetricsResponse(BaseModel):
     """Respuesta completa de métricas generales del autor"""
-    
+
     # Información del autor
     author_id: int = Field(..., description="ID del autor en la BD local")
     author_name: str = Field(..., description="Nombre del autor")
     orcid: Optional[str] = Field(None, description="ORCID del autor")
-    
-    # Métricas generales
-    general_metrics: GeneralMetrics = Field(..., description="Estadísticas generales de productividad")
+
+    # Métricas por plataforma y general
+    platforms: List[PlatformMetrics] = Field(..., description="Métricas individuales por plataforma de indexación")
+    general_metrics: GeneralMetrics = Field(..., description="Estadísticas generales combinadas (máximo entre fuentes)")
     
     # Time series
     publications_by_year: List[YearMetrics] = Field(..., description="Desglose por año")
@@ -82,6 +92,29 @@ class AuthorGeneralMetricsResponse(BaseModel):
                 "author_id": 123,
                 "author_name": "Juan Pérez García",
                 "orcid": "0000-0001-2345-6789",
+                "platforms": [
+                    {
+                        "platform": "openalex",
+                        "total_publications": 45,
+                        "total_citations": 320,
+                        "h_index": 8,
+                        "cpp": 7.11
+                    },
+                    {
+                        "platform": "scopus",
+                        "total_publications": 30,
+                        "total_citations": 250,
+                        "h_index": 7,
+                        "cpp": 8.33
+                    },
+                    {
+                        "platform": "wos",
+                        "total_publications": 25,
+                        "total_citations": 200,
+                        "h_index": 6,
+                        "cpp": 8.0
+                    }
+                ],
                 "general_metrics": {
                     "total_publications": 45,
                     "total_citations": 320,

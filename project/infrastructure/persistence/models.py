@@ -290,6 +290,49 @@ class PossibleDuplicatePair(Base):
 
 
 # =============================================================
+# CLASIFICACIÓN MINCIENCIAS (datos abiertos)
+# =============================================================
+
+class ClasificacionMinciencias(Base):
+    """
+    Clasificación oficial de Minciencias para una publicación canónica.
+    Un registro por publicación — convocatoria más reciente, mejor score.
+    Poblada desde canonical_pub_open_data.
+    """
+    __tablename__ = "clasificacion_minciencias"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    canonical_publication_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("canonical_publications.id", ondelete="CASCADE"),
+        nullable=False, index=True,
+    )
+    nme_clase_pd: Mapped[Optional[str]] = mapped_column(String(200))
+    nme_tipo_medicion_pd: Mapped[Optional[str]] = mapped_column(String(200))
+    nme_tipologia_pd: Mapped[Optional[str]] = mapped_column(String(200))
+    cod_grupo_gr: Mapped[Optional[str]] = mapped_column(String(20), index=True)
+    nme_grupo_gr: Mapped[Optional[str]] = mapped_column(String(500))
+    nme_convocatoria: Mapped[Optional[str]] = mapped_column(String(200))
+    ano_convo: Mapped[Optional[str]] = mapped_column(String(20))
+    match_score: Mapped[Optional[float]] = mapped_column(Float)
+    match_method: Mapped[Optional[str]] = mapped_column(String(20))
+    classified_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), server_default=func.now(), nullable=False
+    )
+
+    publication = relationship("CanonicalPublication", backref="clasificacion_minciencias")
+
+    __table_args__ = (
+        UniqueConstraint("canonical_publication_id", "cod_grupo_gr", name="uq_clasif_pub_grupo"),
+    )
+
+    def __repr__(self):
+        return (
+            f"<ClasificacionMinciencias(pub={self.canonical_publication_id}, "
+            f"clase={self.nme_clase_pd}, grupo={self.cod_grupo_gr})>"
+        )
+
+
+# =============================================================
 # AUTORES
 # =============================================================
 

@@ -24,6 +24,8 @@ from api.schemas.publications import (
     YearDistribution,
     ExternalRecordBrief,
     PublicationAuthorRead,
+    DatosAbiertosInfo,
+    CategoriaMinciencias,
     DuplicatePublicationPair,
     DuplicatePublicationsSummary,
     MergePublicationsRequest,
@@ -41,6 +43,7 @@ from db.models import (
     get_all_source_records_for_canonical,
     find_record_by_doi_across_sources,
 )
+from project.infrastructure.persistence.source_registry import SOURCE_REGISTRY
 from extractors.base import normalize_text, normalize_doi
 from shared.normalizers import normalize_publication_type
 from api.routers.publications_duplicates import find_possible_duplicates
@@ -102,6 +105,7 @@ def list_publications(
     page_size: int = Query(50, ge=1, le=500),
     db: Session = Depends(get_db),
     institutional_only: Optional[bool] = Query(None, description="Si es True, solo publicaciones institucionales (institutional_authors_count > 0). Si es False, solo no institucionales. Si es None, todas."),
+    con_datos_abiertos: Optional[bool] = Query(None, description="True → solo publicaciones con vínculo en datos abiertos Minciencias (grupos institucionales)."),
     needs_review: Optional[bool] = Query(
         None,
         description=(
@@ -172,6 +176,16 @@ def list_publications(
         else:
             q = q.filter(has_source)    # tiene source records → OK
 
+    # Filtro datos abiertos institucionales
+    if con_datos_abiertos is not None:
+        da_ids_subq = db.execute(
+            text("SELECT canonical_publication_id FROM clasificacion_minciencias")
+        ).scalars().all()
+        if con_datos_abiertos:
+            q = q.filter(CanonicalPublication.id.in_(da_ids_subq))
+        else:
+            q = q.filter(CanonicalPublication.id.notin_(da_ids_subq))
+
     total = q.count()
     items = (
         q.order_by(CanonicalPublication.publication_year.desc().nullslast(), CanonicalPublication.id.desc())
@@ -180,12 +194,36 @@ def list_publications(
         .all()
     )
 
+    # Batch-fetch categoria Minciencias desde tabla clasificacion_minciencias
+    page_ids = [p.id for p in items]
+    categoria_map = {}
+    if page_ids:
+        da_cats = db.execute(
+            text("""
+                SELECT canonical_publication_id,
+                       nme_clase_pd, nme_tipo_medicion_pd, nme_tipologia_pd,
+                       cod_grupo_gr, nme_grupo_gr, nme_convocatoria
+                FROM clasificacion_minciencias
+                WHERE canonical_publication_id = ANY(:ids)
+            """),
+            {"ids": page_ids},
+        ).fetchall()
+        for row in da_cats:
+            categoria_map[row[0]] = CategoriaMinciencias(
+                nme_clase_pd=row[1],
+                nme_tipo_medicion_pd=row[2],
+                nme_tipologia_pd=row[3],
+                cod_grupo_gr=row[4],
+                nme_grupo_gr=row[5],
+                nme_convocatoria=row[6],
+            )
 
     result_items = []
     for p in items:
         estado_nombre = getattr(p, "estado_publicacion", None)
         pub_dict = PublicationRead.model_validate(p).model_dump()
         pub_dict["estado"] = EstadoPublicacion(nombre=estado_nombre).model_dump() if estado_nombre else None
+        pub_dict["categoria_minciencias"] = categoria_map.get(p.id)
         result_items.append(pub_dict)
 
     return PaginatedResponse.create(
@@ -194,6 +232,92 @@ def list_publications(
         page=page,
         page_size=page_size,
     )
+
+
+# ── GET /publications/by-grupo/{cod_grupo_gr} ────────────────
+
+@router.get("/by-grupo/{cod_grupo_gr}", summary="Publicaciones categorizadas de un grupo institucional", tags=["Publicaciones"])
+def get_publications_by_grupo(
+    cod_grupo_gr: str,
+    page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=500),
+    db: Session = Depends(get_db),
+):
+    """Publicaciones canónicas categorizadas en datos abiertos Minciencias para un grupo institucional."""
+    # Total
+    count_row = db.execute(
+        text("""
+            SELECT COUNT(*)
+            FROM clasificacion_minciencias
+            WHERE cod_grupo_gr = :cod
+        """),
+        {"cod": cod_grupo_gr},
+    ).scalar()
+
+    if count_row == 0:
+        raise HTTPException(404, f"Grupo '{cod_grupo_gr}' sin publicaciones categorizadas")
+
+    rows = db.execute(
+        text("""
+            SELECT c.canonical_publication_id,
+                   c.nme_clase_pd, c.nme_tipo_medicion_pd, c.nme_tipologia_pd,
+                   c.cod_grupo_gr, c.nme_grupo_gr,
+                   c.nme_convocatoria, c.ano_convo,
+                   c.match_score, c.match_method,
+                   p.title, p.doi, p.publication_year, p.publication_type,
+                   p.source_journal, p.citation_count
+            FROM clasificacion_minciencias c
+            JOIN canonical_publications p ON p.id = c.canonical_publication_id
+            WHERE c.cod_grupo_gr = :cod
+            ORDER BY p.publication_year DESC NULLS LAST
+            LIMIT :lim OFFSET :off
+        """),
+        {"cod": cod_grupo_gr, "lim": page_size, "off": (page - 1) * page_size},
+    ).fetchall()
+
+    page_ids = [r[0] for r in rows]
+
+    # Batch source IDs por publicación usando UNION sobre todas las tablas fuente
+    source_links_map: dict = {pid: {} for pid in page_ids}
+    id_attrs = SOURCE_REGISTRY.id_attrs  # {source_name: id_column_name}
+    for src_name, id_attr in id_attrs.items():
+        model_cls = SOURCE_MODELS.get(src_name)
+        if not model_cls:
+            continue
+        table = model_cls.__tablename__
+        src_rows = db.execute(
+            text(f"SELECT canonical_publication_id, {id_attr} FROM {table} WHERE canonical_publication_id = ANY(:ids)"),
+            {"ids": page_ids},
+        ).fetchall()
+        for pub_id, raw_id in src_rows:
+            clean = get_clean_source_id(src_name, raw_id)
+            if clean:
+                source_links_map[pub_id][src_name] = clean
+
+    items = [
+        {
+            "canonical_publication_id": r[0],
+            "nme_clase_pd": r[1],
+            "nme_tipo_medicion_pd": r[2],
+            "nme_tipologia_pd": r[3],
+            "cod_grupo_gr": r[4],
+            "nme_grupo_gr": r[5],
+            "nme_convocatoria": r[6],
+            "ano_convo": r[7],
+            "match_score": r[8],
+            "match_method": r[9],
+            "title": r[10],
+            "doi": r[11],
+            "publication_year": r[12],
+            "publication_type": r[13],
+            "source_journal": r[14],
+            "citation_count": r[15],
+            "source_links": source_links_map.get(r[0], {}),
+        }
+        for r in rows
+    ]
+
+    return PaginatedResponse.create(items=items, total=count_row, page=page, page_size=page_size)
 
 
 # ── GET /publications/exists ─────────────────────────────────
@@ -964,21 +1088,57 @@ async def enrich_publication_by_doi(
 
         engine = ReconciliationEngine(session=db)
 
-        # Ingestar + reconciliar
+        # Ingestar registros nuevos
         ingested = engine.ingest_records(records_to_ingest)
-        recon_stats = None
-        if ingested > 0:
-            recon_stats = engine.reconcile_pending(batch_size=ingested + 10)
 
-        # Encontrar el canónico resultante (por DOI normalizado)
+        # Buscar el canónico por DOI
         canonical = (
             db.query(CanonicalPublication)
             .filter(CanonicalPublication.doi == ndoi)
             .first()
         )
 
+        # Vincular todos los source records de este DOI que no estén ya vinculados
+        # (sin importar status: PENDING, MANUAL_REVIEW, etc.)
+        recon_stats = {"processed": 0, "linked": 0, "errors": 0}
+        if canonical:
+            unlinked_for_doi = []
+            for model_cls in SOURCE_MODELS.values():
+                unlinked_for_doi.extend(
+                    db.query(model_cls)
+                    .filter(
+                        model_cls.doi == ndoi,
+                        model_cls.canonical_publication_id.is_(None),
+                    )
+                    .all()
+                )
+
+            if unlinked_for_doi:
+                engine._cache = engine._build_cache()
+                for rec in unlinked_for_doi:
+                    try:
+                        engine._reconcile_one(rec)
+                        recon_stats["processed"] += 1
+                        recon_stats["linked"] += 1
+                    except Exception as exc:
+                        recon_stats["errors"] += 1
+                        logger.warning(f"enrich-by-doi: reconcile {rec} failed: {exc}")
+                db.flush()
+
         enrich_result = {}
         if canonical:
+            # Paso 1: aplicar datos frescos de la API directamente.
+            # Necesario cuando ingested=0 (record ya en BD): ingest_records omite
+            # el registro sin actualizar raw_data, así que el record almacenado
+            # puede tener abstract_inverted_index / keywords / citas desactualizados.
+            # Usar el fresh StandardRecord garantiza los campos más recientes.
+            for fresh_rec in records_to_ingest:
+                engine._enrich_canonical(canonical, fresh_rec)
+                engine._ingest_authors(canonical, fresh_rec)
+            db.flush()
+
+            # Paso 2: enriquecer también desde todos los source records vinculados
+            # en BD (cvlac, datos_abiertos y demás que no tienen búsqueda por DOI).
             enrich_result = engine.enrich_canonical(canonical.id)
             db.commit()
             db.refresh(canonical)
@@ -1003,6 +1163,25 @@ async def enrich_publication_by_doi(
                 for er in ext_records
                 if get_clean_source_id(er.source_name, er.source_id)
             }
+
+            pub_authors = (
+                db.query(PublicationAuthor, Author)
+                .join(Author, PublicationAuthor.author_id == Author.id)
+                .filter(PublicationAuthor.publication_id == canonical.id)
+                .order_by(PublicationAuthor.author_position.asc().nullslast())
+                .all()
+            )
+            authors_out = [
+                {
+                    "id": a.id,
+                    "name": a.name,
+                    "orcid": a.orcid,
+                    "position": pa.author_position,
+                    "is_institutional": pa.is_institutional,
+                }
+                for pa, a in pub_authors
+            ]
+
             pub_data = {
                 "id": canonical.id,
                 "doi": canonical.doi,
@@ -1024,6 +1203,7 @@ async def enrich_publication_by_doi(
                 "field_provenance": canonical.field_provenance or {},
                 "external_records": ext_briefs,
                 "source_links": source_links,
+                "authors": authors_out,
             }
 
         return {
@@ -1031,7 +1211,7 @@ async def enrich_publication_by_doi(
             "canonical_id": canonical.id if canonical else None,
             "platforms": platform_results,
             "records_ingested": ingested,
-            "reconciliation": recon_stats.to_dict() if recon_stats else None,
+            "reconciliation": (recon_stats if isinstance(recon_stats, dict) else recon_stats.to_dict()) if recon_stats else None,
             "enrichment": enrich_result,
             "publication": pub_data,
         }
@@ -1139,38 +1319,51 @@ async def enrich_publication_all_sources(
 
         engine = ReconciliationEngine(session=db)
 
-        # ── Ingesta + reconciliación ───────────────────────────────────────
-        # Always reconcile: pre-existing pending records (ingested=0 on dedup)
-        # still need to be linked to the canonical before enrichment.
-        # We first reconcile any pending records that match this DOI across ALL
-        # source tables (they may have been ingested in a previous call), then
-        # run a general pass for anything newly ingested.
+        # ── Ingesta
         ingested = engine.ingest_records(records_to_ingest)
 
+        # ── Vincular source records no enlazados para este DOI
+        # Filtra por canonical_publication_id IS NULL (no solo PENDING)
+        # para cubrir también registros en MANUAL_REVIEW u otros estados.
         from db.models import SOURCE_MODELS
-        from config import RecordStatus
-        pending_for_doi = []
+        unlinked_for_doi = []
         for model_cls in SOURCE_MODELS.values():
-            pending_for_doi.extend(
+            unlinked_for_doi.extend(
                 db.query(model_cls)
                 .filter(
                     model_cls.doi == ndoi,
-                    model_cls.status == RecordStatus.PENDING,
+                    model_cls.canonical_publication_id.is_(None),
                 )
                 .all()
             )
-        engine._cache = engine._build_cache()
-        for rec in pending_for_doi:
-            try:
-                engine._reconcile_one(rec)
-            except Exception:
-                pass
-        if pending_for_doi or ingested > 0:
+
+        recon_stats = {"processed": 0, "linked": 0, "errors": 0}
+        if unlinked_for_doi:
+            engine._cache = engine._build_cache()
+            for rec in unlinked_for_doi:
+                try:
+                    engine._reconcile_one(rec)
+                    recon_stats["processed"] += 1
+                    recon_stats["linked"] += 1
+                except Exception as exc:
+                    recon_stats["errors"] += 1
+                    logger.warning(f"enrich-all: reconcile {rec} failed: {exc}")
             db.flush()
 
-        recon_stats = engine.reconcile_pending(batch_size=max(ingested + 20, 50))
+        # ── Enriquecimiento del canónico ──────────────────────────────────
+        # Paso 1: aplicar datos frescos de la API directamente.
+        # ingest_records omite duplicados sin actualizar raw_data, así que
+        # el abstract_inverted_index / keywords / citas del record almacenado
+        # pueden estar desactualizados. El fresh StandardRecord tiene lo más reciente.
+        pub_canonical = db.get(CanonicalPublication, pub_id)
+        if pub_canonical and records_to_ingest:
+            for fresh_rec in records_to_ingest:
+                engine._enrich_canonical(pub_canonical, fresh_rec)
+                engine._ingest_authors(pub_canonical, fresh_rec)
+            db.flush()
 
-        # ── Enriquecimiento del canónico ───────────────────────────────────
+        # Paso 2: enriquecer desde todos los source records vinculados en BD
+        # (cvlac, datos_abiertos y demás fuentes sin búsqueda por DOI).
         enrich_result = engine.enrich_canonical(pub_id)
         db.commit()
         db.refresh(pub)
@@ -1213,7 +1406,7 @@ async def enrich_publication_all_sources(
             "doi": ndoi,
             "platforms": platform_results,
             "records_ingested": ingested,
-            "reconciliation": recon_stats.to_dict() if recon_stats else None,
+            "reconciliation": recon_stats,
             "enrichment": enrich_result,
             "publication": {
                 "id": pub.id,
@@ -1375,6 +1568,23 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
     )
     authors_out = [PublicationAuthorRead.from_pa_author(pa, a) for pa, a in pub_authors]
 
+    # Datos abiertos Minciencias — desde tabla clasificacion_minciencias (un registro por pub)
+    da_rows = db.execute(
+        text("""
+            SELECT
+                NULL::bigint AS open_data_record_id,
+                NULL::text   AS id_producto_pd,
+                nme_clase_pd, nme_tipo_medicion_pd, nme_tipologia_pd,
+                cod_grupo_gr, nme_grupo_gr,
+                nme_convocatoria, ano_convo,
+                match_score, match_method
+            FROM clasificacion_minciencias
+            WHERE canonical_publication_id = :pub_id
+        """),
+        {"pub_id": pub_id},
+    ).fetchall()
+    datos_abiertos_out = [DatosAbiertosInfo(**row._mapping) for row in da_rows]
+
     pub_data = PublicationRead.model_validate(pub)
     return PublicationDetail(
         **pub_data.model_dump(),
@@ -1382,6 +1592,7 @@ def get_publication(pub_id: int, db: Session = Depends(get_db)):
         authors=authors_out,
         source_links=source_links,
         field_conflicts=pub.field_conflicts or {},
+        datos_abiertos=datos_abiertos_out,
     )
 
 @router.get("/{pub_id}/source-links", summary="Links de acceso por fuente", tags=["Publicaciones"])
@@ -1469,6 +1680,48 @@ def get_publication_source_links(pub_id: int, db: Session = Depends(get_db)):
         "doi_url":        doi_url,
         "sources_count":  len(sources_out),
         "sources":        sources_out,
+    }
+
+
+@router.get("/{pub_id}/grupos", summary="Grupos institucionales que categorizan esta publicación", tags=["Publicaciones"])
+def get_grupos_by_publication(pub_id: int, db: Session = Depends(get_db)):
+    """Retorna los grupos institucionales de Minciencias que tienen esta publicación categorizada."""
+    pub = db.get(CanonicalPublication, pub_id)
+    if not pub:
+        raise HTTPException(404, "Publicación no encontrada")
+
+    rows = db.execute(
+        text("""
+            SELECT cod_grupo_gr, nme_grupo_gr,
+                   nme_clase_pd, nme_tipo_medicion_pd, nme_tipologia_pd,
+                   nme_convocatoria, ano_convo,
+                   match_score, match_method
+            FROM clasificacion_minciencias
+            WHERE canonical_publication_id = :pub_id
+        """),
+        {"pub_id": pub_id},
+    ).fetchall()
+
+    if not rows:
+        return {"canonical_publication_id": pub_id, "title": pub.title, "grupos": []}
+
+    return {
+        "canonical_publication_id": pub_id,
+        "title": pub.title,
+        "grupos": [
+            {
+                "cod_grupo_gr":       r[0],
+                "nme_grupo_gr":       r[1],
+                "nme_clase_pd":       r[2],
+                "nme_tipo_medicion_pd": r[3],
+                "nme_tipologia_pd":   r[4],
+                "nme_convocatoria":   r[5],
+                "ano_convo":          r[6],
+                "match_score":        r[7],
+                "match_method":       r[8],
+            }
+            for r in rows
+        ],
     }
 
 
