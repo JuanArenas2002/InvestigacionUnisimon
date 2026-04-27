@@ -1014,3 +1014,101 @@ def _build_enrichment_samples(db: Session, limit: int = 10) -> List[ScopusEnrich
                 fields_from_scopus=fields,
             ))
     return samples
+
+
+# ══════════════════════════════════════════════════════════════
+# POST /scopus/author-h-index
+# Extrae el h-index de autores por Scopus Author ID desde Excel
+# ══════════════════════════════════════════════════════════════
+
+@router.post(
+    "/author-h-index",
+    summary="Extraer H-Index de autores desde Scopus",
+    description=(
+        "Carga un archivo Excel con IDs de autores de Scopus y extrae su H-Index.\n\n"
+        "El Excel debe contener una columna con IDs de autores de Scopus. "
+        "Las columnas soportadas son:\n"
+        "- **author_id** (recomendado)\n"
+        "- **scopus_id**\n"
+        "- **scopus_author_id**\n"
+        "- **id**\n\n"
+        "Devuelve un Excel con:\n"
+        "1. **H-Index Autores**: Tabla con H-Index y otras métricas\n"
+        "2. **Errores**: Autores que no pudieron procesarse\n"
+        "3. **Resumen**: Estadísticas generales"
+    ),
+    responses={
+        200: {
+            "content": {"application/vnd.openxmlformats-officedocument.spreadsheetml.sheet": {}},
+            "description": "Excel con H-Index de autores"
+        },
+        400: {"description": "Archivo vacío o formato inválido"},
+        422: {"description": "Error al procesar el archivo"},
+    },
+)
+async def extract_author_h_index(
+    file: UploadFile = File(..., description="Archivo Excel (.xlsx) con IDs de autores"),
+    max_workers: int = Query(3, ge=1, le=10, description="Consultas simultáneas (1-10)"),
+):
+    """
+    Endpoint para extraer el H-Index de múltiples autores desde Scopus.
+
+    Procesa cada autor del Excel, consulta su H-Index en Scopus 
+    y devuelve un Excel con los resultados.
+    
+    Usa hasta `max_workers` consultas simultáneas para reducir el tiempo total.
+    """
+    if not file.filename.lower().endswith((".xlsx", ".xls")):
+        raise HTTPException(400, "Solo se aceptan archivos Excel (.xlsx o .xls)")
+
+    file_bytes = await file.read()
+    if not file_bytes:
+        raise HTTPException(400, "El archivo está vacío")
+
+    logger.info(
+        f"[author-h-index] Archivo recibido: {file.filename} "
+        f"({len(file_bytes):,} bytes) — workers={max_workers}"
+    )
+
+    # Importar servicio
+    from api.services.scopus_h_index_service import ScopusHIndexService
+    from api.exporters.excel.scopus_h_index import generate_h_index_excel
+    from datetime import datetime
+
+    service = ScopusHIndexService(max_workers=max_workers)
+    
+    try:
+        # Ejecutar extracción de h-index
+        _t0 = time.time()
+        author_results = await run_in_threadpool(service.process_author_ids, file_bytes)
+        elapsed = time.time() - _t0
+        
+        if not author_results:
+            raise HTTPException(422, "No se encontraron autores en el archivo")
+        
+        successful = sum(1 for r in author_results if r['status'] == 'success')
+        failed = sum(1 for r in author_results if r['status'] == 'error')
+        
+        logger.info(
+            f"[author-h-index] Extracción completada en {elapsed:.1f}s\n"
+            f"  - Total autores: {len(author_results)}\n"
+            f"  - Exitosos: {successful}\n"
+            f"  - Con errores: {failed}"
+        )
+        
+        # Generar Excel
+        excel_bytes = await run_in_threadpool(generate_h_index_excel, author_results)
+        
+        filename = f"h_index_scopus_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xlsx"
+        
+        return StreamingResponse(
+            io.BytesIO(excel_bytes),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+    
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"[author-h-index] Error: {str(e)}", exc_info=True)
+        raise HTTPException(422, f"Error al procesar: {str(e)}")

@@ -52,6 +52,12 @@ _APP_LOGGERS = [
     "extractors.wos",
     "extractors.cvlac",
     "reconciliation.engine",
+    # servicios Scopus
+    "scopus_search",
+    "scopus_author_production",
+    "scopus_h_index",
+    "scopus_h_index_excel_exporter",
+    "scopus_excel_exporter",
 ]
 
 

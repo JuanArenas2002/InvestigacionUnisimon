@@ -173,3 +173,5 @@ try:
     print(df[["year","cited_by","title","journal"]].head(20).to_string())
 except ImportError:
     print("\npandas no disponible — instala con: pip install pandas")
+
+
