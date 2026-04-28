@@ -5,12 +5,17 @@ Endpoint de login basado en cédula.
 
 import os
 import logging
+import uuid
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Header, status
+from fastapi import APIRouter, Depends, HTTPException, Header, Request, status
+from slowapi import Limiter
+from slowapi.util import get_remote_address
 from sqlalchemy.orm import Session
 from jose import jwt, JWTError
+
+from api.security.token_blocklist import blocklist
 
 from db.models import Author, ResearcherCredential
 from api.dependencies import get_db
@@ -25,63 +30,72 @@ from api.schemas.auth import (
 logger = logging.getLogger(__name__)
 
 # Configuración JWT
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "supersecretkey-change-in-production")
+_raw_secret = os.getenv("JWT_SECRET_KEY", "")
+if not _raw_secret:
+    raise RuntimeError(
+        "JWT_SECRET_KEY no está configurada. "
+        "Define esta variable de entorno antes de iniciar la API."
+    )
+SECRET_KEY = _raw_secret
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 
 router = APIRouter(prefix="/auth", tags=["Autenticación de Investigadores"])
+
+# 5 intentos por minuto por IP
+_limiter = Limiter(key_func=get_remote_address)
 
 
 # =============================================================
 # HELPERS
 # =============================================================
 
+_INVALID_TOKEN = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Token inválido o expirado",
+    headers={"WWW-Authenticate": "Bearer"},
+)
+_INVALID_CREDENTIALS = HTTPException(
+    status_code=status.HTTP_401_UNAUTHORIZED,
+    detail="Cédula o contraseña incorrecta",
+)
+
+
 def create_access_token(
     subject: str,
     expires_delta: Optional[timedelta] = None,
-) -> tuple[str, datetime]:
-    """
-    Crea un JWT token de acceso.
-    
-    Returns:
-        (token, expiration_datetime)
-    """
+) -> tuple[str, datetime, str]:
+    """Crea un JWT con jti único. Retorna (token, expiration, jti)."""
     if expires_delta is None:
         expires_delta = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
-    
+
     expire = datetime.now(timezone.utc) + expires_delta
-    to_encode = {"sub": subject, "exp": expire}
-    
+    jti = str(uuid.uuid4())
+    to_encode = {"sub": subject, "exp": expire, "jti": jti}
+
     encoded_jwt = jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-    return encoded_jwt, expire
+    return encoded_jwt, expire, jti
 
 
-def verify_token(token: str) -> str:
+def verify_token(token: str) -> tuple[str, str]:
     """
-    Verifica la validez de un JWT token.
-    
-    Returns:
-        cedula del investigador si es válido
-        
-    Raises:
-        HTTPException si el token es inválido
+    Verifica el JWT y comprueba la blocklist.
+    Retorna (cedula, jti) o lanza HTTPException 401.
     """
     try:
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-        cedula = payload.get("sub")
-        if cedula is None:
-            raise HTTPException(
-                status_code=status.HTTP_401_UNAUTHORIZED,
-                detail="Token inválido",
-                headers={"WWW-Authenticate": "Bearer"},
-            )
-        return cedula
     except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Token expirado o inválido",
-            headers={"WWW-Authenticate": "Bearer"},
-        )
+        raise _INVALID_TOKEN
+
+    cedula = payload.get("sub")
+    jti = payload.get("jti")
+    if not cedula or not jti:
+        raise _INVALID_TOKEN
+
+    if blocklist.is_revoked(jti):
+        raise _INVALID_TOKEN
+
+    return cedula, jti
 
 
 def get_token_from_header(authorization: Optional[str] = Header(None)) -> str:
@@ -112,107 +126,86 @@ async def get_current_researcher(
     token: str = Depends(get_token_from_header),
     db: Session = Depends(get_db),
 ) -> Author:
-    """
-    Dependency que valida el token y retorna el investigador autenticado.
-    
-    Uso en otros endpoints:
-    ```python
-    @router.get("/me")
-    def get_profile(researcher: Author = Depends(get_current_researcher)):
-        return researcher
-    ```
-    """
-    cedula = verify_token(token)
+    """Dependency: valida token (incluye blocklist) y retorna el investigador."""
+    cedula, _ = verify_token(token)
     author = db.query(Author).filter(Author.cedula == cedula).first()
     if not author:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Investigador no encontrado",
-        )
+        raise _INVALID_TOKEN
     return author
+
+
+def get_token_jti(token: str = Depends(get_token_from_header)) -> tuple[str, str, datetime]:
+    """Dependency: retorna (token_raw, jti, expires_at) para uso en logout."""
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+    except JWTError:
+        raise _INVALID_TOKEN
+    jti = payload.get("jti")
+    exp = payload.get("exp")
+    if not jti or not exp:
+        raise _INVALID_TOKEN
+    expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
+    return token, jti, expires_at
 
 
 # =============================================================
 # ENDPOINTS
 # =============================================================
 
+def _mask_cedula(cedula: str) -> str:
+    """Enmascara la cédula para logs: '1234567890' -> '******7890'."""
+    return f"{'*' * max(0, len(cedula) - 4)}{cedula[-4:]}" if cedula else "****"
+
+
 @router.post(
     "/login",
     response_model=TokenResponse,
     responses={
         401: {"model": ErrorResponse, "description": "Credenciales inválidas"},
-        404: {"model": ErrorResponse, "description": "Investigador no encontrado"},
-        410: {"model": ErrorResponse, "description": "Credencial expirada"},
+        410: {"model": ErrorResponse, "description": "Credencial expirada — contactar admin"},
+        429: {"description": "Demasiados intentos. Espera 1 minuto."},
     },
     summary="Login de investigador",
-    description="Autentica un investigador usando su cédula y contraseña.",
+    description="Autentica un investigador usando su cédula y contraseña. Límite: 5 intentos/minuto por IP.",
 )
-def login(request: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
-    """
-    **Endpoint de login para investigadores.**
-    
-    **Factores:**
-    - `cedula`: Cédula de ciudadanía del investigador
-    - `password`: Contraseña
-    
-    **Retorna:**
-    - JWT access token válido por 60 minutos (configurable)
-    - Información del investigador
-    
-    **Errores:**
-    - 404: Investigador/credencial no encontrado
-    - 401: Credenciales inválidas o expiradas
-    - 410: Credencial expirada
-    """
-    # 1. Buscar investigador por cédula
-    author = db.query(Author).filter(Author.cedula == request.cedula).first()
+@_limiter.limit("5/minute")
+def login(request: Request, body: LoginRequest, db: Session = Depends(get_db)) -> TokenResponse:
+    masked = _mask_cedula(body.cedula)
+
+    # 1. Buscar investigador — mismo error que contraseña incorrecta (anti-enumeración)
+    author = db.query(Author).filter(Author.cedula == body.cedula).first()
     if not author:
-        logger.warning(f"Intento de login con cédula no registrada: {request.cedula}")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="Investigador no encontrado",
-        )
-    
+        logger.warning("Login fallido — cédula no registrada: %s", masked)
+        raise _INVALID_CREDENTIALS
+
     # 2. Buscar credencial activa
     credential = (
         db.query(ResearcherCredential)
-        .filter(
-            ResearcherCredential.author_id == author.id,
-            ResearcherCredential.is_active == True,
-        )
+        .filter(ResearcherCredential.author_id == author.id, ResearcherCredential.is_active == True)
         .first()
     )
     if not credential:
-        logger.warning(f"Intento de login sin credencial activa para: {request.cedula}")
-        raise HTTPException(
-            status_code=status.HTTP_404_NOT_FOUND,
-            detail="No hay una credencial activa para este investigador",
-        )
-    
-    # 3. Verificar expiración
+        logger.warning("Login fallido — sin credencial activa: %s", masked)
+        raise _INVALID_CREDENTIALS
+
+    # 3. Verificar expiración (este sí puede distinguirse: el usuario necesita contactar admin)
     if credential.is_expired():
-        logger.warning(f"Intento de login con credencial expirada: {request.cedula}")
-        raise HTTPException(
-            status_code=status.HTTP_410_GONE,
-            detail="La credencial ha expirado",
-        )
-    
+        logger.warning("Login fallido — credencial expirada: %s", masked)
+        raise HTTPException(status_code=status.HTTP_410_GONE, detail="La credencial ha expirado. Contacta al administrador.")
+
     # 4. Verificar contraseña
-    if not credential.verify_password(request.password):
-        logger.warning(f"Intento de login con contraseña incorrecta: {request.cedula}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Cédula o contraseña incorrecta",
-        )
-    
-    # 5. Generar token JWT
-    token, expires_at = create_access_token(subject=request.cedula)
-    
+    if not credential.verify_password(body.password):
+        logger.warning("Login fallido — contraseña incorrecta: %s", masked)
+        raise _INVALID_CREDENTIALS
+
+    # 5. Generar token JWT con jti
+    token, expires_at, _ = create_access_token(subject=body.cedula)
+
     # 6. Registrar último acceso
     credential.last_login = datetime.now(timezone.utc)
     db.commit()
-    logger.info(f"Login exitoso para investigador: {request.cedula} (ID: {author.id})")
-    
+    logger.info("Login exitoso — investigador ID %s", author.id)
+
     # 7. Retornar respuesta
     expires_in = int((expires_at - datetime.now(timezone.utc)).total_seconds())
     return TokenResponse(

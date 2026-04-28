@@ -32,3 +32,13 @@ OpenAlexJson/
 
 # Cachés de runtime
 extractors/.journal_disk_cache.json
+
+# Modelos ML entrenados (regenerables con train)
+models/*.joblib
+models/*.pkl
+models/*.version
+
+# Secretos y certificados
+*.pem
+*.key
+secrets/

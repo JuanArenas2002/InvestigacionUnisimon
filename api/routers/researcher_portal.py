@@ -17,7 +17,8 @@ from sqlalchemy import func
 from sqlalchemy.orm import Session
 
 from api.dependencies import get_db
-from api.routers.auth import get_current_researcher
+from api.routers.auth import get_current_researcher, get_token_jti
+from api.security.token_blocklist import blocklist
 from api.schemas.auth import ChangePasswordRequest
 from db.models import ResearcherCredential
 from api.routers.authors import _batch_source_records
@@ -470,37 +471,24 @@ def change_my_password(
 @router.post(
     "/logout",
     summary="Cerrar sesión",
-    description=(
-        "Registra el cierre de sesión del investigador. "
-        "El cliente debe descartar el token JWT localmente — "
-        "los JWT son stateless y no se pueden invalidar en el servidor."
-    ),
+    description="Invalida el token JWT actual. Cualquier uso posterior del token retornará 401.",
 )
 def logout(
+    token_info: tuple = Depends(get_token_jti),
     researcher: Author = Depends(get_current_researcher),
     db: Session = Depends(get_db),
 ):
-    """
-    Cierra la sesión del investigador autenticado.
+    _token_raw, jti, expires_at = token_info
+    blocklist.revoke(jti, expires_at)
 
-    **Nota técnica:** el JWT no se invalida en servidor (es stateless).
-    Este endpoint registra el evento en `last_login` y el cliente
-    debe eliminar el token de su almacenamiento local.
-
-    Para invalidación real de sesiones, usar `POST /me/change-password`
-    que fuerza al usuario a autenticarse con nueva credencial.
-    """
     credential = (
         db.query(ResearcherCredential)
-        .filter(
-            ResearcherCredential.author_id == researcher.id,
-            ResearcherCredential.is_active == True,
-        )
+        .filter(ResearcherCredential.author_id == researcher.id, ResearcherCredential.is_active == True)
         .first()
     )
     if credential:
         credential.last_login = datetime.now(timezone.utc)
         db.commit()
 
-    logger.info(f"Logout registrado para investigador ID {researcher.id}")
-    return {"message": "Sesión cerrada. Descarta el token en el cliente."}
+    logger.info("Logout — investigador ID %s, token revocado", researcher.id)
+    return {"message": "Sesión cerrada. Token invalidado."}

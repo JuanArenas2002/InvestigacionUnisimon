@@ -2573,13 +2573,28 @@ class ReconciliationEngine:
 
         updated = 0
 
-        scopus_expr = Author.external_ids["scopus"].astext
-        existing_sids = {
-            r[0] for r in
-            self.session.query(scopus_expr)
-            .filter(scopus_expr.isnot(None), scopus_expr != "")
-            .all()
-        }
+        # Preload all authors into lookup dicts to avoid N+1 per-author queries
+        all_authors = self.session.query(Author).all()
+        author_by_id: dict[int, Author] = {a.id: a for a in all_authors}
+        orcid_map: dict[str, Author] = {a.orcid: a for a in all_authors if a.orcid}
+        scopus_map: dict[str, Author] = {}
+        openalex_map: dict[str, Author] = {}
+        name_map: dict[str, Author] = {a.normalized_name: a for a in all_authors if a.normalized_name}
+        existing_sids: set[str] = set()
+        for a in all_authors:
+            eids = a.external_ids or {}
+            if eids.get("scopus"):
+                scopus_map[eids["scopus"]] = a
+                existing_sids.add(eids["scopus"])
+            if eids.get("openalex"):
+                openalex_map[eids["openalex"]] = a
+
+        # Preload pub_id → author_ids (without scopus) for fuzzy pub-level matching
+        pub_authors_map: dict[int, list[Author]] = {}
+        for pa in self.session.query(PublicationAuthor).all():
+            a = author_by_id.get(pa.author_id)
+            if a and not (a.external_ids or {}).get("scopus"):
+                pub_authors_map.setdefault(pa.publication_id, []).append(a)
 
         # Iterar todas las tablas de fuente
         for source_name, model_cls in SOURCE_MODELS.items():
@@ -2625,27 +2640,19 @@ class ReconciliationEngine:
                     if scopus_id and str(scopus_id) in existing_sids:
                         continue
 
-                    # Estrategia 1: match exacto por IDs o nombre
+                    # Estrategia 1: match exacto por IDs o nombre (in-memory lookups)
                     author = None
                     if orcid:
-                        author = self.session.query(Author).filter_by(orcid=orcid).first()
+                        author = orcid_map.get(orcid)
                     if not author and scopus_id:
-                        author = (
-                            self.session.query(Author)
-                            .filter(Author.external_ids["scopus"].astext == str(scopus_id))
-                            .first()
-                        )
+                        author = scopus_map.get(str(scopus_id))
                     if not author and openalex_id:
-                        author = (
-                            self.session.query(Author)
-                            .filter(Author.external_ids["openalex"].astext == openalex_id)
-                            .first()
-                        )
+                        author = openalex_map.get(openalex_id)
                     if not author:
                         name = auth_data.get("name") or auth_data.get("authname") or ""
                         norm = normalize_text(normalize_author_name(name))
                         if norm:
-                            author = self.session.query(Author).filter_by(normalized_name=norm).first()
+                            author = name_map.get(norm)
 
                     # Estrategia 2: match por publicación + fuzzy apellido
                     if not author and pub_id and scopus_id:
@@ -2655,18 +2662,9 @@ class ReconciliationEngine:
                         sc_surname = sc_parts[0] if sc_parts else ""
 
                         if sc_surname and len(sc_surname) > 2:
-                            pub_authors = (
-                                self.session.query(Author)
-                                .join(PublicationAuthor, Author.id == PublicationAuthor.author_id)
-                                .filter(
-                                    PublicationAuthor.publication_id == pub_id,
-                                    ~Author.external_ids.has_key("scopus"),
-                                )
-                                .all()
-                            )
                             best_match = None
                             best_score = 0
-                            for candidate in pub_authors:
+                            for candidate in pub_authors_map.get(pub_id, []):
                                 c_norm = candidate.normalized_name or ""
                                 c_parts = c_norm.split()
                                 c_surname = c_parts[0] if c_parts else ""

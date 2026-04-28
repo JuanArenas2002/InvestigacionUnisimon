@@ -136,6 +136,8 @@ async def full_enrich_all(
             if not batch:
                 break
 
+            engine._cache = engine._build_cache()
+
             for canonical in batch:
                 try:
                     ndoi = _norm_doi(canonical.doi) or canonical.doi
@@ -186,7 +188,6 @@ async def full_enrich_all(
                         )
 
                     if unlinked:
-                        engine._cache = engine._build_cache()
                         for rec in unlinked:
                             try:
                                 engine._reconcile_one(rec)

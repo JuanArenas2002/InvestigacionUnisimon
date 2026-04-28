@@ -1027,6 +1027,8 @@ def get_author_inventory(
     source: Optional[str]      = Query(None),
     institutional_only: bool   = Query(False, description="Si es True, solo publicaciones con autores institucionales (institutional_authors_count > 0)"),
     force_refresh: bool = Query(False, description="Fuerza extracción de datos incluso si son recientes"),
+    limit: int  = Query(100, ge=1, le=500, description="Máximo de productos a retornar"),
+    offset: int = Query(0,   ge=0,         description="Desplazamiento para paginación"),
     db: Session = Depends(get_db),
 ):
     """
@@ -1092,7 +1094,7 @@ def get_author_inventory(
     if institutional_only:
         q = q.filter(CanonicalPublication.institutional_authors_count > 0)
 
-    pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).all()
+    pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).offset(offset).limit(limit).all()
     pub_ids = [p.id for p in pubs]
 
     # ── BATCH de fuentes externas ──
@@ -1355,6 +1357,8 @@ def get_author_publications(
     year: Optional[int] = Query(None),
     publication_type: Optional[str] = Query(None),
     source: Optional[str] = Query(None),
+    limit: int  = Query(100, ge=1, le=1000, description="Máximo de publicaciones a retornar"),
+    offset: int = Query(0,   ge=0,          description="Desplazamiento para paginación"),
     db: Session = Depends(get_db),
 ):
     """
@@ -1375,7 +1379,7 @@ def get_author_publications(
         normalized_type = normalize_publication_type(publication_type)
         q = q.filter(CanonicalPublication.publication_type == normalized_type)
 
-    pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).all()
+    pubs = q.order_by(CanonicalPublication.publication_year.desc().nullslast()).offset(offset).limit(limit).all()
     pub_ids = [p.id for p in pubs]
 
     # Filtrar por fuente usando el modelo correspondiente (sigue siendo 1 query)

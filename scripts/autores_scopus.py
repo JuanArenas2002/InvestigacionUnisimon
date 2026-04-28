@@ -3,11 +3,12 @@
 # Listo para Google Colab — copy & paste
 # ══════════════════════════════════════════════════════════════════
 
+import os
 import requests
 
 # ── CONFIGURACIÓN ─────────────────────────────────────────────────
-API_KEY   = "3808a2c8b3d66cae57bbf55e51e91edd"
-AUTHOR_ID = "57193767797"   # ← cambia este ID
+API_KEY   = os.environ["SCOPUS_API_KEY"]   # export SCOPUS_API_KEY=<tu_key>
+AUTHOR_ID = "57193767797"                  # ← cambia este ID
 # ──────────────────────────────────────────────────────────────────
 
 BASE_URL = "https://api.elsevier.com/content"

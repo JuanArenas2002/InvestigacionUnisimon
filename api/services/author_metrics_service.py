@@ -214,21 +214,28 @@ class AuthorMetricsService:
     @staticmethod
     def _calculate_top_journals(publications: List, db: Session) -> List[JournalMetrics]:
         """Calcula top 10 revistas por número de publicaciones"""
-        
+
         journals_dict = {}
         journals_citations = {}
         journals_issn = {}
-        
+
+        # Collect journal_ids to batch-load ISSNs in one query
+        needed_ids = {pub.journal_id for pub in publications if pub.journal_id}
+        if needed_ids:
+            journal_rows = db.query(Journal).filter(Journal.id.in_(needed_ids)).all()
+            journal_id_to_issn = {j.id: j.issn for j in journal_rows}
+        else:
+            journal_id_to_issn = {}
+
         for pub in publications:
             journal_name = pub.source_journal or "Unknown"
             journals_dict[journal_name] = journals_dict.get(journal_name, 0) + 1
             journals_citations[journal_name] = journals_citations.get(journal_name, 0) + (pub.citation_count or 0)
-            
-            # Obtener ISSN si existe
+
             if pub.journal_id and journal_name not in journals_issn:
-                j = db.query(Journal).filter(Journal.id == pub.journal_id).first()
-                if j:
-                    journals_issn[journal_name] = j.issn
+                issn = journal_id_to_issn.get(pub.journal_id)
+                if issn:
+                    journals_issn[journal_name] = issn
         
         return [
             JournalMetrics(

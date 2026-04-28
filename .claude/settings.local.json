@@ -31,7 +31,8 @@
       "Bash(python -c \"from api.routers.authors import router; print\\('OK'\\)\")",
       "Bash(python -c \"from extractors.scopus import ScopusExtractor; print\\(hasattr\\(ScopusExtractor, 'extract_by_author'\\)\\)\")",
       "Bash(pip install *)",
-      "Read(//c/Users/juan.arenas1/.claude/projects/c--Users-juan-arenas1-Desktop-CONVOCATORIA/memory/**)"
+      "Read(//c/Users/juan.arenas1/.claude/projects/c--Users-juan-arenas1-Desktop-CONVOCATORIA/memory/**)",
+      "Bash(python -c ' *)"
     ]
   }
 }

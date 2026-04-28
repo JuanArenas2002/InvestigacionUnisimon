@@ -104,22 +104,20 @@ def overview_stats(db: Session = Depends(get_db)):
     status_counts = count_source_records_by_status(db)
     source_counts = count_source_records_by_source(db)
 
-    # Multi-source: publicaciones con registros de más de 1 fuente
-    # Contar cuántas canonicals tienen registros en > 1 tabla de fuente
-    canon_sources = {}  # canonical_id → set of source_names
-    for source_name, model_cls in SOURCE_MODELS.items():
-        rows = (
-            db.query(model_cls.canonical_publication_id)
-            .filter(model_cls.canonical_publication_id.isnot(None))
-            .distinct()
-            .all()
+    # Multi-source: canonicals with records in > 1 source table — single SQL UNION ALL
+    if SOURCE_MODELS:
+        union_parts = " UNION ALL ".join(
+            f"SELECT DISTINCT canonical_publication_id, '{sname}' AS src"
+            f" FROM {cls.__tablename__} WHERE canonical_publication_id IS NOT NULL"
+            for sname, cls in SOURCE_MODELS.items()
         )
-        for (cpid,) in rows:
-            if cpid not in canon_sources:
-                canon_sources[cpid] = set()
-            canon_sources[cpid].add(source_name)
-
-    multi_source = sum(1 for sources in canon_sources.values() if len(sources) > 1)
+        multi_source = db.execute(text(
+            f"SELECT COUNT(*) FROM"
+            f" (SELECT canonical_publication_id FROM ({union_parts}) sub"
+            f"  GROUP BY canonical_publication_id HAVING COUNT(*) > 1) multi"
+        )).scalar() or 0
+    else:
+        multi_source = 0
     cross_pct = round(multi_source / total_canon * 100, 1) if total_canon > 0 else 0.0
 
     return OverviewStats(

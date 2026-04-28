@@ -294,20 +294,19 @@ class PostgresRepository(RepositoryPort):
         if not publication.authors:
             return
 
+        existing_relations: dict[int, PublicationAuthor] = {
+            r.author_id: r
+            for r in session.query(PublicationAuthor).filter(
+                PublicationAuthor.publication_id == canonical.id
+            ).all()
+        }
+
         for position, author_payload in enumerate(publication.authors, start=1):
             author = PostgresRepository._upsert_author(session, author_payload, publication.source_name)
             if author is None:
                 continue
 
-            relation = (
-                session.query(PublicationAuthor)
-                .filter(
-                    PublicationAuthor.publication_id == canonical.id,
-                    PublicationAuthor.author_id == author.id,
-                )
-                .first()
-            )
-
+            relation = existing_relations.get(author.id)
             if relation is None:
                 relation = PublicationAuthor(
                     publication_id=canonical.id,
@@ -316,6 +315,7 @@ class PostgresRepository(RepositoryPort):
                     author_position=position,
                 )
                 session.add(relation)
+                existing_relations[author.id] = relation
             else:
                 relation.is_institutional = relation.is_institutional or bool(author_payload.is_institutional)
                 if relation.author_position is None:

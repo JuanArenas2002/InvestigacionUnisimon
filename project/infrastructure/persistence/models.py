@@ -273,6 +273,9 @@ class PossibleDuplicatePair(Base):
         String(20), nullable=False, default="pending",
         comment="pending | merged | dismissed",
     )
+    confidence_level: Mapped[Optional[str]] = mapped_column(String(20), nullable=True)
+    reviewed_by: Mapped[Optional[str]] = mapped_column(String(200), nullable=True)
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("canonical_id_1", "canonical_id_2", name="uq_dup_pair"),
@@ -378,7 +381,7 @@ class Author(Base):
         DateTime(timezone=True), server_default=func.now(), onupdate=func.now()
     )
 
-    publications = relationship("PublicationAuthor", back_populates="author", lazy="selectin")
+    publications = relationship("PublicationAuthor", back_populates="author", lazy="select")
     institutions = relationship("AuthorInstitution", back_populates="author", lazy="dynamic")
 
     def get_external_id(self, source: str) -> Optional[str]:
@@ -482,6 +485,7 @@ class PublicationAuthor(Base):
     )
     is_institutional: Mapped[bool] = mapped_column(Boolean, default=False)
     author_position: Mapped[Optional[int]] = mapped_column(Integer, nullable=True)
+    role: Mapped[Optional[str]] = mapped_column(String(50), nullable=True)
 
     publication = relationship("CanonicalPublication", back_populates="authors")
     author = relationship("Author", back_populates="publications")
@@ -770,6 +774,32 @@ class User(Base):
 
 
 # =============================================================
+# ALIAS DE AUTORES (variantes de nombre por fuente)
+# =============================================================
+
+class AuthorAlias(Base):
+    __tablename__ = "author_aliases"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    author_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("authors.id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    alias_name: Mapped[str] = mapped_column(String(300), nullable=False)
+    normalized_alias: Mapped[Optional[str]] = mapped_column(String(300), nullable=True)
+    source: Mapped[Optional[str]] = mapped_column(String(100), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
+
+    author = relationship("Author", backref="aliases")
+
+    __table_args__ = (
+        UniqueConstraint("author_id", "alias_name", name="uq_author_alias"),
+    )
+
+    def __repr__(self):
+        return f"<AuthorAlias(author_id={self.author_id}, alias='{self.alias_name}')>"
+
+
+# =============================================================
 # AUTO-DESCUBRIMIENTO DE FUENTES
 # =============================================================
 # Importar el paquete sources/ dispara sources/__init__.py que usa
@@ -856,33 +886,40 @@ def get_all_source_records_for_canonical(session, canonical_id: int) -> list:
 
 def count_all_source_records(session) -> int:
     """Cuenta el total de registros en todas las tablas de fuentes."""
-    total = 0
-    for model_cls in SOURCE_REGISTRY.models.values():
-        total += session.query(func.count(model_cls.id)).scalar() or 0
-    return total
+    models = list(SOURCE_REGISTRY.models.values())
+    if not models:
+        return 0
+    from sqlalchemy import text as _text
+    parts = " UNION ALL ".join(f"SELECT COUNT(*) AS cnt FROM {cls.__tablename__}" for cls in models)
+    return session.execute(_text(f"SELECT SUM(cnt) FROM ({parts}) sub")).scalar() or 0
 
 
 def count_source_records_by_status(session) -> dict:
     """Conteo de registros agrupados por status, sumando todas las fuentes."""
-    from collections import Counter
-    counts = Counter()
-    for model_cls in SOURCE_REGISTRY.models.values():
-        rows = (
-            session.query(model_cls.status, func.count(model_cls.id))
-            .group_by(model_cls.status)
-            .all()
-        )
-        for status, cnt in rows:
-            counts[status] += cnt
-    return dict(counts)
+    models = list(SOURCE_REGISTRY.models.values())
+    if not models:
+        return {}
+    from sqlalchemy import text as _text
+    parts = " UNION ALL ".join(
+        f"SELECT status, COUNT(*) AS cnt FROM {cls.__tablename__} GROUP BY status"
+        for cls in models
+    )
+    rows = session.execute(_text(f"SELECT status, SUM(cnt) FROM ({parts}) sub GROUP BY status")).all()
+    return {status: int(cnt) for status, cnt in rows}
 
 
 def count_source_records_by_source(session) -> dict:
     """Conteo de registros por fuente."""
-    return {
-        sname: session.query(func.count(model_cls.id)).scalar() or 0
-        for sname, model_cls in SOURCE_REGISTRY.models.items()
-    }
+    items = list(SOURCE_REGISTRY.models.items())
+    if not items:
+        return {}
+    from sqlalchemy import text as _text
+    parts = " UNION ALL ".join(
+        f"SELECT '{sname}' AS src, COUNT(*) AS cnt FROM {cls.__tablename__}"
+        for sname, cls in items
+    )
+    rows = session.execute(_text(f"SELECT src, cnt FROM ({parts}) sub")).all()
+    return {src: int(cnt) for src, cnt in rows}
 
 
 def get_thresholds_by_field(session, field_code: str) -> dict:

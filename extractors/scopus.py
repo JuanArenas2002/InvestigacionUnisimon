@@ -216,12 +216,12 @@ class ScopusExtractor(BaseExtractor):
                     params=params,
                     timeout=self.config.timeout,
                 )
-                print(f"ScopusExtractor: URL={resp.url}")
+                logger.debug("ScopusExtractor: URL=%s", resp.url)
                 resp.raise_for_status()
                 xml_content = resp.text
-                print("Respuesta cruda Scopus (XML):", xml_content[:2000])
+                logger.debug("Respuesta cruda Scopus (XML): %s", xml_content[:2000])
             except requests.exceptions.RequestException as e:
-                print(f"Error en Scopus API: {e}")
+                logger.error("Error en Scopus API: %s", e)
                 raise ScopusAPIError(f"Error en Scopus API: {e}")
 
             # Manejo robusto de errores de parseo XML

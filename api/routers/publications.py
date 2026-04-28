@@ -841,35 +841,35 @@ def detect_duplicate_publications(
     elapsed = round(time.perf_counter() - t0, 2)
 
     # --- 8. Persistir pares encontrados en possible_duplicate_pairs ---
-    # Upsert: insertar solo si no existe ya (status != merged/dismissed se respeta).
-    seen_stored_keys: set = set()
+    # Upsert: insertar solo los pares que no existen — batch check en una sola query.
+    normalized_pairs: dict[tuple, object] = {}
     for pair in pairs:
         id1 = min(pair.canonical_id_1, pair.canonical_id_2)
         id2 = max(pair.canonical_id_1, pair.canonical_id_2)
-        key = (id1, id2)
-        if key in seen_stored_keys:
-            continue
-        seen_stored_keys.add(key)
-        existing = (
-            db.query(PossibleDuplicatePair)
-            .filter_by(canonical_id_1=id1, canonical_id_2=id2)
-            .first()
-        )
-        if not existing:
-            try:
-                db.add(PossibleDuplicatePair(
-                    canonical_id_1=id1,
-                    canonical_id_2=id2,
-                    similarity_score=round(pair.similarity_score * 100, 2),
-                    match_method=pair.match_method,
-                    status="pending",
-                ))
-            except Exception:
-                pass  # no romper la respuesta si falla el upsert
-    try:
-        db.commit()
-    except Exception:
-        db.rollback()
+        normalized_pairs.setdefault((id1, id2), pair)
+
+    if normalized_pairs:
+        candidate_ids = list({i for k in normalized_pairs for i in k})
+        existing_keys = {
+            (r.canonical_id_1, r.canonical_id_2)
+            for r in db.query(PossibleDuplicatePair).filter(
+                PossibleDuplicatePair.canonical_id_1.in_(candidate_ids),
+                PossibleDuplicatePair.canonical_id_2.in_(candidate_ids),
+            ).all()
+        }
+        try:
+            for (id1, id2), pair in normalized_pairs.items():
+                if (id1, id2) not in existing_keys:
+                    db.add(PossibleDuplicatePair(
+                        canonical_id_1=id1,
+                        canonical_id_2=id2,
+                        similarity_score=round(pair.similarity_score * 100, 2),
+                        match_method=pair.match_method,
+                        status="pending",
+                    ))
+            db.commit()
+        except Exception:
+            db.rollback()
 
     # --- 9. Incluir pares almacenados del motor que no aparecieron on-the-fly ---
     stored_pairs = (

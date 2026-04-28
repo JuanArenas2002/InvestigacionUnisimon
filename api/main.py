@@ -18,9 +18,14 @@ import logging
 import os
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.exception_handlers import http_exception_handler as _default_http_handler
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.errors import RateLimitExceeded
+from slowapi.util import get_remote_address
 
 from db.session import create_all_tables, check_connection
 
@@ -239,6 +244,17 @@ openapi_tags = [
         ),
     },
 
+    # ── ML / Predicción ──────────────────────────────────────
+    {
+        "name": "Predicción de Impacto",
+        "description": (
+            "Modelo XGBoost que predice el nivel de impacto (`bajo` / `medio` / `alto`) "
+            "de una publicación canónica a partir de sus métricas de coautoría y fuentes.\n\n"
+            "Flujo: **entrenar** (`POST /publications/impact/train`) → "
+            "**predecir** (`GET /publications/{id}/impact`)."
+        ),
+    },
+
     # ── Análisis y reportes ───────────────────────────────────
     {
         "name": "Gráficos de Investigadores",
@@ -334,6 +350,8 @@ FASE 2 — Reconciliación global (bajo demanda)
 | Datos Abiertos Colombia | SODA API pública | Nombre institución / nombre autor |
 """
 
+_limiter = Limiter(key_func=get_remote_address)
+
 app = FastAPI(
     title="Reconciliación Bibliográfica API",
     description=_API_DESCRIPTION,
@@ -372,6 +390,23 @@ if _is_production and not _allowed_origins:
         "CORS bloqueará todas las peticiones cross-origin."
     )
 
+app.state.limiter = _limiter
+app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+
+
+@app.exception_handler(HTTPException)
+async def sanitized_http_exception_handler(request: Request, exc: HTTPException):
+    if exc.status_code >= 500:
+        logger.error("HTTP %d en %s %s — %s", exc.status_code, request.method, request.url.path, exc.detail)
+        return JSONResponse(status_code=exc.status_code, content={"detail": "Error interno del servidor."})
+    return await _default_http_handler(request, exc)
+
+
+@app.exception_handler(Exception)
+async def unhandled_exception_handler(request: Request, exc: Exception):
+    logger.exception("Excepción no manejada en %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"detail": "Error interno del servidor."})
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=_allowed_origins,
@@ -388,7 +423,7 @@ app.add_middleware(
 from api.routers import (
     publications, authors, external_records,
     stats, search, pipeline, catalogs, scopus, admin, charts, auth,
-    researcher_portal,
+    researcher_portal, impact,
 )
 from api.routers.sources import router as sources_router
 from project.interfaces.api.routers.ingest import router as hex_ingest_router
@@ -410,6 +445,7 @@ app.include_router(pipeline.router,         prefix="/api")
 # ── Inventario canónico ───────────────────────────────────────
 app.include_router(publications.router,     prefix="/api")
 app.include_router(authors.router,          prefix="/api")
+app.include_router(impact.router,           prefix="/api")
 
 # ── Análisis y reportes ───────────────────────────────────────
 app.include_router(charts.router,           prefix="/api")

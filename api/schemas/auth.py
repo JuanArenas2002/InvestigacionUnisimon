@@ -2,9 +2,24 @@
 Esquemas Pydantic para autenticación y credenciales de investigadores.
 """
 
-from pydantic import BaseModel, Field
+import re
+from pydantic import BaseModel, Field, field_validator
 from datetime import datetime
 from typing import Optional
+
+_PASSWORD_RULES = re.compile(
+    r'^(?=.*[a-z])(?=.*[A-Z])(?=.*\d)(?=.*[!@#$%^&*()_+\-=\[\]{};\'\\:"|,.<>\/?]).{8,}$'
+)
+_PASSWORD_HINT = (
+    "La contraseña debe tener al menos 8 caracteres e incluir: "
+    "una mayúscula, una minúscula, un número y un carácter especial (!@#$%^&*...)."
+)
+
+
+def _validate_password(v: str) -> str:
+    if not _PASSWORD_RULES.match(v):
+        raise ValueError(_PASSWORD_HINT)
+    return v
 
 
 # =============================================================
@@ -44,11 +59,12 @@ class LoginRequest(BaseModel):
 class ChangePasswordRequest(BaseModel):
     """Solicitud para cambiar contraseña."""
     old_password: str = Field(..., description="Contraseña actual")
-    new_password: str = Field(
-        ...,
-        min_length=8,
-        description="Nueva contraseña (mínimo 8 caracteres)"
-    )
+    new_password: str = Field(..., min_length=8, description=_PASSWORD_HINT)
+
+    @field_validator("new_password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        return _validate_password(v)
 
     class Config:
         json_schema_extra = {
@@ -62,15 +78,13 @@ class ChangePasswordRequest(BaseModel):
 class CreateCredentialRequest(BaseModel):
     """Solicitud para crear una nueva credencial (por administrador o el mismo investigador)."""
     author_id: int = Field(..., description="ID del autor/investigador")
-    password: str = Field(
-        ...,
-        min_length=8,
-        description="Nueva contraseña"
-    )
-    deactivate_previous: bool = Field(
-        True,
-        description="Si es True, desactiva la credencial anterior"
-    )
+    password: str = Field(..., min_length=8, description=_PASSWORD_HINT)
+    deactivate_previous: bool = Field(True, description="Si es True, desactiva la credencial anterior")
+
+    @field_validator("password")
+    @classmethod
+    def password_complexity(cls, v: str) -> str:
+        return _validate_password(v)
 
     class Config:
         json_schema_extra = {
